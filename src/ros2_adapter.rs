@@ -17,11 +17,11 @@ pub enum KinematicInterlockError {
     InvalidAdapterConfiguration,
 }
 
-pub struct Ros2CmdVelInterlockAdapter {
+pub struct Ros2Adapter {
     pub angular_velocity_limit: f64,
 }
 
-impl Ros2CmdVelInterlockAdapter {
+impl Ros2Adapter {
     pub fn new(max_angular: f64) -> Result<Self, KinematicInterlockError> {
         if max_angular <= 0.0 || max_angular.is_nan() || max_angular.is_infinite() {
             return Err(KinematicInterlockError::InvalidAdapterConfiguration);

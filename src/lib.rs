@@ -14,6 +14,9 @@ pub mod metrics;
 pub mod health;
 pub mod output;
 pub mod gateway;
+pub mod robotics_alignment;
+pub mod dds_bridge;
+pub mod ffi;
 
 #[cfg(test)]
 mod tests;

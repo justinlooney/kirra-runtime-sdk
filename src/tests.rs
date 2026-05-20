@@ -1,11 +1,13 @@
 // src/tests.rs
 
 use crate::aegis_core::{AegisKernelGovernor, ContractProfile};
-use crate::kinematics_contract::Twist2DKinematicContract;
+use crate::kinematics_contract::KinematicContract;
 use crate::{AgentAction, ActionResolution};
-use crate::action_filter::AiActionFilterEngine;
+use crate::action_filter::ActionFilter;
 use crate::action_policy::UnstructuredTextParser;
-use crate::ros2_adapter::Ros2CmdVelInterlockAdapter;
+use crate::ros2_adapter::Ros2Adapter;
+use crate::robotics_alignment::AlignmentBridge;
+use crate::dds_bridge::DdsPublisherBridge;
 use crate::SafetyGovernor;
 
 fn generate_valid_test_profile() -> ContractProfile {
@@ -45,14 +47,14 @@ fn test_type_safe_llm_parser_rejection_of_injections() {
 
 #[test]
 fn test_action_filter_leverages_dynamic_contract_angular_bounds() {
-    let contract = Twist2DKinematicContract {
+    let contract = KinematicContract {
         max_linear_velocity: 2.0,
         max_angular_velocity: 0.5,
         max_linear_acceleration: 0.1,
         fallback_linear_speed: 0.0,
     };
     let mut gov = AegisKernelGovernor::new(contract, 0.0, -0.5, 0.5);
-    let filter = AiActionFilterEngine::new(contract);
+    let filter = ActionFilter::new(contract);
 
     let over_rotation = AgentAction::Rotate { angular_velocity: 0.8 };
     let output = filter.process_agent_intent(&mut gov, over_rotation, 1.0);
@@ -61,10 +63,32 @@ fn test_action_filter_leverages_dynamic_contract_angular_bounds() {
 
 #[test]
 fn test_ros2_adapter_prevents_nan_propagation() {
-    let adapter = Ros2CmdVelInterlockAdapter::new(1.0).unwrap();
+    let adapter = Ros2Adapter::new(1.0).unwrap();
     let mut malformed_bytes = vec![0u8; 48];
     let nan_bytes = f64::NAN.to_le_bytes();
     malformed_bytes[8..16].copy_from_slice(&nan_bytes);
     let decode_res = adapter.decode_twist_frame(&malformed_bytes);
     assert!(decode_res.is_err());
+}
+
+#[test]
+fn test_embodied_ai_pipeline_rejects_unsafe_llm_rotation() {
+    let contract = KinematicContract {
+        max_linear_velocity: 2.0,
+        max_angular_velocity: 0.5,
+        max_linear_acceleration: 0.1,
+        fallback_linear_speed: 0.0,
+    };
+    let bridge = AlignmentBridge::new(contract);
+    let intent_json = r#"{"action": "ROTATE", "angular_velocity": 2.0}"#;
+    let (output, _) = bridge.align_and_serialize_intent(intent_json).unwrap();
+    assert_eq!(output.resolution, ActionResolution::Rejected);
+}
+
+#[test]
+fn test_dds_bridge_adds_cdr_encapsulation_header() {
+    let twist_bytes = vec![0u8; 48];
+    let wrapped = DdsPublisherBridge::wrap_cdr_encapsulation(&twist_bytes);
+    assert_eq!(wrapped.len(), 52);
+    assert_eq!(&wrapped[..4], &[0x00, 0x01, 0x00, 0x00]);
 }

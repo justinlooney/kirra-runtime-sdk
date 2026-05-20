@@ -8,11 +8,11 @@ pub struct FilterOutput {
     pub narrative: String,
 }
 
-pub struct AiActionFilterEngine<C: SafetyContract> {
+pub struct ActionFilter<C: SafetyContract> {
     pub contract: C,
 }
 
-impl<C: SafetyContract> AiActionFilterEngine<C> {
+impl<C: SafetyContract> ActionFilter<C> {
     pub fn new(contract: C) -> Self {
         Self { contract }
     }
@@ -42,40 +42,24 @@ impl<C: SafetyContract> AiActionFilterEngine<C> {
                     narrative: intercept.mitigation_narrative,
                 }
             }
-            AgentAction::SetPumpRate { gpm } => {
-                let intercept = governor.evaluate(gpm, dt);
-                let mutated = (intercept.sanitized_scalar - gpm).abs() > 0.001;
-                let resolution = if mutated { ActionResolution::Mutated } else { ActionResolution::Approved };
-
-                FilterOutput {
-                    resolution,
-                    sanitized_action: AgentAction::SetPumpRate { gpm: intercept.sanitized_scalar },
-                    narrative: intercept.mitigation_narrative,
-                }
-            }
             AgentAction::Rotate { angular_velocity } => {
                 if angular_velocity.abs() > self.contract.max_angular_rate() {
                     return FilterOutput {
                         resolution: ActionResolution::Rejected,
                         sanitized_action: AgentAction::HoldPosition,
-                        narrative: "REJECTED_AGENT_INTENT: Angular rate violates safety contract envelope restrictions.".to_string(),
+                        narrative: "REJECTED: Angular rate violates safety envelope.".to_string(),
                     };
                 }
                 FilterOutput {
                     resolution: ActionResolution::Approved,
                     sanitized_action: AgentAction::Rotate { angular_velocity },
-                    narrative: "PASSTHROUGH_UNRESTRICTED_NORMAL".to_string(),
+                    narrative: "PASSTHROUGH_NORMAL".to_string(),
                 }
             }
-            AgentAction::HoldPosition => FilterOutput {
+            _ => FilterOutput {
                 resolution: ActionResolution::Approved,
                 sanitized_action: AgentAction::HoldPosition,
-                narrative: "PASSTHROUGH_UNRESTRICTED_NORMAL".to_string(),
-            },
-            AgentAction::EmergencyStop => FilterOutput {
-                resolution: ActionResolution::Failsafe,
-                sanitized_action: AgentAction::EmergencyStop,
-                narrative: "CRITICAL_LOCKOUT: Emergency stop commanded by proxy loop.".to_string(),
+                narrative: "PASSTHROUGH_NORMAL".to_string(),
             },
         }
     }
