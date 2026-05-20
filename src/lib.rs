@@ -17,6 +17,7 @@ pub mod gateway;
 pub mod robotics_alignment;
 pub mod dds_bridge;
 pub mod ffi;
+pub mod startup_sentinel;
 
 #[cfg(test)]
 mod tests;
