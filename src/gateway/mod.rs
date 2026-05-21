@@ -3,6 +3,7 @@
 pub mod interceptor;
 pub mod policy;
 pub mod policy_layer;
+pub mod cmd_vel;
 
 use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};

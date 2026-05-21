@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  aegis-primary:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aegis-primary
+    ports:
+      - "8088:8088"
+    environment:
+      - AEGIS_VERIFIER_MODE=active
+      - AEGIS_ADMIN_TOKEN=primary-super-secret-admin-token
+      - AEGIS_DB_PATH=/data/primary_verifier.sqlite
+      - RUST_LOG=info
+    volumes:
+      - aegis-data-primary:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  aegis-standby:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aegis-standby
+    ports:
+      - "8089:8088"
+    environment:
+      - AEGIS_VERIFIER_MODE=passive_standby
+      - AEGIS_ADMIN_TOKEN=standby-super-secret-admin-token
+      - AEGIS_DB_PATH=/data/standby_verifier.sqlite
+      - RUST_LOG=info
+    volumes:
+      - aegis-data-standby:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  aegis-data-primary:
+    driver: local
+  aegis-data-standby:
+    driver: local

@@ -48,6 +48,8 @@ impl VerifierStore {
             [],
         )?;
 
+        Self::init_audit_chain_schema(&conn)?;
+
         Ok(Self { conn })
     }
 
@@ -226,5 +228,151 @@ impl VerifierStore {
         })?;
 
         rows.collect()
+    }
+
+    // --- v1.1 tamper-evident audit chain -------------------------------------
+
+    fn init_audit_chain_schema(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS audit_log_chain (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type        TEXT NOT NULL,
+                event_json        TEXT NOT NULL,
+                previous_hash_hex TEXT NOT NULL,
+                record_hash_hex   TEXT NOT NULL,
+                created_at_ms     INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS federated_trust_reports (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_controller_id TEXT NOT NULL,
+                asset_id             TEXT NOT NULL,
+                posture_json         TEXT NOT NULL,
+                issued_at_ms         INTEGER NOT NULL,
+                expires_at_ms        INTEGER NOT NULL,
+                received_at_ms       INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_posture_event_chained(
+        &mut self,
+        node_id: &str,
+        event_type: &str,
+        posture_json: &str,
+        reason: Option<&str>,
+        created_at_ms: u64,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO posture_events
+             (node_id, event_type, posture_json, reason, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![node_id, event_type, posture_json, reason, created_at_ms as i64],
+        )?;
+        crate::audit_chain::AuditChainLinker::append_audit_event_tx(
+            &tx, event_type, posture_json, created_at_ms as i64,
+        )?;
+        tx.commit()
+    }
+
+    pub fn save_federated_report_chained(
+        &mut self,
+        source_controller_id: &str,
+        asset_id: &str,
+        posture_json: &str,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+        received_at_ms: u64,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO federated_trust_reports
+             (source_controller_id, asset_id, posture_json, issued_at_ms, expires_at_ms, received_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                source_controller_id, asset_id, posture_json,
+                issued_at_ms as i64, expires_at_ms as i64, received_at_ms as i64,
+            ],
+        )?;
+        let audit = serde_json::json!({
+            "source_controller_id": source_controller_id,
+            "asset_id": asset_id,
+            "posture": posture_json,
+            "issued_at_ms": issued_at_ms,
+            "expires_at_ms": expires_at_ms,
+            "received_at_ms": received_at_ms,
+        });
+        crate::audit_chain::AuditChainLinker::append_audit_event_tx(
+            &tx,
+            "FEDERATED_TRUST_REPORT_ACCEPTED",
+            &audit.to_string(),
+            received_at_ms as i64,
+        )?;
+        tx.commit()
+    }
+
+    pub fn load_federated_reports_for_asset(
+        &self,
+        asset_id: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_controller_id, asset_id, posture_json, issued_at_ms, expires_at_ms
+             FROM federated_trust_reports
+             WHERE asset_id = ?1
+             ORDER BY received_at_ms DESC",
+        )?;
+        let rows = stmt.query_map(params![asset_id], |row| {
+            let source: String = row.get(0)?;
+            let aid: String = row.get(1)?;
+            let posture_json: String = row.get(2)?;
+            let issued: i64 = row.get(3)?;
+            let expires: i64 = row.get(4)?;
+            Ok(serde_json::json!({
+                "source_controller_id": source,
+                "asset_id": aid,
+                "posture": posture_json,
+                "issued_at_ms": issued as u64,
+                "expires_at_ms": expires as u64,
+            }))
+        })?;
+        rows.collect()
+    }
+
+    pub fn verify_audit_chain_integrity(&self) -> Result<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_json, previous_hash_hex, record_hash_hex, created_at_ms
+             FROM audit_log_chain
+             ORDER BY id ASC",
+        )?;
+
+        let mut expected_previous_hash = "0".repeat(64);
+        let mut rows = stmt.query([])?;
+
+        while let Some(row) = rows.next()? {
+            let event_json: String = row.get(0)?;
+            let previous_hash_hex: String = row.get(1)?;
+            let record_hash_hex: String = row.get(2)?;
+            let created_at_ms: i64 = row.get(3)?;
+
+            if previous_hash_hex != expected_previous_hash {
+                return Ok(false);
+            }
+            let recalc = crate::audit_chain::AuditChainLinker::compute_record_hash(
+                &previous_hash_hex,
+                &event_json,
+                created_at_ms,
+            );
+            if recalc != record_hash_hex {
+                return Ok(false);
+            }
+            expected_previous_hash = record_hash_hex;
+        }
+
+        Ok(true)
     }
 }

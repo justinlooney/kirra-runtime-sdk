@@ -1,0 +1,7 @@
+target/
+.git/
+.gitignore
+docs/
+*.sqlite
+*.sqlite-journal
+*.patch

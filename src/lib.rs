@@ -23,6 +23,9 @@ pub mod startup_sentinel;
 pub mod verifier;
 pub mod verifier_store;
 pub mod posture_cache;
+pub mod audit_chain;
+pub mod federation;
+pub mod protocol_adapter;
 
 #[cfg(test)]
 mod tests;

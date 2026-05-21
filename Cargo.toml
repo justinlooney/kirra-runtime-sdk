@@ -24,6 +24,8 @@ tss-esapi = { version = "7", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
 tower = { version = "0.5", features = ["util"] }
 http = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 [[bin]]
 name = "ai_robot_demo"

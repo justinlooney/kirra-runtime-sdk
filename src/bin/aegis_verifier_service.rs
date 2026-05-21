@@ -21,6 +21,9 @@ use aegis_runtime_sdk::verifier::{
 use aegis_runtime_sdk::verifier_store::VerifierStore;
 use aegis_runtime_sdk::posture_cache::{now_ms, CachedFleetPosture, SharedPostureCache};
 use aegis_runtime_sdk::security::constant_time_compare;
+use aegis_runtime_sdk::action_filter::{evaluate_action_claim, ActionClaim, ActionDecision};
+use aegis_runtime_sdk::protocol_adapter::{evaluate_industrial_event, IndustrialEvent};
+use aegis_runtime_sdk::federation::{evaluate_federated_report, FederatedTrustReport, ReportEvaluation};
 
 // --- Auth middleware ---------------------------------------------------------
 
@@ -368,6 +371,137 @@ async fn get_node_flap_status(
     }
 }
 
+// --- v1.1 handlers ----------------------------------------------------------
+
+async fn verify_audit_chain(
+    State(svc): State<Arc<ServiceState>>,
+) -> impl IntoResponse {
+    match svc.app.store.lock() {
+        Ok(mut store) => match store.verify_audit_chain_integrity() {
+            Ok(valid) => Json(json!({ "valid": valid })).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "error": "audit chain query failed" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+}
+
+async fn evaluate_action_filter(
+    State(svc): State<Arc<ServiceState>>,
+    Json(claim): Json<ActionClaim>,
+) -> impl IntoResponse {
+    let posture = svc.posture_cache
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.propagated_status.clone()))
+        .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
+
+    let decision = evaluate_action_claim(claim.clone(), posture);
+
+    if !decision.allowed {
+        let event = json!({
+            "target_node": claim.target_node,
+            "action_type": claim.action_type,
+            "risk_class": claim.risk_class,
+            "reason": decision.reason,
+        });
+        if let Ok(mut store) = svc.app.store.lock() {
+            let _ = store.save_posture_event_chained(
+                "action_filter", "ACTION_FILTER_DENIED",
+                &event.to_string(), Some("action denied"), now_ms(),
+            );
+        }
+    }
+    Json(decision).into_response()
+}
+
+async fn evaluate_industrial_adapter(
+    State(svc): State<Arc<ServiceState>>,
+    Json(event): Json<IndustrialEvent>,
+) -> impl IntoResponse {
+    let posture = svc.posture_cache
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.propagated_status.clone()))
+        .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
+
+    let asset_id = event.asset_id.clone();
+    let protocol = format!("{:?}", event.protocol);
+    let operation = event.operation.clone();
+    let address = event.address.clone();
+    let risk_class = event.risk_class.clone();
+
+    let decision = evaluate_industrial_event(event, posture);
+
+    if !decision.allowed {
+        let audit = json!({
+            "asset_id": asset_id,
+            "protocol": protocol,
+            "operation": operation,
+            "address": address,
+            "risk_class": risk_class,
+            "reason": decision.reason,
+        });
+        if let Ok(mut store) = svc.app.store.lock() {
+            let _ = store.save_posture_event_chained(
+                "industrial_adapter", "INDUSTRIAL_ACTION_DENIED",
+                &audit.to_string(), Some("industrial action denied"), now_ms(),
+            );
+        }
+    }
+    Json(decision).into_response()
+}
+
+async fn submit_federated_report(
+    State(svc): State<Arc<ServiceState>>,
+    Json(report): Json<FederatedTrustReport>,
+) -> impl IntoResponse {
+    let received_at_ms = now_ms();
+    let evaluation = evaluate_federated_report(&report, received_at_ms);
+
+    if evaluation.accepted {
+        let posture_json = match serde_json::to_string(&report.posture) {
+            Ok(s) => s,
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                              Json(json!({ "error": "posture serialization failed" }))).into_response(),
+        };
+        match svc.app.store.lock() {
+            Ok(mut store) => {
+                if store.save_federated_report_chained(
+                    &report.source_controller_id,
+                    &report.asset_id,
+                    &posture_json,
+                    report.issued_at_ms,
+                    report.expires_at_ms,
+                    received_at_ms,
+                ).is_err() {
+                    return (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": "failed to persist federated report" }))).into_response();
+                }
+            }
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                              Json(json!({ "error": "store lock poisoned" }))).into_response(),
+        }
+    }
+    Json(evaluation).into_response()
+}
+
+async fn get_federated_reports(
+    State(svc): State<Arc<ServiceState>>,
+    Path(asset_id): Path<String>,
+) -> impl IntoResponse {
+    match svc.app.store.lock() {
+        Ok(store) => match store.load_federated_reports_for_asset(&asset_id) {
+            Ok(reports) => Json(json!({ "asset_id": asset_id, "reports": reports })).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "error": "failed to load reports" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+}
+
 // --- Entry point ------------------------------------------------------------
 
 #[tokio::main]
@@ -413,6 +547,10 @@ async fn main() {
         .route("/attestation/register", post(register_node))
         .route("/fleet/dependencies", post(register_dependencies))
         .route("/system/backup/export", post(export_backup))
+        .route("/system/audit/verify", get(verify_audit_chain))
+        .route("/action_filter/evaluate", post(evaluate_action_filter))
+        .route("/industrial/evaluate", post(evaluate_industrial_adapter))
+        .route("/federation/reports/submit", post(submit_federated_report))
         .layer(middleware::from_fn(require_admin_token));
 
     // Challenge and verify are unauthenticated — the challenge-response protocol
@@ -432,7 +570,8 @@ async fn main() {
         .route("/fleet/posture", get(get_fleet_posture))
         .route("/fleet/posture/:node_id", get(get_node_posture))
         .route("/fleet/history/:node_id", get(get_node_history))
-        .route("/fleet/flapping/:node_id", get(get_node_flap_status));
+        .route("/fleet/flapping/:node_id", get(get_node_flap_status))
+        .route("/federation/reports/:asset_id", get(get_federated_reports));
 
     let app = Router::new()
         .merge(probe_routes)
