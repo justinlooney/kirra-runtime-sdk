@@ -166,11 +166,11 @@ async fn get_node_status(
                 NodeTrustState::Untrusted(_) => "Untrusted",
                 NodeTrustState::Unknown => "Unknown",
             };
-            (StatusCode::OK, Json(json!({
-                "node_id": node_id,
-                "status": status,
-                "registered_at_ms": node.registered_at_ms,
-            }))).into_response()
+            (StatusCode::OK, Json(AttestationStatusResponse {
+                node_id: node_id.clone(),
+                status: status.to_string(),
+                registered_at_ms: node.registered_at_ms,
+            })).into_response()
         }
         None => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response(),
     }
