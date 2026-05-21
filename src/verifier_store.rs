@@ -190,4 +190,41 @@ impl VerifierStore {
             |row| row.get(0),
         )
     }
+
+    // --- v0.9.8 HA probes & backup export ---
+
+    /// Lightweight liveness check: proves the SQLite connection is alive.
+    pub fn health_check(&self) -> Result<()> {
+        self.conn.query_row("SELECT 1", [], |_| Ok(()))
+    }
+
+    /// Return every posture event in ascending timestamp order (full backup scan).
+    pub fn load_all_posture_events(&self) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, event_type, posture_json, reason, created_at_ms
+             FROM posture_events
+             ORDER BY created_at_ms ASC",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let node_id: String = row.get(0)?;
+            let event_type: String = row.get(1)?;
+            let posture_json: String = row.get(2)?;
+            let reason: Option<String> = row.get(3)?;
+            let created_at_ms: i64 = row.get(4)?;
+
+            let posture: serde_json::Value = serde_json::from_str(&posture_json)
+                .unwrap_or(serde_json::Value::Null);
+
+            Ok(serde_json::json!({
+                "node_id": node_id,
+                "event_type": event_type,
+                "posture": posture,
+                "reason": reason,
+                "created_at_ms": created_at_ms as u64,
+            }))
+        })?;
+
+        rows.collect()
+    }
 }

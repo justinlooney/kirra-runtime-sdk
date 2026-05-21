@@ -14,7 +14,10 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aegis_runtime_sdk::verifier::{AppState, FlapStatus, FleetNodePosture, NodeTrustState, RegisteredNode};
+use aegis_runtime_sdk::verifier::{
+    AppState, BackupExport, FlapStatus, FleetNodePosture, HealthResponse,
+    NodeTrustState, RegisteredNode, VerifierOperationMode,
+};
 use aegis_runtime_sdk::verifier_store::VerifierStore;
 use aegis_runtime_sdk::posture_cache::{now_ms, CachedFleetPosture, SharedPostureCache};
 use aegis_runtime_sdk::security::constant_time_compare;
@@ -89,10 +92,67 @@ struct AttestationStatusResponse {
 
 // --- Handlers ----------------------------------------------------------------
 
+/// Unconditional liveness probe — returns 200 immediately with no I/O.
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "ok".to_string() })
+}
+
+/// Readiness probe — verifies the SQLite connection is alive before returning 200.
+async fn ready(State(svc): State<Arc<ServiceState>>) -> impl IntoResponse {
+    match svc.app.store.lock() {
+        Ok(store) => match store.health_check() {
+            Ok(()) => (StatusCode::OK, Json(HealthResponse { status: "ready".to_string() }))
+                .into_response(),
+            Err(_) => (StatusCode::SERVICE_UNAVAILABLE,
+                       Json(HealthResponse { status: "db_unavailable".to_string() }))
+                .into_response(),
+        },
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE,
+                   Json(HealthResponse { status: "store_lock_poisoned".to_string() }))
+            .into_response(),
+    }
+}
+
+/// Full state snapshot — nodes, dependency graph, and posture event log.
+/// Protected by require_admin_token; must never be exposed unauthenticated.
+async fn export_backup(State(svc): State<Arc<ServiceState>>) -> impl IntoResponse {
+    match svc.app.store.lock() {
+        Ok(store) => {
+            let nodes = match store.load_nodes() {
+                Ok(n) => n,
+                Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                                  Json(json!({ "error": "failed to load nodes" }))).into_response(),
+            };
+            let dependencies = match store.load_dependencies() {
+                Ok(d) => d,
+                Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                                  Json(json!({ "error": "failed to load dependencies" }))).into_response(),
+            };
+            let posture_events = match store.load_all_posture_events() {
+                Ok(e) => e,
+                Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                                  Json(json!({ "error": "failed to load posture events" }))).into_response(),
+            };
+            Json(BackupExport {
+                exported_at_ms: now_ms(),
+                nodes,
+                dependencies,
+                posture_events,
+            }).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+}
+
 async fn register_node(
     State(svc): State<Arc<ServiceState>>,
     Json(req): Json<RegisterNodeRequest>,
 ) -> impl IntoResponse {
+    if !svc.app.mode.allows_mutation() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "instance is in passive standby mode" }))).into_response();
+    }
     let now = now_ms();
     let node = RegisteredNode {
         node_id: req.node_id.clone(),
@@ -116,6 +176,10 @@ async fn issue_challenge(
     State(svc): State<Arc<ServiceState>>,
     Path(node_id): Path<String>,
 ) -> impl IntoResponse {
+    if !svc.app.mode.allows_mutation() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "instance is in passive standby mode" }))).into_response();
+    }
     if !svc.app.nodes.contains_key(&node_id) {
         return (StatusCode::NOT_FOUND,
                 Json(json!({ "error": "node not registered" }))).into_response();
@@ -132,6 +196,10 @@ async fn verify_attestation(
     State(svc): State<Arc<ServiceState>>,
     Json(req): Json<VerifyAttestationRequest>,
 ) -> impl IntoResponse {
+    if !svc.app.mode.allows_mutation() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "instance is in passive standby mode" }))).into_response();
+    }
     let now = now_ms();
 
     // Verify the proof: HMAC-SHA256(admin_token, nonce_le_bytes) == proof_hex.
@@ -239,6 +307,10 @@ async fn register_dependencies(
     State(svc): State<Arc<ServiceState>>,
     Json(req): Json<RegisterDependenciesRequest>,
 ) -> impl IntoResponse {
+    if !svc.app.mode.allows_mutation() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "instance is in passive standby mode" }))).into_response();
+    }
     if svc.app.persist_and_insert_deps(&req.node_id, req.depends_on).is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "failed to persist dependencies" }))).into_response();
@@ -308,7 +380,10 @@ async fn main() {
     let store = VerifierStore::new(&db_path)
         .expect("failed to initialize verifier store");
 
-    let app_state = Arc::new(AppState::new(store));
+    let mode = VerifierOperationMode::from_env();
+    println!("Aegis Verifier starting in {mode:?} mode (db: {db_path})");
+
+    let app_state = Arc::new(AppState::new(store, mode));
 
     // Boot hydration — load persisted nodes and dependency graph into memory.
     // Mutex is released before the server starts; the lock window is startup-only.
@@ -332,9 +407,12 @@ async fn main() {
     });
 
     // Mutation routes require Bearer token auth (AEGIS_ADMIN_TOKEN env var).
+    // export_backup is read-only but returns the full trust-fabric state dump —
+    // it is admin-protected so an unauthenticated caller cannot exfiltrate it.
     let admin_routes = Router::new()
         .route("/attestation/register", post(register_node))
         .route("/fleet/dependencies", post(register_dependencies))
+        .route("/system/backup/export", post(export_backup))
         .layer(middleware::from_fn(require_admin_token));
 
     // Challenge and verify are unauthenticated — the challenge-response protocol
@@ -342,6 +420,11 @@ async fn main() {
     let attestation_routes = Router::new()
         .route("/attestation/challenge/:node_id", post(issue_challenge))
         .route("/attestation/verify", post(verify_attestation));
+
+    // Liveness/readiness probes — always public, no auth, minimal I/O.
+    let probe_routes = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready));
 
     // Read-only routes need no auth.
     let read_routes = Router::new()
@@ -352,6 +435,7 @@ async fn main() {
         .route("/fleet/flapping/:node_id", get(get_node_flap_status));
 
     let app = Router::new()
+        .merge(probe_routes)
         .merge(admin_routes)
         .merge(attestation_routes)
         .merge(read_routes)

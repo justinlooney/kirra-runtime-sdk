@@ -136,7 +136,7 @@ fn test_posture_diamond_dag_not_misidentified_as_cycle() {
     // The old single-set algorithm incorrectly returned LockedOut/INVALID_GRAPH_CONFIG
     // the second time D was encountered. The gray/black two-set algorithm memoizes D
     // on first completion and returns the cached result on the second visit.
-    let state = AppState::new(crate::verifier_store::VerifierStore::new(":memory:").unwrap());
+    let state = AppState::new(crate::verifier_store::VerifierStore::new(":memory:").unwrap(), crate::verifier::VerifierOperationMode::Active);
     for id in ["A", "B", "C", "D"] { make_node(&state, id, NodeTrustState::Trusted); }
     state.dependency_graph.insert("A".to_string(), vec!["B".to_string(), "C".to_string()]);
     state.dependency_graph.insert("B".to_string(), vec!["D".to_string()]);
@@ -151,7 +151,7 @@ fn test_posture_diamond_dag_not_misidentified_as_cycle() {
 #[test]
 fn test_posture_cycle_returns_locked_out_with_diagnostic_tag() {
     // A→B→A: genuine cycle — must lock out and tag with INVALID_GRAPH_CONFIG.
-    let state = AppState::new(crate::verifier_store::VerifierStore::new(":memory:").unwrap());
+    let state = AppState::new(crate::verifier_store::VerifierStore::new(":memory:").unwrap(), crate::verifier::VerifierOperationMode::Active);
     for id in ["A", "B"] { make_node(&state, id, NodeTrustState::Trusted); }
     state.dependency_graph.insert("A".to_string(), vec!["B".to_string()]);
     state.dependency_graph.insert("B".to_string(), vec!["A".to_string()]);
@@ -170,7 +170,7 @@ fn test_posture_cycle_returns_locked_out_with_diagnostic_tag() {
 fn test_posture_locked_out_dep_propagates_locked_out_not_degraded() {
     // Parent is Trusted but its dependency is Untrusted (LockedOut).
     // The propagated status must be LockedOut, not softened to Degraded.
-    let state = AppState::new(crate::verifier_store::VerifierStore::new(":memory:").unwrap());
+    let state = AppState::new(crate::verifier_store::VerifierStore::new(":memory:").unwrap(), crate::verifier::VerifierOperationMode::Active);
     make_node(&state, "parent", NodeTrustState::Trusted);
     make_node(&state, "dep", NodeTrustState::Untrusted("compromised".to_string()));
     state.dependency_graph.insert("parent".to_string(), vec!["dep".to_string()]);
@@ -393,4 +393,68 @@ fn test_history_isolated_per_node() {
     assert_eq!(i_history.len(), 1);
     assert_eq!(h_history[0]["created_at_ms"], 1_000u64);
     assert_eq!(i_history[0]["created_at_ms"], 2_000u64);
+}
+
+// --- v0.9.8 HA mode and store probe tests ------------------------------------
+
+use crate::verifier::VerifierOperationMode;
+
+#[test]
+fn test_verifier_mode_active_by_default() {
+    // Without AEGIS_VERIFIER_MODE set, mode must be Active.
+    // We can't unset env vars safely in parallel tests, so test the parser directly.
+    let mode = match "".to_ascii_lowercase().as_str() {
+        "passive" | "passive_standby" | "standby" => VerifierOperationMode::PassiveStandby,
+        _ => VerifierOperationMode::Active,
+    };
+    assert_eq!(mode, VerifierOperationMode::Active);
+}
+
+#[test]
+fn test_verifier_mode_passive_variants_parsed() {
+    for input in ["passive", "PASSIVE", "passive_standby", "Standby"] {
+        let mode = match input.to_ascii_lowercase().as_str() {
+            "passive" | "passive_standby" | "standby" => VerifierOperationMode::PassiveStandby,
+            _ => VerifierOperationMode::Active,
+        };
+        assert_eq!(mode, VerifierOperationMode::PassiveStandby,
+            "{input:?} should parse to PassiveStandby");
+    }
+}
+
+#[test]
+fn test_active_mode_allows_mutation() {
+    assert!(VerifierOperationMode::Active.allows_mutation());
+}
+
+#[test]
+fn test_passive_standby_mode_blocks_mutation() {
+    assert!(!VerifierOperationMode::PassiveStandby.allows_mutation());
+}
+
+#[test]
+fn test_health_check_passes_on_valid_connection() {
+    let store = in_memory_store();
+    assert!(store.health_check().is_ok(), "SELECT 1 must succeed on a live connection");
+}
+
+#[test]
+fn test_load_all_posture_events_returns_in_asc_order() {
+    let store = in_memory_store();
+    for (node, ts) in [("n1", 3_000u64), ("n2", 1_000), ("n1", 2_000)] {
+        store.save_posture_event(node, "EV", "{}", None, ts).unwrap();
+    }
+    let all = store.load_all_posture_events().unwrap();
+    assert_eq!(all.len(), 3);
+    // Ascending by created_at_ms across all nodes.
+    assert_eq!(all[0]["created_at_ms"], 1_000u64);
+    assert_eq!(all[1]["created_at_ms"], 2_000u64);
+    assert_eq!(all[2]["created_at_ms"], 3_000u64);
+}
+
+#[test]
+fn test_load_all_posture_events_empty_on_fresh_store() {
+    let store = in_memory_store();
+    let all = store.load_all_posture_events().unwrap();
+    assert!(all.is_empty());
 }

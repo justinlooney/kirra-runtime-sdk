@@ -57,6 +57,51 @@ pub struct FlapStatus {
     pub event_count_5m: u64,
 }
 
+/// Determines whether this instance accepts mutations or is read-only.
+///
+/// Active     — normal operation; all mutation routes are open (subject to auth).
+/// PassiveStandby — HA hot-spare; mutation routes return 503 to prevent split-brain.
+///
+/// Configured via AEGIS_VERIFIER_MODE env var.  Anything other than
+/// "passive", "passive_standby", or "standby" (case-insensitive) → Active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VerifierOperationMode {
+    Active,
+    PassiveStandby,
+}
+
+impl VerifierOperationMode {
+    pub fn from_env() -> Self {
+        match std::env::var("AEGIS_VERIFIER_MODE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "passive" | "passive_standby" | "standby" => Self::PassiveStandby,
+            _ => Self::Active,
+        }
+    }
+
+    pub fn allows_mutation(self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
+/// Liveness/readiness probe response body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
+}
+
+/// Full state snapshot for backup and HA replication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupExport {
+    pub exported_at_ms: u64,
+    pub nodes: Vec<RegisteredNode>,
+    pub dependencies: std::collections::HashMap<String, Vec<String>>,
+    pub posture_events: Vec<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetNodePosture {
     pub node_id: String,
@@ -72,15 +117,18 @@ pub struct AppState {
     pub pending_challenges: DashMap<String, ChallengeEntry>,
     /// Durable store for nodes and dependency graph (write-through, read on boot).
     pub store: Arc<Mutex<VerifierStore>>,
+    /// Operational role: Active accepts mutations; PassiveStandby is read-only.
+    pub mode: VerifierOperationMode,
 }
 
 impl AppState {
-    pub fn new(store: VerifierStore) -> Self {
+    pub fn new(store: VerifierStore, mode: VerifierOperationMode) -> Self {
         Self {
             nodes: DashMap::new(),
             dependency_graph: DashMap::new(),
             pending_challenges: DashMap::new(),
             store: Arc::new(Mutex::new(store)),
+            mode,
         }
     }
 
