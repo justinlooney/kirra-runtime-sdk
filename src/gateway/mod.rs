@@ -1,4 +1,8 @@
-// src/gateway.rs
+// src/gateway/mod.rs
+
+pub mod interceptor;
+pub mod policy;
+pub mod policy_layer;
 
 use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
