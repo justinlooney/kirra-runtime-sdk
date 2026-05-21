@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// (e.g., servo loops, hydraulic valves), reduce this to match the worst-case latency
 /// budget — the TTL must be less than the time it takes for a physical state change
 /// to become hazardous if undetected.
-const CACHE_TTL_MS: u64 = 2_000;
+pub const CACHE_TTL_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedFleetPosture {
@@ -69,5 +69,113 @@ pub fn should_route_from_cache(cache: &SharedPostureCache) -> bool {
     match guard.as_ref() {
         Some(posture) => should_route_sensitive_command(posture, now),
         None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP command classification and posture-aware routing
+// ---------------------------------------------------------------------------
+
+/// Broad classification of an HTTP request by its operational impact.
+///
+/// The classification is derived from method + path only. Headers must never
+/// be the primary signal because they are caller-supplied and trivially forged.
+/// A header override (e.g., X-Aegis-Command-Class) may be consulted as a
+/// secondary signal for known-internal services, but it can only *downgrade*
+/// the class, never upgrade it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationalCommand {
+    ReadTelemetry,
+    WriteState,
+    SystemMutation,
+}
+
+/// Classify an HTTP request into an `OperationalCommand` using method + path.
+///
+/// Path matching rules (first match wins):
+///
+/// | Method       | Path prefix / exact       | Class           |
+/// |--------------|---------------------------|-----------------|
+/// | GET          | /metrics/*, /telemetry/*, /health/* | ReadTelemetry |
+/// | GET          | (any other)               | ReadTelemetry   |
+/// | POST         | /actuator/*, /cmd_vel, /control/* | WriteState |
+/// | PUT          | /actuator/*               | WriteState      |
+/// | POST         | /firmware/*, /reboot      | SystemMutation  |
+/// | PUT          | /config/*                 | SystemMutation  |
+/// | DELETE       | (any)                     | SystemMutation  |
+/// | unknown      | (any)                     | SystemMutation  |
+///
+/// Query strings are stripped before matching. Method comparison is
+/// case-insensitive.
+pub fn classify_http_command(method: &str, path: &str) -> OperationalCommand {
+    // Strip query string — classification is path-structure only.
+    let path = path.split('?').next().unwrap_or(path);
+    let method = method.to_ascii_uppercase();
+
+    match method.as_str() {
+        "GET" => {
+            // All GETs are reads; HTTP semantics prohibit side effects.
+            // The explicit prefixes (/metrics, /telemetry, /health) are the
+            // canonical read paths. Any other GET is still a read — the
+            // catch-all keeps classification simple and safe.
+            OperationalCommand::ReadTelemetry
+        }
+        "POST" => {
+            if path.starts_with("/actuator")
+                || path == "/cmd_vel"
+                || path.starts_with("/control")
+            {
+                OperationalCommand::WriteState
+            } else if path.starts_with("/firmware") || path == "/reboot" {
+                OperationalCommand::SystemMutation
+            } else {
+                // Unknown POST paths can mutate state — treat conservatively.
+                OperationalCommand::WriteState
+            }
+        }
+        "PUT" => {
+            if path.starts_with("/actuator") {
+                OperationalCommand::WriteState
+            } else if path.starts_with("/config") {
+                OperationalCommand::SystemMutation
+            } else {
+                OperationalCommand::WriteState
+            }
+        }
+        "DELETE" => OperationalCommand::SystemMutation,
+        _ => {
+            // Unknown HTTP methods have undefined semantics — most conservative class.
+            OperationalCommand::SystemMutation
+        }
+    }
+}
+
+/// Decide whether to forward a command based on fleet posture and cache freshness.
+///
+/// Policy (ordered by severity, first match wins):
+///
+/// | Condition                   | ReadTelemetry | WriteState | SystemMutation |
+/// |-----------------------------|---------------|------------|----------------|
+/// | Stale (> CACHE_TTL_MS)      | deny          | deny       | deny           |
+/// | LockedOut                   | deny          | deny       | deny           |
+/// | Degraded                    | allow         | deny       | deny           |
+/// | Nominal                     | allow         | allow      | allow          |
+///
+/// "Missing" (cache is `None`) must be handled by the caller before invoking
+/// this function. `should_route_from_cache` handles that case.
+pub fn should_route_command(
+    cache: &CachedFleetPosture,
+    now_ms: u64,
+    command: OperationalCommand,
+) -> bool {
+    let age_ms = now_ms.saturating_sub(cache.updated_at_epoch_ms);
+    if age_ms > CACHE_TTL_MS {
+        return false;
+    }
+
+    match cache.propagated_status {
+        FleetPosture::Nominal => true,
+        FleetPosture::Degraded => matches!(command, OperationalCommand::ReadTelemetry),
+        FleetPosture::LockedOut => false,
     }
 }

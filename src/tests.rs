@@ -180,3 +180,119 @@ fn test_posture_locked_out_dep_propagates_locked_out_not_degraded() {
         "LockedOut dependency must propagate LockedOut to parent, not be softened to Degraded");
     assert!(posture.blocked_by.contains(&"dep".to_string()));
 }
+
+// --- HTTP command classification tests ---------------------------------------
+
+use crate::posture_cache::{
+    classify_http_command, should_route_command,
+    CachedFleetPosture, OperationalCommand, CACHE_TTL_MS,
+};
+
+fn make_cache(status: FleetPosture, age_ms: u64) -> (CachedFleetPosture, u64) {
+    let updated_at = 100_000u64;
+    let now = updated_at + age_ms;
+    let cache = CachedFleetPosture {
+        node_id: "test".to_string(),
+        local_status: NodeTrustState::Trusted,
+        propagated_status: status,
+        blocked_by: vec![],
+        updated_at_epoch_ms: updated_at,
+    };
+    (cache, now)
+}
+
+#[test]
+fn test_classify_get_paths_are_read_telemetry() {
+    assert_eq!(classify_http_command("GET", "/metrics/cpu"),       OperationalCommand::ReadTelemetry);
+    assert_eq!(classify_http_command("GET", "/telemetry/joints"),  OperationalCommand::ReadTelemetry);
+    assert_eq!(classify_http_command("GET", "/health/live"),       OperationalCommand::ReadTelemetry);
+    // Unknown GET paths are still reads — HTTP semantics prohibit side effects.
+    assert_eq!(classify_http_command("GET", "/unknown/path"),      OperationalCommand::ReadTelemetry);
+}
+
+#[test]
+fn test_classify_actuator_and_control_are_write_state() {
+    assert_eq!(classify_http_command("POST", "/actuator/servo"),   OperationalCommand::WriteState);
+    assert_eq!(classify_http_command("PUT",  "/actuator/valve"),   OperationalCommand::WriteState);
+    assert_eq!(classify_http_command("POST", "/cmd_vel"),          OperationalCommand::WriteState);
+    assert_eq!(classify_http_command("POST", "/control/arm"),      OperationalCommand::WriteState);
+}
+
+#[test]
+fn test_classify_system_mutations() {
+    assert_eq!(classify_http_command("POST",   "/firmware/update"), OperationalCommand::SystemMutation);
+    assert_eq!(classify_http_command("POST",   "/reboot"),          OperationalCommand::SystemMutation);
+    assert_eq!(classify_http_command("PUT",    "/config/network"),  OperationalCommand::SystemMutation);
+    assert_eq!(classify_http_command("DELETE", "/nodes/abc"),       OperationalCommand::SystemMutation);
+    assert_eq!(classify_http_command("DELETE", "/"),                OperationalCommand::SystemMutation);
+}
+
+#[test]
+fn test_classify_strips_query_string_before_matching() {
+    assert_eq!(classify_http_command("GET",  "/metrics?window=60s"),         OperationalCommand::ReadTelemetry);
+    assert_eq!(classify_http_command("POST", "/actuator/servo?dry_run=true"), OperationalCommand::WriteState);
+    assert_eq!(classify_http_command("PUT",  "/config/net?validate=1"),       OperationalCommand::SystemMutation);
+}
+
+#[test]
+fn test_classify_method_comparison_is_case_insensitive() {
+    assert_eq!(classify_http_command("get",    "/metrics"), OperationalCommand::ReadTelemetry);
+    assert_eq!(classify_http_command("post",   "/cmd_vel"), OperationalCommand::WriteState);
+    assert_eq!(classify_http_command("delete", "/x"),       OperationalCommand::SystemMutation);
+}
+
+#[test]
+fn test_classify_unknown_method_is_system_mutation() {
+    assert_eq!(classify_http_command("PATCH",  "/actuator/x"), OperationalCommand::SystemMutation);
+    assert_eq!(classify_http_command("FROBNI", "/anything"),   OperationalCommand::SystemMutation);
+}
+
+#[test]
+fn test_routing_nominal_allows_all_command_classes() {
+    let (cache, now) = make_cache(FleetPosture::Nominal, 500);
+    assert!(should_route_command(&cache, now, OperationalCommand::ReadTelemetry));
+    assert!(should_route_command(&cache, now, OperationalCommand::WriteState));
+    assert!(should_route_command(&cache, now, OperationalCommand::SystemMutation));
+}
+
+#[test]
+fn test_routing_degraded_allows_reads_blocks_writes() {
+    let (cache, now) = make_cache(FleetPosture::Degraded, 500);
+    assert!( should_route_command(&cache, now, OperationalCommand::ReadTelemetry),
+        "Degraded must still allow telemetry reads");
+    assert!(!should_route_command(&cache, now, OperationalCommand::WriteState),
+        "Degraded must block WriteState");
+    assert!(!should_route_command(&cache, now, OperationalCommand::SystemMutation),
+        "Degraded must block SystemMutation");
+}
+
+#[test]
+fn test_routing_locked_out_blocks_all_including_reads() {
+    let (cache, now) = make_cache(FleetPosture::LockedOut, 500);
+    assert!(!should_route_command(&cache, now, OperationalCommand::ReadTelemetry));
+    assert!(!should_route_command(&cache, now, OperationalCommand::WriteState));
+    assert!(!should_route_command(&cache, now, OperationalCommand::SystemMutation));
+}
+
+#[test]
+fn test_routing_stale_cache_blocks_all_regardless_of_posture() {
+    // Even a Nominal posture entry must be blocked once the TTL expires.
+    let stale_age = CACHE_TTL_MS + 1;
+    let (cache, now) = make_cache(FleetPosture::Nominal, stale_age);
+    assert!(!should_route_command(&cache, now, OperationalCommand::ReadTelemetry));
+    assert!(!should_route_command(&cache, now, OperationalCommand::WriteState));
+    assert!(!should_route_command(&cache, now, OperationalCommand::SystemMutation));
+}
+
+#[test]
+fn test_routing_exactly_at_ttl_boundary_is_allowed() {
+    // Age == CACHE_TTL_MS is still within window (> not >=).
+    let (cache, now) = make_cache(FleetPosture::Nominal, CACHE_TTL_MS);
+    assert!(should_route_command(&cache, now, OperationalCommand::WriteState));
+}
+
+#[test]
+fn test_routing_one_ms_past_ttl_is_blocked() {
+    let (cache, now) = make_cache(FleetPosture::Nominal, CACHE_TTL_MS + 1);
+    assert!(!should_route_command(&cache, now, OperationalCommand::WriteState));
+}
