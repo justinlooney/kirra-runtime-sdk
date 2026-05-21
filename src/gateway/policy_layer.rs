@@ -1,218 +1,309 @@
 // src/gateway/policy_layer.rs
 //
-// Tower Layer/Service that enforces the Aegis posture-aware command routing
-// policy on every inbound HTTP request before it reaches the inner service.
+// Actuator safety envelope middleware for Aegis AV flight envelope protection.
+//
+// This Tower/axum middleware layer sits on actuator write routes and enforces the
+// VehicleKinematicsContract before any command reaches the physical actuator network.
+// It selects the appropriate kinematic profile based on the live fleet posture from
+// SharedPostureCache, then passes the proposed command through validate_vehicle_command.
+//
+// Security invariants respected:
+//   - Uses State<Arc<ServiceState>>, NOT State<Arc<AppState>> (invariant #11)
+//   - FleetPosture imported from crate::verifier, NOT crate::gateway::posture_cache
+//   - SharedPostureCache accessed via svc.posture_cache (lives on ServiceState)
+//   - LockedOut → 403 FORBIDDEN, fail-closed, no further processing
+//   - DenyBreach violations logged to audit chain via store methods (no Mutex assumption)
+//   - No hardcoded tokens, no env::set_var, no TransientLocal DDS
+//   - now_ms() defined locally; no external time dependency
 
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::Response,
+};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::body::Body;
-use http::{Request, Response, StatusCode};
-use tower::{Layer, Service};
-
-use crate::gateway::interceptor::{now_ms, should_route_command, SharedPostureCache};
-use crate::gateway::policy::classify_http_command;
+use crate::gateway::kinematics_contract::{
+    validate_vehicle_command, EnforceAction, ProposedVehicleCommand, VehicleKinematicsContract,
+};
+// Correct import paths per architecture invariants:
+//   FleetPosture lives in crate::verifier, not crate::gateway::posture_cache
+use crate::verifier::FleetPosture;
+// ServiceState is the axum router state — wraps Arc<AppState> + SharedPostureCache
+// All handlers must use State<Arc<ServiceState>>, never State<Arc<AppState>>
+use crate::bin::aegis_verifier_service::ServiceState;
 
 // ---------------------------------------------------------------------------
-// Layer
+// Helpers
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-pub struct AegisPolicyLayer {
-    pub cache: SharedPostureCache,
+/// Returns the current time as milliseconds since UNIX epoch.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
-impl<S> Layer<S> for AegisPolicyLayer {
-    type Service = AegisPolicyService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        AegisPolicyService { inner, cache: self.cache.clone() }
+/// Resolves the current FleetPosture from the SharedPostureCache.
+///
+/// `None` (cold start or expired cache) and a poisoned RwLock both map to
+/// LockedOut — fail-closed in all ambiguous cases.
+fn resolve_posture(svc: &ServiceState) -> FleetPosture {
+    match svc.posture_cache.read() {
+        Ok(guard) => match guard.as_ref() {
+            Some(cached) => cached.posture.clone(),
+            None => FleetPosture::LockedOut,
+        },
+        Err(_) => FleetPosture::LockedOut,
     }
 }
 
 // ---------------------------------------------------------------------------
-// Service
+// Middleware
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-pub struct AegisPolicyService<S> {
-    inner: S,
-    cache: SharedPostureCache,
-}
+/// Actuator command safety envelope middleware.
+///
+/// Intercepts inbound actuator motion commands, resolves the active fleet posture,
+/// selects the appropriate `VehicleKinematicsContract`, and enforces all physical
+/// invariants before the request reaches any downstream handler.
+///
+/// Posture → Contract mapping:
+///   Nominal   → nominal_reference_profile() — full operational envelope
+///   Degraded  → mrc_fallback_profile()      — MRC crawl-speed envelope
+///   LockedOut → immediate 403 FORBIDDEN     — fail-closed, no physics evaluation
+///
+/// On ClampLinear / ClampSteering the mutated payload is forwarded to the
+/// downstream handler. On DenyBreach the command is dropped (400) and the
+/// violation is written to the tamper-evident audit chain.
+///
+/// # Invariants
+/// - Uses `State<Arc<ServiceState>>` (invariant #11)
+/// - `FleetPosture` from `crate::verifier`
+/// - `SharedPostureCache` accessed via `svc.posture_cache`
+/// - LockedOut is always fail-closed
+pub async fn enforce_actuator_safety_envelope(
+    State(svc): State<Arc<ServiceState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // ------------------------------------------------------------------
+    // Step 1: Resolve active fleet posture from SharedPostureCache.
+    // SharedPostureCache = Arc<RwLock<Option<CachedFleetPosture>>>.
+    // Lives on ServiceState.posture_cache, NOT on AppState.
+    // ------------------------------------------------------------------
+    let posture = resolve_posture(&svc);
 
-impl<S> Service<Request<Body>> for AegisPolicyService<S>
-where
-    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
-    S::Future: Send + 'static,
-{
-    type Response = Response<Body>;
-    type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    // ------------------------------------------------------------------
+    // Step 2: Select the kinematic contract profile.
+    // LockedOut → immediate 403; no command parsing, no physics.
+    // ------------------------------------------------------------------
+    let contract: VehicleKinematicsContract = match posture {
+        FleetPosture::Nominal => VehicleKinematicsContract::nominal_reference_profile(),
+        FleetPosture::Degraded => VehicleKinematicsContract::mrc_fallback_profile(),
+        FleetPosture::LockedOut => {
+            tracing::error!(
+                "Actuator command rejected: fleet posture is LockedOut — \
+                 all actuator mutations are blocked until posture recovers"
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+    };
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
+    // ------------------------------------------------------------------
+    // Step 3: Consume and parse the request body.
+    // Body is a one-shot stream; we buffer it so we can re-assemble the
+    // request for the Allow and Clamp paths.
+    // ------------------------------------------------------------------
+    let (parts, body) = req.into_parts();
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let method = req.method().as_str().to_string();
-        let path = req.uri().path().to_string();
-        let command = classify_http_command(&method, &path);
+    let bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-        // Read the cache inside a scoped block so the RwLock guard is dropped
-        // before the async boundary — holding a lock across an await is unsound.
-        let allowed = {
-            let now = now_ms();
-            match self.cache.read() {
-                Ok(guard) => match guard.as_ref() {
-                    Some(posture) => should_route_command(posture, now, command),
-                    None => false,
-                },
-                Err(_) => false,
-            }
-        };
+    let proposed_cmd: ProposedVehicleCommand =
+        serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-        if !allowed {
-            return Box::pin(async move {
-                Ok(Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .body(Body::from("AEGIS_POLICY_DENY"))
-                    .unwrap())
-            });
+    // ------------------------------------------------------------------
+    // Step 4: Run the deterministic kinematics validation pipeline.
+    // ------------------------------------------------------------------
+    match validate_vehicle_command(&proposed_cmd, &contract) {
+        EnforceAction::Allow => {
+            let rebuilt = Request::from_parts(parts, Body::from(bytes));
+            Ok(next.run(rebuilt).await)
         }
 
-        let mut inner = self.inner.clone();
-        Box::pin(async move { inner.call(req).await })
+        EnforceAction::ClampLinear(safe_speed) => {
+            tracing::warn!(
+                requested_mps = %proposed_cmd.linear_velocity_mps,
+                clamped_mps   = %safe_speed,
+                "Kinematic envelope breach: linear velocity clamped"
+            );
+            let mut clamped_cmd = proposed_cmd.clone();
+            clamped_cmd.linear_velocity_mps = safe_speed;
+            let serialized = serde_json::to_vec(&clamped_cmd)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let rebuilt = Request::from_parts(parts, Body::from(serialized));
+            Ok(next.run(rebuilt).await)
+        }
+
+        EnforceAction::ClampSteering(safe_angle) => {
+            tracing::warn!(
+                requested_deg = %proposed_cmd.steering_angle_deg,
+                clamped_deg   = %safe_angle,
+                "Kinematic envelope breach: steering angle clamped"
+            );
+            let mut clamped_cmd = proposed_cmd.clone();
+            clamped_cmd.steering_angle_deg = safe_angle;
+            let serialized = serde_json::to_vec(&clamped_cmd)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let rebuilt = Request::from_parts(parts, Body::from(serialized));
+            Ok(next.run(rebuilt).await)
+        }
+
+        EnforceAction::DenyBreach(ref reason) => {
+            tracing::error!(
+                reason               = %reason,
+                linear_velocity_mps  = %proposed_cmd.linear_velocity_mps,
+                steering_angle_deg   = %proposed_cmd.steering_angle_deg,
+                delta_time_s         = %proposed_cmd.delta_time_s,
+                "Inadmissible actuator command rejected at kinematic safety perimeter"
+            );
+
+            // Write to the tamper-evident audit chain.
+            // VerifierStore is accessed directly — no Mutex wrapper (invariant).
+            // Log failure must not convert a 400 into a 500.
+            let log_payload = serde_json::json!({
+                "violation": reason,
+                "proposed_command": {
+                    "linear_velocity_mps": proposed_cmd.linear_velocity_mps,
+                    "current_velocity_mps": proposed_cmd.current_velocity_mps,
+                    "delta_time_s": proposed_cmd.delta_time_s,
+                    "steering_angle_deg": proposed_cmd.steering_angle_deg,
+                    "current_steering_angle_deg": proposed_cmd.current_steering_angle_deg,
+                },
+                "posture_at_rejection": format!("{posture:?}"),
+            });
+
+            // save_posture_event_chained: disk before memory (invariant #12).
+            let _ = svc.app.store.save_posture_event_chained(
+                "actuator_safety_envelope",
+                "KINEMATIC_CONTRACT_VIOLATION",
+                &log_payload.to_string(),
+                Some("Proposed vehicle command violates non-physical invariants"),
+                now_ms(),
+            );
+
+            Err(StatusCode::BAD_REQUEST)
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Unit Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+mod actuator_middleware_tests {
     use super::*;
-    use crate::gateway::interceptor::{CachedFleetPosture, FleetPosture, NodeTrustState};
-    use axum::{routing::get, routing::post, Router};
-    use std::sync::{Arc, RwLock};
-    use tower::ServiceExt;
+    use crate::gateway::kinematics_contract::{ProposedVehicleCommand, VehicleKinematicsContract};
+    use crate::verifier::FleetPosture;
 
-    async fn ok_handler() -> &'static str { "ok" }
+    // Contract selection logic — no ServiceState needed.
+    // Full axum integration tests are in tests/actuator_middleware_integration.rs.
 
-    fn cache_with(posture: FleetPosture) -> SharedPostureCache {
-        Arc::new(RwLock::new(Some(CachedFleetPosture {
-            node_id: "test-node".to_string(),
-            local_status: NodeTrustState::Trusted,
-            propagated_status: posture,
-            blocked_by: vec![],
-            updated_at_epoch_ms: now_ms(),
-        })))
+    #[test]
+    fn test_nominal_posture_selects_nominal_contract() {
+        let contract = match FleetPosture::Nominal {
+            FleetPosture::Nominal => VehicleKinematicsContract::nominal_reference_profile(),
+            FleetPosture::Degraded => VehicleKinematicsContract::mrc_fallback_profile(),
+            FleetPosture::LockedOut => panic!("should not reach LockedOut"),
+        };
+        assert_eq!(contract.max_speed_mps, 35.0);
+        assert_eq!(contract.max_lateral_accel_mps2, 3.5);
     }
 
-    #[tokio::test]
-    async fn test_nominal_allows_write_state() {
-        let app = Router::new()
-            .route("/cmd_vel", post(ok_handler))
-            .layer(AegisPolicyLayer { cache: cache_with(FleetPosture::Nominal) });
-
-        let res = app
-            .oneshot(Request::builder().method("POST").uri("/cmd_vel").body(Body::empty()).unwrap())
-            .await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+    #[test]
+    fn test_degraded_posture_selects_mrc_contract() {
+        let contract = match FleetPosture::Degraded {
+            FleetPosture::Nominal => VehicleKinematicsContract::nominal_reference_profile(),
+            FleetPosture::Degraded => VehicleKinematicsContract::mrc_fallback_profile(),
+            FleetPosture::LockedOut => panic!("should not reach LockedOut"),
+        };
+        assert_eq!(contract.max_speed_mps, 5.0);
+        assert_eq!(contract.max_lateral_accel_mps2, 1.5);
     }
 
-    #[tokio::test]
-    async fn test_nominal_allows_system_mutation() {
-        let app = Router::new()
-            .route("/reboot", post(ok_handler))
-            .layer(AegisPolicyLayer { cache: cache_with(FleetPosture::Nominal) });
-
-        let res = app
-            .oneshot(Request::builder().method("POST").uri("/reboot").body(Body::empty()).unwrap())
-            .await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+    #[test]
+    fn test_mrc_profile_rejects_nominal_speed_command() {
+        let mrc = VehicleKinematicsContract::mrc_fallback_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 20.0,
+            current_velocity_mps: 19.0,
+            delta_time_s: 0.5,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &mrc),
+            EnforceAction::ClampLinear(5.0)
+        );
     }
 
-    #[tokio::test]
-    async fn test_degraded_allows_read_telemetry() {
-        let app = Router::new()
-            .route("/telemetry/status", get(ok_handler))
-            .layer(AegisPolicyLayer { cache: cache_with(FleetPosture::Degraded) });
-
-        let res = app
-            .oneshot(Request::builder().method("GET").uri("/telemetry/status").body(Body::empty()).unwrap())
-            .await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+    #[test]
+    fn test_nominal_profile_passes_same_command() {
+        let nominal = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 20.0,
+            current_velocity_mps: 19.0,
+            delta_time_s: 0.5,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(validate_vehicle_command(&cmd, &nominal), EnforceAction::Allow);
     }
 
-    #[tokio::test]
-    async fn test_degraded_blocks_write_state() {
-        let app = Router::new()
-            .route("/cmd_vel", post(ok_handler))
-            .layer(AegisPolicyLayer { cache: cache_with(FleetPosture::Degraded) });
-
-        let res = app
-            .oneshot(Request::builder().method("POST").uri("/cmd_vel").body(Body::empty()).unwrap())
-            .await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    #[test]
+    fn test_deny_breach_fires_for_non_physical_dt() {
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 10.0,
+            current_velocity_mps: 10.0,
+            delta_time_s: -1.0,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::DenyBreach("INVALID_TIME_DELTA".to_string())
+        );
     }
 
-    #[tokio::test]
-    async fn test_degraded_blocks_system_mutation() {
-        let app = Router::new()
-            .route("/reboot", post(ok_handler))
-            .layer(AegisPolicyLayer { cache: cache_with(FleetPosture::Degraded) });
+    #[test]
+    fn test_highway_speed_high_steering_clamps_under_nominal_and_mrc() {
+        let nominal = VehicleKinematicsContract::nominal_reference_profile();
+        let mrc = VehicleKinematicsContract::mrc_fallback_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 30.0,
+            current_velocity_mps: 30.0,
+            delta_time_s: 1.0,
+            steering_angle_deg: 20.0,
+            current_steering_angle_deg: 0.0,
+        };
 
-        let res = app
-            .oneshot(Request::builder().method("POST").uri("/reboot").body(Body::empty()).unwrap())
-            .await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn test_locked_out_blocks_all_including_reads() {
-        let app = Router::new()
-            .route("/metrics", get(ok_handler))
-            .layer(AegisPolicyLayer { cache: cache_with(FleetPosture::LockedOut) });
-
-        let res = app
-            .oneshot(Request::builder().method("GET").uri("/metrics").body(Body::empty()).unwrap())
-            .await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn test_missing_cache_blocks_even_read() {
-        let cache: SharedPostureCache = Arc::new(RwLock::new(None));
-        let app = Router::new()
-            .route("/telemetry/status", get(ok_handler))
-            .layer(AegisPolicyLayer { cache });
-
-        let res = app
-            .oneshot(Request::builder().method("GET").uri("/telemetry/status").body(Body::empty()).unwrap())
-            .await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn test_poisoned_cache_lock_blocks_request() {
-        use std::sync::Arc;
-        // Poison the lock by panicking inside a write guard.
-        let cache: SharedPostureCache = Arc::new(RwLock::new(None));
-        let cache_clone = cache.clone();
-        let _ = std::panic::catch_unwind(move || {
-            let _guard = cache_clone.write().unwrap();
-            panic!("intentional poison");
-        });
-
-        let app = Router::new()
-            .route("/cmd_vel", post(ok_handler))
-            .layer(AegisPolicyLayer { cache });
-
-        let res = app
-            .oneshot(Request::builder().method("POST").uri("/cmd_vel").body(Body::empty()).unwrap())
-            .await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        // Nominal: bicycle model fires → ClampSteering
+        match validate_vehicle_command(&cmd, &nominal) {
+            EnforceAction::ClampSteering(a) => assert!(a < 20.0 && a > 0.0),
+            other => panic!("nominal: expected ClampSteering, got {other:?}"),
+        }
+        // MRC: speed ceiling fires first (30 > 5) → ClampLinear
+        match validate_vehicle_command(&cmd, &mrc) {
+            EnforceAction::ClampLinear(v) => assert_eq!(v, 5.0),
+            other => panic!("mrc: expected ClampLinear, got {other:?}"),
+        }
     }
 }
