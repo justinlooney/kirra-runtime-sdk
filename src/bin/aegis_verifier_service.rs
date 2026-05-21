@@ -21,9 +21,15 @@ use aegis_runtime_sdk::verifier::{
 use aegis_runtime_sdk::verifier_store::VerifierStore;
 use aegis_runtime_sdk::posture_cache::{now_ms, CachedFleetPosture, SharedPostureCache};
 use aegis_runtime_sdk::security::constant_time_compare;
-use aegis_runtime_sdk::action_filter::{evaluate_action_claim, ActionClaim, ActionDecision};
+use aegis_runtime_sdk::action_filter::{evaluate_action_claim, ActionClaim};
 use aegis_runtime_sdk::protocol_adapter::{evaluate_industrial_event, IndustrialEvent};
-use aegis_runtime_sdk::federation::{evaluate_federated_report, FederatedTrustReport, ReportEvaluation};
+use aegis_runtime_sdk::federation::{
+    evaluate_federated_report,
+    verify_federated_report_signature,
+    FederatedTrustReport,
+    RegisterFederationControllerRequest,
+    ReportEvaluation,
+};
 
 // --- Auth middleware ---------------------------------------------------------
 
@@ -377,7 +383,7 @@ async fn verify_audit_chain(
     State(svc): State<Arc<ServiceState>>,
 ) -> impl IntoResponse {
     match svc.app.store.lock() {
-        Ok(mut store) => match store.verify_audit_chain_integrity() {
+        Ok(store) => match store.verify_audit_chain_integrity() {
             Ok(valid) => Json(json!({ "valid": valid })).into_response(),
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
                        Json(json!({ "error": "audit chain query failed" }))).into_response(),
@@ -453,38 +459,105 @@ async fn evaluate_industrial_adapter(
     Json(decision).into_response()
 }
 
+async fn register_federation_controller(
+    State(svc): State<Arc<ServiceState>>,
+    Json(req): Json<RegisterFederationControllerRequest>,
+) -> impl IntoResponse {
+    if req.controller_id.trim().is_empty() || req.public_key_b64.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "controller_id and public_key_b64 are required" }))).into_response();
+    }
+    match svc.app.store.lock() {
+        Ok(store) => match store.save_trusted_federation_controller(
+            &req.controller_id, &req.public_key_b64, now_ms(),
+        ) {
+            Ok(()) => (StatusCode::CREATED,
+                       Json(json!({ "controller_id": req.controller_id, "registered": true }))).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "error": "failed to register controller" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+}
+
 async fn submit_federated_report(
     State(svc): State<Arc<ServiceState>>,
     Json(report): Json<FederatedTrustReport>,
 ) -> impl IntoResponse {
     let received_at_ms = now_ms();
-    let evaluation = evaluate_federated_report(&report, received_at_ms);
 
-    if evaluation.accepted {
-        let posture_json = match serde_json::to_string(&report.posture) {
-            Ok(s) => s,
-            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
-                              Json(json!({ "error": "posture serialization failed" }))).into_response(),
-        };
-        match svc.app.store.lock() {
-            Ok(mut store) => {
-                if store.save_federated_report_chained(
-                    &report.source_controller_id,
-                    &report.asset_id,
-                    &posture_json,
-                    report.issued_at_ms,
-                    report.expires_at_ms,
-                    received_at_ms,
-                ).is_err() {
-                    return (StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({ "error": "failed to persist federated report" }))).into_response();
-                }
-            }
-            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
-                              Json(json!({ "error": "store lock poisoned" }))).into_response(),
-        }
+    // 1. Structural and freshness check (future timestamp, replay window, expiry).
+    let evaluation = evaluate_federated_report(&report, received_at_ms);
+    if !evaluation.accepted {
+        return Json(evaluation).into_response();
     }
-    Json(evaluation).into_response()
+
+    let mut store = match svc.app.store.lock() {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    };
+
+    // 2. Identity verification: reject claims from unregistered controllers.
+    let pk_b64 = match store.load_trusted_federation_controller_key(&report.source_controller_id) {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            let event = json!({ "source_controller_id": report.source_controller_id,
+                                "reason": "UNREGISTERED_FEDERATION_CONTROLLER" });
+            let _ = store.save_posture_event_chained(
+                "federation_gateway", "FEDERATION_REJECTED",
+                &event.to_string(), Some("unregistered source"), received_at_ms,
+            );
+            return Json(ReportEvaluation {
+                accepted: false,
+                reason: "UNREGISTERED_FEDERATION_CONTROLLER".to_string(),
+            }).into_response();
+        }
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          Json(json!({ "error": "controller lookup failed" }))).into_response(),
+    };
+
+    // 3. Cryptographic signature validation.
+    if !verify_federated_report_signature(&report, &pk_b64) {
+        let event = json!({ "source_controller_id": report.source_controller_id,
+                            "reason": "INVALID_FEDERATION_SIGNATURE" });
+        let _ = store.save_posture_event_chained(
+            "federation_gateway", "FEDERATION_REJECTED",
+            &event.to_string(), Some("signature mismatch"), received_at_ms,
+        );
+        return Json(ReportEvaluation {
+            accepted: false,
+            reason: "INVALID_FEDERATION_SIGNATURE".to_string(),
+        }).into_response();
+    }
+
+    // 4. Nonce replay prevention.
+    match store.has_seen_federation_nonce(&report.nonce_hex) {
+        Ok(true) => {
+            let event = json!({ "source_controller_id": report.source_controller_id,
+                                "nonce_hex": report.nonce_hex,
+                                "reason": "FEDERATION_NONCE_REPLAY" });
+            let _ = store.save_posture_event_chained(
+                "federation_gateway", "FEDERATION_REJECTED",
+                &event.to_string(), Some("nonce replay"), received_at_ms,
+            );
+            return Json(ReportEvaluation {
+                accepted: false,
+                reason: "FEDERATED_NONCE_REPLAY".to_string(),
+            }).into_response();
+        }
+        Ok(false) => {}
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          Json(json!({ "error": "nonce lookup failed" }))).into_response(),
+    }
+
+    // 5. Atomic commit: report + nonce burn + audit chain.
+    match store.save_federated_report_chained(&report, received_at_ms) {
+        Ok(()) => Json(evaluation).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "failed to persist federated report" }))).into_response(),
+    }
 }
 
 async fn get_federated_reports(
@@ -551,6 +624,7 @@ async fn main() {
         .route("/action_filter/evaluate", post(evaluate_action_filter))
         .route("/industrial/evaluate", post(evaluate_industrial_adapter))
         .route("/federation/reports/submit", post(submit_federated_report))
+        .route("/federation/controllers/register", post(register_federation_controller))
         .layer(middleware::from_fn(require_admin_token));
 
     // Challenge and verify are unauthenticated — the challenge-response protocol

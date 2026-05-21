@@ -467,3 +467,96 @@ fn test_load_all_posture_events_empty_on_fresh_store() {
     let all = store.load_all_posture_events().unwrap();
     assert!(all.is_empty());
 }
+
+#[test]
+fn test_valid_ed25519_signature_verification_passes() {
+    use crate::federation::{canonical_federation_payload, verify_federated_report_signature, FederatedTrustReport};
+    use crate::verifier::FleetPosture;
+    use ed25519_dalek::{SigningKey, Signer};
+    use rand::rngs::OsRng;
+    use base64::{engine::general_purpose::STANDARD as b64, Engine as _};
+
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let verifying_key = signing_key.verifying_key();
+    let public_key_b64 = b64.encode(verifying_key.to_bytes());
+    let current_time = 1_716_300_000_000u64;
+
+    let mut report = FederatedTrustReport {
+        source_controller_id: "cluster-edge-01".to_string(),
+        asset_id: "critical-actuator".to_string(),
+        posture: FleetPosture::Nominal,
+        issued_at_ms: current_time,
+        expires_at_ms: current_time + 10_000,
+        nonce_hex: "a1b2c3d4e5f6".to_string(),
+        signature_b64: String::new(),
+    };
+
+    let payload = canonical_federation_payload(&report);
+    let signature = signing_key.sign(payload.as_bytes());
+    report.signature_b64 = b64.encode(signature.to_bytes());
+
+    assert!(verify_federated_report_signature(&report, &public_key_b64));
+}
+
+#[test]
+fn test_tampered_payload_ed25519_verification_fails() {
+    use crate::federation::{canonical_federation_payload, verify_federated_report_signature, FederatedTrustReport};
+    use crate::verifier::FleetPosture;
+    use ed25519_dalek::{SigningKey, Signer};
+    use rand::rngs::OsRng;
+    use base64::{engine::general_purpose::STANDARD as b64, Engine as _};
+
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let verifying_key = signing_key.verifying_key();
+    let public_key_b64 = b64.encode(verifying_key.to_bytes());
+    let current_time = 1_716_300_000_000u64;
+
+    let mut report = FederatedTrustReport {
+        source_controller_id: "cluster-edge-01".to_string(),
+        asset_id: "critical-actuator".to_string(),
+        posture: FleetPosture::Nominal,
+        issued_at_ms: current_time,
+        expires_at_ms: current_time + 10_000,
+        nonce_hex: "a1b2c3d4e5f6".to_string(),
+        signature_b64: String::new(),
+    };
+
+    let payload = canonical_federation_payload(&report);
+    let signature = signing_key.sign(payload.as_bytes());
+    report.signature_b64 = b64.encode(signature.to_bytes());
+
+    // Tamper: change asset_id after signing
+    report.asset_id = "different-actuator".to_string();
+
+    assert!(!verify_federated_report_signature(&report, &public_key_b64));
+}
+
+#[test]
+fn test_wrong_key_ed25519_verification_fails() {
+    use crate::federation::{canonical_federation_payload, verify_federated_report_signature, FederatedTrustReport};
+    use crate::verifier::FleetPosture;
+    use ed25519_dalek::{SigningKey, Signer};
+    use rand::rngs::OsRng;
+    use base64::{engine::general_purpose::STANDARD as b64, Engine as _};
+
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let wrong_key = SigningKey::generate(&mut OsRng);
+    let wrong_public_key_b64 = b64.encode(wrong_key.verifying_key().to_bytes());
+    let current_time = 1_716_300_000_000u64;
+
+    let mut report = FederatedTrustReport {
+        source_controller_id: "cluster-edge-01".to_string(),
+        asset_id: "critical-actuator".to_string(),
+        posture: FleetPosture::Nominal,
+        issued_at_ms: current_time,
+        expires_at_ms: current_time + 10_000,
+        nonce_hex: "a1b2c3d4e5f6".to_string(),
+        signature_b64: String::new(),
+    };
+
+    let payload = canonical_federation_payload(&report);
+    let signature = signing_key.sign(payload.as_bytes());
+    report.signature_b64 = b64.encode(signature.to_bytes());
+
+    assert!(!verify_federated_report_signature(&report, &wrong_public_key_b64));
+}

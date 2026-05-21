@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use rusqlite::{params, Connection, Result};
 use crate::verifier::{NodeTrustState, RegisteredNode};
+use crate::federation::FederatedTrustReport;
 
 pub struct VerifierStore {
     conn: Connection,
@@ -256,6 +257,22 @@ impl VerifierStore {
             )",
             [],
         )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS trusted_federation_controllers (
+                controller_id    TEXT PRIMARY KEY,
+                public_key_b64   TEXT NOT NULL,
+                registered_at_ms INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS federation_report_nonces (
+                nonce_hex            TEXT PRIMARY KEY,
+                source_controller_id TEXT NOT NULL,
+                seen_at_ms           INTEGER NOT NULL
+            )",
+            [],
+        )?;
         Ok(())
     }
 
@@ -280,31 +297,42 @@ impl VerifierStore {
         tx.commit()
     }
 
+    /// Atomically commits a verified federated report: persists the report,
+    /// burns the nonce, and chains the event into the tamper-evident audit ledger.
     pub fn save_federated_report_chained(
         &mut self,
-        source_controller_id: &str,
-        asset_id: &str,
-        posture_json: &str,
-        issued_at_ms: u64,
-        expires_at_ms: u64,
+        report: &FederatedTrustReport,
         received_at_ms: u64,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
+
+        let posture_json = serde_json::to_string(&report.posture)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
         tx.execute(
             "INSERT INTO federated_trust_reports
              (source_controller_id, asset_id, posture_json, issued_at_ms, expires_at_ms, received_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                source_controller_id, asset_id, posture_json,
-                issued_at_ms as i64, expires_at_ms as i64, received_at_ms as i64,
+                report.source_controller_id, report.asset_id, posture_json,
+                report.issued_at_ms as i64, report.expires_at_ms as i64, received_at_ms as i64,
             ],
         )?;
+
+        // Consume the nonce atomically with the report commit.
+        tx.execute(
+            "INSERT INTO federation_report_nonces (nonce_hex, source_controller_id, seen_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![report.nonce_hex, report.source_controller_id, received_at_ms as i64],
+        )?;
+
         let audit = serde_json::json!({
-            "source_controller_id": source_controller_id,
-            "asset_id": asset_id,
+            "source_controller_id": report.source_controller_id,
+            "asset_id": report.asset_id,
             "posture": posture_json,
-            "issued_at_ms": issued_at_ms,
-            "expires_at_ms": expires_at_ms,
+            "issued_at_ms": report.issued_at_ms,
+            "expires_at_ms": report.expires_at_ms,
+            "nonce_hex": report.nonce_hex,
             "received_at_ms": received_at_ms,
         });
         crate::audit_chain::AuditChainLinker::append_audit_event_tx(
@@ -313,7 +341,49 @@ impl VerifierStore {
             &audit.to_string(),
             received_at_ms as i64,
         )?;
+
         tx.commit()
+    }
+
+    // --- v1.1 trusted federation controller registry -------------------------
+
+    pub fn save_trusted_federation_controller(
+        &self,
+        controller_id: &str,
+        public_key_b64: &str,
+        registered_at_ms: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO trusted_federation_controllers
+             (controller_id, public_key_b64, registered_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![controller_id, public_key_b64, registered_at_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_trusted_federation_controller_key(
+        &self,
+        controller_id: &str,
+    ) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT public_key_b64 FROM trusted_federation_controllers
+             WHERE controller_id = ?1",
+        )?;
+        match stmt.query_row(params![controller_id], |row| row.get::<_, String>(0)) {
+            Ok(key) => Ok(Some(key)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn has_seen_federation_nonce(&self, nonce_hex: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM federation_report_nonces WHERE nonce_hex = ?1",
+            params![nonce_hex],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn load_federated_reports_for_asset(
