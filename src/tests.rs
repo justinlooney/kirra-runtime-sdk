@@ -242,9 +242,9 @@ fn test_classify_method_comparison_is_case_insensitive() {
 }
 
 #[test]
-fn test_classify_unknown_method_is_system_mutation() {
-    assert_eq!(classify_http_command("PATCH",  "/actuator/x"), OperationalCommand::SystemMutation);
-    assert_eq!(classify_http_command("FROBNI", "/anything"),   OperationalCommand::SystemMutation);
+fn test_classify_unknown_method_is_unknown() {
+    assert_eq!(classify_http_command("PATCH",  "/actuator/x"), OperationalCommand::Unknown);
+    assert_eq!(classify_http_command("FROBNI", "/anything"),   OperationalCommand::Unknown);
 }
 
 #[test]
@@ -253,6 +253,15 @@ fn test_routing_nominal_allows_all_command_classes() {
     assert!(should_route_command(&cache, now, OperationalCommand::ReadTelemetry));
     assert!(should_route_command(&cache, now, OperationalCommand::WriteState));
     assert!(should_route_command(&cache, now, OperationalCommand::SystemMutation));
+}
+
+#[test]
+fn test_routing_nominal_rejects_unknown_command() {
+    // Unknown commands must be denied in ALL postures, including Nominal —
+    // closing the implicit fallback bypass identified in the v1 spec.
+    let (cache, now) = make_cache(FleetPosture::Nominal, 500);
+    assert!(!should_route_command(&cache, now, OperationalCommand::Unknown),
+        "Nominal posture must not route Unknown commands");
 }
 
 #[test]

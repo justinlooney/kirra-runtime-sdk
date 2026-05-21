@@ -88,6 +88,10 @@ pub enum OperationalCommand {
     ReadTelemetry,
     WriteState,
     SystemMutation,
+    /// Any HTTP method or path pattern that cannot be positively identified.
+    /// Denied in all posture states, including Nominal, to prevent implicit
+    /// fallback paths from becoming exploitable bypass vectors.
+    Unknown,
 }
 
 /// Classify an HTTP request into an `OperationalCommand` using method + path.
@@ -144,8 +148,9 @@ pub fn classify_http_command(method: &str, path: &str) -> OperationalCommand {
         }
         "DELETE" => OperationalCommand::SystemMutation,
         _ => {
-            // Unknown HTTP methods have undefined semantics — most conservative class.
-            OperationalCommand::SystemMutation
+            // Unknown HTTP methods have undefined semantics — classified as Unknown
+            // so the routing matrix denies them in ALL postures, including Nominal.
+            OperationalCommand::Unknown
         }
     }
 }
@@ -154,12 +159,15 @@ pub fn classify_http_command(method: &str, path: &str) -> OperationalCommand {
 ///
 /// Policy (ordered by severity, first match wins):
 ///
-/// | Condition                   | ReadTelemetry | WriteState | SystemMutation |
-/// |-----------------------------|---------------|------------|----------------|
-/// | Stale (> CACHE_TTL_MS)      | deny          | deny       | deny           |
-/// | LockedOut                   | deny          | deny       | deny           |
-/// | Degraded                    | allow         | deny       | deny           |
-/// | Nominal                     | allow         | allow      | allow          |
+/// | Condition                   | ReadTelemetry | WriteState | SystemMutation | Unknown |
+/// |-----------------------------|---------------|------------|----------------|---------|
+/// | Stale (> CACHE_TTL_MS)      | deny          | deny       | deny           | deny    |
+/// | LockedOut                   | deny          | deny       | deny           | deny    |
+/// | Degraded                    | allow         | deny       | deny           | deny    |
+/// | Nominal                     | allow         | allow      | allow          | deny    |
+///
+/// `Unknown` is denied in all posture states, including Nominal, to close the
+/// implicit fallback path identified in the v1 gateway policy specification.
 ///
 /// "Missing" (cache is `None`) must be handled by the caller before invoking
 /// this function. `should_route_from_cache` handles that case.
@@ -168,6 +176,11 @@ pub fn should_route_command(
     now_ms: u64,
     command: OperationalCommand,
 ) -> bool {
+    // Unknown commands are unconditionally denied regardless of posture or freshness.
+    if command == OperationalCommand::Unknown {
+        return false;
+    }
+
     let age_ms = now_ms.saturating_sub(cache.updated_at_epoch_ms);
     if age_ms > CACHE_TTL_MS {
         return false;

@@ -3,10 +3,6 @@
 // Re-exports the canonical OperationalCommand type and classify_http_command
 // from posture_cache. All classification logic lives there; this module is
 // the gateway-facing import surface.
-//
-// NOTE: there is no Unknown variant. Unrecognised methods return SystemMutation
-// (the most conservative class) so unknown routes fail closed without needing
-// a separate enum variant and an extra match arm.
 
 pub use crate::posture_cache::{classify_http_command, OperationalCommand};
 
@@ -41,10 +37,11 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_method_fails_closed_as_system_mutation() {
-        // Unknown HTTP methods map to SystemMutation — the most conservative
-        // class — so they are blocked in every posture except Nominal.
-        assert_eq!(classify_http_command("PATCH",  "/unknown"), OperationalCommand::SystemMutation);
-        assert_eq!(classify_http_command("FROBNI", "/x"),       OperationalCommand::SystemMutation);
+    fn test_unknown_method_classifies_as_unknown() {
+        // Unknown HTTP methods map to OperationalCommand::Unknown, which is
+        // denied in ALL posture states including Nominal — closing the implicit
+        // fallback bypass identified in the v1 gateway policy specification.
+        assert_eq!(classify_http_command("PATCH",  "/unknown"), OperationalCommand::Unknown);
+        assert_eq!(classify_http_command("FROBNI", "/x"),       OperationalCommand::Unknown);
     }
 }
