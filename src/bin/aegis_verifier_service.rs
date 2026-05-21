@@ -18,8 +18,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 
 use aegis_runtime_sdk::verifier::{
-    AppState, BackupExport, FlapStatus, FleetNodePosture, HealthResponse,
-    NodeTrustState, PostureStreamEvent, RegisteredNode, VerifierOperationMode,
+    validate_client_identity_headers, AppState, BackupExport, FlapStatus, FleetNodePosture,
+    HealthResponse, NodeTrustState, PostureStreamEvent, RegisteredNode, VerifierOperationMode,
 };
 use aegis_runtime_sdk::verifier_store::VerifierStore;
 use aegis_runtime_sdk::posture_cache::{now_ms, CachedFleetPosture, SharedPostureCache};
@@ -59,6 +59,25 @@ async fn require_admin_token(request: Request, next: Next) -> Result<Response, S
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    Ok(next.run(request).await)
+}
+
+/// Delegates to the pure `validate_client_identity_headers` function.
+/// Fail-closed: denies unless `AEGIS_TRUSTED_INGRESS_MODE=true` AND the
+/// configured client-id header is present and non-blank.
+async fn require_client_identity(
+    State(svc): State<Arc<ServiceState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let cfg = &svc.app.transport_identity;
+    if !validate_client_identity_headers(
+        cfg.trusted_ingress_mode,
+        &cfg.client_id_header,
+        request.headers(),
+    ) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     Ok(next.run(request).await)
 }
 
@@ -521,6 +540,40 @@ async fn register_federation_controller(
     }
 }
 
+// --- Patch 1: attestation identity registry --------------------------------
+
+#[derive(Deserialize)]
+struct RegisterIdentityRequest {
+    node_id: String,
+    ak_public_fingerprint_hex: String,
+}
+
+async fn register_node_identity(
+    State(svc): State<Arc<ServiceState>>,
+    Json(req): Json<RegisterIdentityRequest>,
+) -> impl IntoResponse {
+    if req.node_id.trim().is_empty() || req.ak_public_fingerprint_hex.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "node_id and ak_public_fingerprint_hex are required" }))).into_response();
+    }
+    let now = now_ms();
+    match svc.app.store.lock() {
+        Ok(mut store) => match store.register_attestation_identity(
+            &req.node_id, &req.ak_public_fingerprint_hex, "admin", now,
+        ) {
+            Ok(()) => {
+                emit_posture_event(&svc.app, "NODE_IDENTITY_PROVISIONED", Some(req.node_id.clone()));
+                (StatusCode::CREATED,
+                 Json(json!({ "node_id": req.node_id, "registered": true }))).into_response()
+            }
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "error": "failed to register identity" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+}
+
 async fn submit_federated_report(
     State(svc): State<Arc<ServiceState>>,
     Json(report): Json<FederatedTrustReport>,
@@ -653,19 +706,28 @@ async fn main() {
         posture_cache: Arc::new(std::sync::RwLock::new(None)),
     });
 
-    // Mutation routes require Bearer token auth (AEGIS_ADMIN_TOKEN env var).
-    // export_backup is read-only but returns the full trust-fabric state dump —
-    // it is admin-protected so an unauthenticated caller cannot exfiltrate it.
+    // Tier 1 — Identity-gated routes: require admin token AND a valid client-id header.
+    // These routes stream sensitive state or forward commands into physical systems;
+    // the additional header check enforces that requests arrive through an authorized
+    // mesh sidecar or proxy, not a raw unauthenticated caller who obtained the token.
+    // Layer ordering: require_admin_token runs first (outermost), then require_client_identity.
+    let identity_gated_routes = Router::new()
+        .route("/system/posture/stream", get(system_posture_stream))
+        .route("/federation/reports/submit", post(submit_federated_report))
+        .route("/action_filter/evaluate", post(evaluate_action_filter))
+        .route("/industrial/evaluate", post(evaluate_industrial_adapter))
+        .layer(middleware::from_fn_with_state(svc_state.clone(), require_client_identity))
+        .layer(middleware::from_fn(require_admin_token));
+
+    // Tier 2 — Admin-only routes: require admin token; no additional identity header.
+    // Management and registration operations that originate from operators directly.
     let admin_routes = Router::new()
         .route("/attestation/register", post(register_node))
         .route("/fleet/dependencies", post(register_dependencies))
         .route("/system/backup/export", post(export_backup))
         .route("/system/audit/verify", get(verify_audit_chain))
-        .route("/action_filter/evaluate", post(evaluate_action_filter))
-        .route("/industrial/evaluate", post(evaluate_industrial_adapter))
-        .route("/federation/reports/submit", post(submit_federated_report))
         .route("/federation/controllers/register", post(register_federation_controller))
-        .route("/system/posture/stream", get(system_posture_stream))
+        .route("/attestation/identity/register", post(register_node_identity))
         .layer(middleware::from_fn(require_admin_token));
 
     // Challenge and verify are unauthenticated — the challenge-response protocol
@@ -690,6 +752,7 @@ async fn main() {
 
     let app = Router::new()
         .merge(probe_routes)
+        .merge(identity_gated_routes)
         .merge(admin_routes)
         .merge(attestation_routes)
         .merge(read_routes)

@@ -124,6 +124,47 @@ pub struct PostureStreamEvent {
     pub posture: Option<FleetNodePosture>,
 }
 
+/// Controls whether the `require_client_identity` middleware enforces the
+/// `x-aegis-client-id` header (or a configured alternative).
+/// Fail-closed: if `trusted_ingress_mode` is false, the check always denies.
+#[derive(Debug, Clone)]
+pub struct TransportIdentityConfig {
+    pub trusted_ingress_mode: bool,
+    pub client_id_header: String,
+}
+
+impl TransportIdentityConfig {
+    pub fn from_env() -> Self {
+        Self {
+            trusted_ingress_mode: std::env::var("AEGIS_TRUSTED_INGRESS_MODE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            client_id_header: std::env::var("AEGIS_CLIENT_ID_HEADER")
+                .unwrap_or_else(|_| "x-aegis-client-id".to_string()),
+        }
+    }
+}
+
+/// Pure boundary check — no side effects, no state allocation.
+/// Returns `true` only when `trusted_ingress_mode` is enabled AND the designated
+/// header is present and contains a non-blank value.
+pub fn validate_client_identity_headers(
+    trusted_ingress_mode: bool,
+    client_id_header: &str,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    if !trusted_ingress_mode {
+        return false;
+    }
+    let Some(value) = headers.get(client_id_header) else {
+        return false;
+    };
+    let Ok(client_id) = value.to_str() else {
+        return false;
+    };
+    !client_id.trim().is_empty()
+}
+
 pub struct AppState {
     pub nodes: DashMap<String, RegisteredNode>,
     pub dependency_graph: DashMap<String, Vec<String>>,
@@ -137,6 +178,8 @@ pub struct AppState {
     /// Lagged receivers are dropped automatically; send errors are ignored
     /// (no active subscribers is a normal steady-state condition).
     pub posture_tx: broadcast::Sender<PostureStreamEvent>,
+    /// Transport identity enforcement config — reads from env at startup.
+    pub transport_identity: TransportIdentityConfig,
 }
 
 impl AppState {
@@ -149,6 +192,7 @@ impl AppState {
             store: Arc::new(Mutex::new(store)),
             mode,
             posture_tx,
+            transport_identity: TransportIdentityConfig::from_env(),
         }
     }
 
@@ -281,3 +325,45 @@ impl AppState {
         });
     }
 }
+
+#[cfg(test)]
+mod transport_identity_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn test_disabled_ingress_rejects_even_with_valid_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-aegis-client-id", HeaderValue::from_static("edge-gateway-01"));
+        assert!(!validate_client_identity_headers(false, "x-aegis-client-id", &headers));
+    }
+
+    #[test]
+    fn test_enabled_ingress_missing_header_rejects() {
+        let headers = HeaderMap::new();
+        assert!(!validate_client_identity_headers(true, "x-aegis-client-id", &headers));
+    }
+
+    #[test]
+    fn test_enabled_ingress_blank_header_rejects() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-aegis-client-id", HeaderValue::from_static("     "));
+        assert!(!validate_client_identity_headers(true, "x-aegis-client-id", &headers));
+    }
+
+    #[test]
+    fn test_enabled_ingress_valid_header_accepts() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-aegis-client-id", HeaderValue::from_static("trusted-mesh-sidecar"));
+        assert!(validate_client_identity_headers(true, "x-aegis-client-id", &headers));
+    }
+
+    #[test]
+    fn test_custom_header_name_is_respected() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-custom-identity", HeaderValue::from_static("fleet-controller"));
+        assert!(validate_client_identity_headers(true, "x-custom-identity", &headers));
+        assert!(!validate_client_identity_headers(true, "x-aegis-client-id", &headers));
+    }
+}
+
