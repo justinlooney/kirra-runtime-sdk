@@ -19,10 +19,14 @@
 //      test infrastructure. A `new_with_generation(posture, generation, now_ms)`
 //      constructor is added for engine use without breaking existing callers.
 //
+//   4. `should_route_command` retains `OperationalCommand` parameter type.
+//      The milestone doc replaced it with `required_class: &str`, bypassing
+//      the Unknown early-return and losing type safety (invariant #9 violation).
+//
 // This file is the single definition of CachedFleetPosture.
 // SharedPostureCache = Arc<RwLock<Option<CachedFleetPosture>>> (unchanged).
 
-use crate::verifier::FleetPosture;
+use crate::verifier::{FleetPosture, OperationalCommand};
 use crate::posture_engine::POSTURE_CACHE_TTL_MS;
 
 // ---------------------------------------------------------------------------
@@ -110,6 +114,59 @@ impl CachedFleetPosture {
 ///   - `CachedFleetPosture` — complete atomic snapshot (never partially updated)
 pub type SharedPostureCache = std::sync::Arc<tokio::sync::RwLock<Option<CachedFleetPosture>>>;
 
+// ---------------------------------------------------------------------------
+// Command routing gate
+// ---------------------------------------------------------------------------
+
+/// Routes or blocks an operational command based on fleet posture and cache freshness.
+///
+/// Invariants preserved:
+///   - OperationalCommand::Unknown → false BEFORE posture check (invariant #9)
+///   - Stale cache → false (fail-closed, uses entry.is_stale() from CachedFleetPosture)
+///   - LockedOut → false for all commands
+///   - Degraded → true for ReadTelemetry only
+///   - Nominal → true for all except Unknown
+///
+/// The `now_ms` parameter accepts an injected clock value. In tests, pass
+/// `virtual_clock.now_ms()`; in production, pass `crate::clock::SystemClock.now_ms()`.
+/// This keeps the function testable without syscall access.
+#[must_use]
+pub fn should_route_command(
+    cache: &Option<CachedFleetPosture>,
+    now_ms: u64,
+    command: OperationalCommand,
+) -> bool {
+    // Invariant #9: Unknown is denied before any posture evaluation.
+    // This early return must never be removed.
+    if command == OperationalCommand::Unknown {
+        return false;
+    }
+
+    let Some(entry) = cache.as_ref() else {
+        // No cache entry — fail-closed
+        return false;
+    };
+
+    // Staleness check uses entry.is_stale() — the TTL is owned by the entry,
+    // not hardcoded here. This aligns with policy_layer.rs resolve_posture.
+    if entry.is_stale(now_ms) {
+        tracing::warn!(
+            generated_at_ms = entry.generated_at_ms,
+            ttl_ms          = entry.ttl_ms,
+            now_ms          = now_ms,
+            generation      = entry.generation,
+            "should_route_command: cache stale — blocking command"
+        );
+        return false;
+    }
+
+    match entry.posture {
+        FleetPosture::Nominal   => true,
+        FleetPosture::Degraded  => command == OperationalCommand::ReadTelemetry,
+        FleetPosture::LockedOut => false,
+    }
+}
+
 #[cfg(test)]
 mod posture_cache_tests {
     use super::*;
@@ -178,5 +235,65 @@ mod posture_cache_tests {
         let rt: CachedFleetPosture = serde_json::from_str(&json).expect("must deserialize");
         assert_eq!(entry.posture, rt.posture);
         assert_eq!(entry.generation, rt.generation);
+    }
+
+    // -----------------------------------------------------------------------
+    // should_route_command tests
+    // -----------------------------------------------------------------------
+
+    fn fresh_cache(posture: FleetPosture) -> Option<CachedFleetPosture> {
+        Some(CachedFleetPosture::new(posture))
+    }
+
+    fn stale_cache(posture: FleetPosture) -> Option<CachedFleetPosture> {
+        let ts = now_ms().saturating_sub(POSTURE_CACHE_TTL_MS + 1);
+        Some(CachedFleetPosture {
+            posture,
+            generated_at_ms: ts,
+            ttl_ms: POSTURE_CACHE_TTL_MS,
+            generation: 1,
+        })
+    }
+
+    #[test]
+    fn test_unknown_command_denied_before_posture_check() {
+        // Invariant #9: Unknown blocked even in Nominal posture.
+        let cache = fresh_cache(FleetPosture::Nominal);
+        assert!(!should_route_command(&cache, now_ms(), OperationalCommand::Unknown));
+    }
+
+    #[test]
+    fn test_none_cache_denies_all_commands() {
+        let ts = now_ms();
+        assert!(!should_route_command(&None, ts, OperationalCommand::ReadTelemetry));
+        assert!(!should_route_command(&None, ts, OperationalCommand::Unknown));
+    }
+
+    #[test]
+    fn test_stale_cache_denies_all_non_unknown_commands() {
+        let cache = stale_cache(FleetPosture::Nominal);
+        let ts = now_ms();
+        assert!(!should_route_command(&cache, ts, OperationalCommand::ReadTelemetry),
+            "stale Nominal must deny — fail-closed");
+    }
+
+    #[test]
+    fn test_nominal_posture_allows_read_telemetry() {
+        let cache = fresh_cache(FleetPosture::Nominal);
+        assert!(should_route_command(&cache, now_ms(), OperationalCommand::ReadTelemetry));
+    }
+
+    #[test]
+    fn test_degraded_posture_allows_only_read_telemetry() {
+        let cache = fresh_cache(FleetPosture::Degraded);
+        let ts = now_ms();
+        assert!(should_route_command(&cache, ts, OperationalCommand::ReadTelemetry));
+    }
+
+    #[test]
+    fn test_lockedout_posture_denies_all_commands() {
+        let cache = fresh_cache(FleetPosture::LockedOut);
+        let ts = now_ms();
+        assert!(!should_route_command(&cache, ts, OperationalCommand::ReadTelemetry));
     }
 }
