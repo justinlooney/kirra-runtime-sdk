@@ -296,3 +296,101 @@ fn test_routing_one_ms_past_ttl_is_blocked() {
     let (cache, now) = make_cache(FleetPosture::Nominal, CACHE_TTL_MS + 1);
     assert!(!should_route_command(&cache, now, OperationalCommand::WriteState));
 }
+
+// --- v0.9.7 posture event store tests ----------------------------------------
+
+use crate::verifier_store::VerifierStore;
+
+fn in_memory_store() -> VerifierStore {
+    VerifierStore::new(":memory:").expect("in-memory SQLite must initialise")
+}
+
+#[test]
+fn test_posture_event_round_trip() {
+    let store = in_memory_store();
+    store.save_posture_event("node-a", "ATTESTATION_TRUSTED", r#"{"ok":true}"#, None, 1_000)
+        .expect("save must succeed");
+
+    let history = store.load_node_history("node-a").expect("load must succeed");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["event_type"], "ATTESTATION_TRUSTED");
+    assert_eq!(history[0]["reason"], serde_json::Value::Null);
+}
+
+#[test]
+fn test_posture_event_with_reason_round_trip() {
+    let store = in_memory_store();
+    store.save_posture_event("node-b", "DEPENDENCY_UPDATED", "{}", Some("parent changed"), 2_000)
+        .expect("save must succeed");
+
+    let history = store.load_node_history("node-b").expect("load must succeed");
+    assert_eq!(history[0]["reason"], "parent changed");
+}
+
+#[test]
+fn test_load_node_history_newest_first() {
+    let store = in_memory_store();
+    for ts in [1_000u64, 2_000, 3_000] {
+        store.save_posture_event("node-c", "EV", "{}", None, ts).unwrap();
+    }
+    let history = store.load_node_history("node-c").unwrap();
+    assert_eq!(history.len(), 3);
+    // Newest event is first.
+    assert_eq!(history[0]["created_at_ms"], 3_000u64);
+    assert_eq!(history[2]["created_at_ms"], 1_000u64);
+}
+
+#[test]
+fn test_count_recent_posture_events_within_window() {
+    let store = in_memory_store();
+    for ts in [1_000u64, 2_000, 3_000] {
+        store.save_posture_event("node-d", "EV", "{}", None, ts).unwrap();
+    }
+    // since_ms = 2_000 → only events at 2_000 and 3_000 qualify.
+    let count = store.count_recent_posture_events("node-d", 2_000).unwrap();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn test_count_excludes_events_before_window() {
+    let store = in_memory_store();
+    store.save_posture_event("node-e", "EV", "{}", None, 500).unwrap();
+    store.save_posture_event("node-e", "EV", "{}", None, 1_000).unwrap();
+    // since_ms = 1_001 → neither event qualifies.
+    let count = store.count_recent_posture_events("node-e", 1_001).unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_flap_threshold_below_three_is_not_flapping() {
+    let store = in_memory_store();
+    for ts in [1_000u64, 2_000] {
+        store.save_posture_event("node-f", "EV", "{}", None, ts).unwrap();
+    }
+    let count = store.count_recent_posture_events("node-f", 0).unwrap();
+    assert!(count < 3, "two events must not trigger flap threshold");
+}
+
+#[test]
+fn test_flap_threshold_at_three_is_flapping() {
+    let store = in_memory_store();
+    for ts in [1_000u64, 2_000, 3_000] {
+        store.save_posture_event("node-g", "EV", "{}", None, ts).unwrap();
+    }
+    let count = store.count_recent_posture_events("node-g", 0).unwrap();
+    assert!(count >= 3, "three events must meet the flap threshold");
+}
+
+#[test]
+fn test_history_isolated_per_node() {
+    let store = in_memory_store();
+    store.save_posture_event("node-h", "EV", "{}", None, 1_000).unwrap();
+    store.save_posture_event("node-i", "EV", "{}", None, 2_000).unwrap();
+
+    let h_history = store.load_node_history("node-h").unwrap();
+    let i_history = store.load_node_history("node-i").unwrap();
+    assert_eq!(h_history.len(), 1);
+    assert_eq!(i_history.len(), 1);
+    assert_eq!(h_history[0]["created_at_ms"], 1_000u64);
+    assert_eq!(i_history[0]["created_at_ms"], 2_000u64);
+}

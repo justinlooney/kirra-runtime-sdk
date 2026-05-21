@@ -35,6 +35,19 @@ impl VerifierStore {
             [],
         )?;
 
+        // v0.9.7: time-series posture event log for observability and flap detection.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS posture_events (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id        TEXT    NOT NULL,
+                event_type     TEXT    NOT NULL,
+                posture_json   TEXT    NOT NULL,
+                reason         TEXT,
+                created_at_ms  INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
         Ok(Self { conn })
     }
 
@@ -116,5 +129,65 @@ impl VerifierStore {
         }
 
         Ok(map)
+    }
+
+    // --- v0.9.7 posture event log -------------------------------------------------
+
+    /// Append a single posture event to the time-series log.
+    pub fn save_posture_event(
+        &self,
+        node_id: &str,
+        event_type: &str,
+        posture_json: &str,
+        reason: Option<&str>,
+        created_at_ms: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO posture_events
+             (node_id, event_type, posture_json, reason, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![node_id, event_type, posture_json, reason, created_at_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Return the full event history for a node, newest first.
+    pub fn load_node_history(&self, node_id: &str) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_type, posture_json, reason, created_at_ms
+             FROM posture_events
+             WHERE node_id = ?1
+             ORDER BY created_at_ms DESC",
+        )?;
+
+        let rows = stmt.query_map(params![node_id], |row| {
+            let event_type: String = row.get(0)?;
+            let posture_json: String = row.get(1)?;
+            let reason: Option<String> = row.get(2)?;
+            let created_at_ms: i64 = row.get(3)?;
+
+            let posture: serde_json::Value = serde_json::from_str(&posture_json)
+                .unwrap_or(serde_json::Value::Null);
+
+            Ok(serde_json::json!({
+                "event_type": event_type,
+                "posture": posture,
+                "reason": reason,
+                "created_at_ms": created_at_ms as u64,
+            }))
+        })?;
+
+        rows.collect()
+    }
+
+    /// Count events for a node with `created_at_ms >= since_ms`.
+    /// Used by the flap-detection analytic.
+    pub fn count_recent_posture_events(&self, node_id: &str, since_ms: u64) -> Result<u64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM posture_events
+             WHERE node_id = ?1 AND created_at_ms >= ?2",
+            params![node_id, since_ms as i64],
+            |row| row.get(0),
+        )
     }
 }

@@ -48,6 +48,15 @@ pub struct ChallengeEntry {
     pub expires_at_ms: u64,
 }
 
+/// Flap-detection result for a node over the last 5 minutes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlapStatus {
+    pub node_id: String,
+    /// True when ≥3 posture events were recorded in the last 300 000 ms.
+    pub flapping: bool,
+    pub event_count_5m: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetNodePosture {
     pub node_id: String,

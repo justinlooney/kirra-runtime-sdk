@@ -14,7 +14,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aegis_runtime_sdk::verifier::{AppState, FleetNodePosture, NodeTrustState, RegisteredNode};
+use aegis_runtime_sdk::verifier::{AppState, FlapStatus, FleetNodePosture, NodeTrustState, RegisteredNode};
 use aegis_runtime_sdk::verifier_store::VerifierStore;
 use aegis_runtime_sdk::posture_cache::{now_ms, CachedFleetPosture, SharedPostureCache};
 use aegis_runtime_sdk::security::constant_time_compare;
@@ -178,6 +178,17 @@ async fn verify_attestation(
                 Json(json!({ "error": "failed to persist trust state" }))).into_response();
     }
 
+    // Emit posture event after successful attestation (best-effort; does not
+    // roll back the trust promotion if the log write fails).
+    let posture = svc.app.calculate_posture(&req.node_id);
+    if let Ok(posture_json) = serde_json::to_string(&posture) {
+        if let Ok(store) = svc.app.store.lock() {
+            let _ = store.save_posture_event(
+                &req.node_id, "ATTESTATION_TRUSTED", &posture_json, None, now,
+            );
+        }
+    }
+
     (StatusCode::OK, Json(json!({ "node_id": req.node_id, "attested": true }))).into_response()
 }
 
@@ -232,7 +243,57 @@ async fn register_dependencies(
         return (StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "failed to persist dependencies" }))).into_response();
     }
+
+    // Snapshot posture after topology change (best-effort event log).
+    let posture = svc.app.calculate_posture(&req.node_id);
+    let now = now_ms();
+    if let Ok(posture_json) = serde_json::to_string(&posture) {
+        if let Ok(store) = svc.app.store.lock() {
+            let _ = store.save_posture_event(
+                &req.node_id, "DEPENDENCY_UPDATED", &posture_json, None, now,
+            );
+        }
+    }
+
     (StatusCode::OK, Json(json!({ "node_id": req.node_id, "dependencies_registered": true }))).into_response()
+}
+
+async fn get_node_history(
+    State(svc): State<Arc<ServiceState>>,
+    Path(node_id): Path<String>,
+) -> impl IntoResponse {
+    match svc.app.store.lock() {
+        Ok(store) => match store.load_node_history(&node_id) {
+            Ok(history) => Json(json!({ "node_id": node_id, "history": history })).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "error": "failed to load history" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+}
+
+async fn get_node_flap_status(
+    State(svc): State<Arc<ServiceState>>,
+    Path(node_id): Path<String>,
+) -> impl IntoResponse {
+    let five_minutes_ago = now_ms().saturating_sub(300_000);
+    match svc.app.store.lock() {
+        Ok(store) => match store.count_recent_posture_events(&node_id, five_minutes_ago) {
+            Ok(count) => {
+                let status = FlapStatus {
+                    node_id: node_id.clone(),
+                    flapping: count >= 3,
+                    event_count_5m: count,
+                };
+                Json(status).into_response()
+            }
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "error": "failed to query events" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
 }
 
 // --- Entry point ------------------------------------------------------------
@@ -286,7 +347,9 @@ async fn main() {
     let read_routes = Router::new()
         .route("/attestation/status/:node_id", get(get_node_status))
         .route("/fleet/posture", get(get_fleet_posture))
-        .route("/fleet/posture/:node_id", get(get_node_posture));
+        .route("/fleet/posture/:node_id", get(get_node_posture))
+        .route("/fleet/history/:node_id", get(get_node_history))
+        .route("/fleet/flapping/:node_id", get(get_node_flap_status));
 
     let app = Router::new()
         .merge(admin_routes)
