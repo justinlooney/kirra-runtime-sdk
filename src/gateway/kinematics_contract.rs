@@ -5,12 +5,12 @@
 // This module answers exactly one question: "Is this proposed vehicle command physically
 // safe to execute on this platform, given the current kinematic state?"
 //
-// Checks run in strict priority order. A check that fires returns immediately.
-// See docs/kinematics_envelope_protection.md for the full invariant specification.
+// The verification pipeline runs checks in strict priority order. A check that fires
+// returns immediately. See docs/kinematics_envelope_protection.md for the full spec.
 //
 // Security invariants respected:
 //   - No interaction with AEGIS_ADMIN_TOKEN or any auth primitives (wrong layer)
-//   - No DDS/ROS2 publishing (ros2_adapter.rs owns NaN/Inf rejection)
+//   - No DDS/ROS2 publishing (ros2_adapter.rs owns NaN/Inf rejection for that path)
 //   - LockedOut handling belongs to the calling policy layer
 //   - All arithmetic is deterministic; no RNG, no I/O, no async
 
@@ -28,29 +28,21 @@ use serde::{Deserialize, Serialize};
 pub struct VehicleKinematicsContract {
     /// Maximum allowable forward/reverse speed (m/s). Hard upper bound.
     pub max_speed_mps: f64,
-
     /// Maximum allowable linear acceleration rate (m/s²).
     pub max_accel_mps2: f64,
-
     /// Maximum allowable linear deceleration rate (m/s²). Service braking only;
     /// emergency braking is handled by a separate hardware interlock layer.
     pub max_brake_mps2: f64,
-
     /// Maximum allowable absolute steering angle (degrees). Physical rack limit.
     pub max_steering_deg: f64,
-
     /// Maximum allowable steering angle rate-of-change (degrees/second).
     pub max_steering_rate_deg_s: f64,
-
     /// Minimum required following distance (meters). Stored for profile completeness;
     /// not evaluated in `validate_vehicle_command`.
     pub min_follow_distance_m: f64,
-
     /// Maximum allowable lateral acceleration from the bicycle model (m/s²).
-    /// The effective steering limit tightens as speed increases:
     /// `a_lat = (v² × |tan(δ)|) / L ≤ max_lateral_accel_mps2`
     pub max_lateral_accel_mps2: f64,
-
     /// Vehicle wheelbase (meters). Used in the bicycle model denominator.
     /// Must match the physical platform.
     pub wheelbase_m: f64,
@@ -58,35 +50,32 @@ pub struct VehicleKinematicsContract {
 
 impl VehicleKinematicsContract {
     /// Full operational profile for a standard reference vehicle platform.
-    ///
     /// Suitable for `FleetPosture::Nominal`.
     pub fn nominal_reference_profile() -> Self {
         Self {
-            max_speed_mps: 35.0,           // ~78 mph operational ceiling
-            max_accel_mps2: 2.5,           // ~0.25g — comfortable acceleration
-            max_brake_mps2: 4.5,           // ~0.46g — service braking
-            max_steering_deg: 35.0,        // Maximum low-speed wheel articulation
-            max_steering_rate_deg_s: 45.0, // Physical steering rack rate limit
-            min_follow_distance_m: 2.0,    // Absolute close-proximity buffer
-            max_lateral_accel_mps2: 3.5,   // ~0.36g — prevents rollover/skid onset
-            wheelbase_m: 2.8,              // Standard mid-size vehicle wheelbase
+            max_speed_mps: 35.0,
+            max_accel_mps2: 2.5,
+            max_brake_mps2: 4.5,
+            max_steering_deg: 35.0,
+            max_steering_rate_deg_s: 45.0,
+            min_follow_distance_m: 2.0,
+            max_lateral_accel_mps2: 3.5,
+            wheelbase_m: 2.8,
         }
     }
 
     /// Minimal Risk Condition (MRC) fallback profile for degraded fleet posture.
-    ///
-    /// Suitable for `FleetPosture::Degraded`. Constrains the vehicle to a low-energy
-    /// state from which a graceful safe stop can be commanded at any time.
+    /// Suitable for `FleetPosture::Degraded`.
     pub fn mrc_fallback_profile() -> Self {
         Self {
-            max_speed_mps: 5.0,            // ~11 mph — safe crawl speed
-            max_accel_mps2: 1.0,           // Subdued acceleration curve
-            max_brake_mps2: 3.0,           // Gradual deceleration profile
-            max_steering_deg: 15.0,        // Restricts high-amplitude maneuvering
-            max_steering_rate_deg_s: 20.0, // Slow, deliberate steering only
-            min_follow_distance_m: 5.0,    // Expanded safety margins during degradation
-            max_lateral_accel_mps2: 1.5,   // ~0.15g — minimizes side-slip risk
-            wheelbase_m: 2.8,              // Physical constant; unchanged by posture
+            max_speed_mps: 5.0,
+            max_accel_mps2: 1.0,
+            max_brake_mps2: 3.0,
+            max_steering_deg: 15.0,
+            max_steering_rate_deg_s: 20.0,
+            min_follow_distance_m: 5.0,
+            max_lateral_accel_mps2: 1.5,
+            wheelbase_m: 2.8,
         }
     }
 }
@@ -102,17 +91,13 @@ pub struct ProposedVehicleCommand {
     /// Desired forward velocity at end of this time step (m/s).
     /// Negative values indicate reverse motion.
     pub linear_velocity_mps: f64,
-
     /// Actual forward velocity at start of this time step (m/s).
     pub current_velocity_mps: f64,
-
     /// Duration of this planning time step (seconds). Must be > 0.
     pub delta_time_s: f64,
-
     /// Desired steering angle at end of this time step (degrees).
     /// Sign convention: positive = left turn (ISO 8855).
     pub steering_angle_deg: f64,
-
     /// Actual steering angle at start of this time step (degrees).
     pub current_steering_angle_deg: f64,
 }
@@ -123,26 +108,17 @@ pub struct ProposedVehicleCommand {
 
 /// Result of `validate_vehicle_command`.
 ///
-/// The calling policy layer is responsible for acting on this:
-/// - `Allow`         → forward the command to the actuator
-/// - `ClampLinear`   → replace linear velocity with the provided safe value
-/// - `ClampSteering` → replace steering angle with the provided safe value
-/// - `DenyBreach`    → drop the command, log the reason, emit a posture event
+/// - `Allow`         → forward to actuator
+/// - `ClampLinear`   → replace linear velocity with provided safe value
+/// - `ClampSteering` → replace steering angle with provided safe value
+/// - `DenyBreach`    → drop command, log reason, emit posture event
 ///
 /// Only one action is returned per call. The first-triggered check wins.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum EnforceAction {
-    /// Command is within all physical invariants. Forward to actuator.
     Allow,
-
-    /// Linear velocity component exceeds a limit. Replace with the provided safe value.
     ClampLinear(f64),
-
-    /// Steering angle component exceeds a limit. Replace with the provided safe value.
-    /// May be triggered by steering rate (priority 5) or bicycle model (priority 6).
     ClampSteering(f64),
-
-    /// Command is non-physical or violates a hard invariant that cannot be clamped.
     DenyBreach(String),
 }
 
@@ -152,13 +128,45 @@ pub enum EnforceAction {
 
 /// Evaluates a proposed vehicle command against a kinematics contract.
 ///
-/// Checks run in strict priority order. Returns the first violation found,
-/// or `EnforceAction::Allow` if all checks pass.
+/// Checks run in strict priority order (Priority 0 → 6). Returns the first
+/// violation found, or `EnforceAction::Allow` if all checks pass.
 #[must_use]
 pub fn validate_vehicle_command(
     cmd: &ProposedVehicleCommand,
     contract: &VehicleKinematicsContract,
 ) -> EnforceAction {
+    // ------------------------------------------------------------------
+    // Priority 0: NaN/Inf guard — must run before ANY arithmetic.
+    //
+    // IEEE 754 NaN/Inf values poison every subsequent computation silently:
+    //   - NaN comparisons always return false → branch logic becomes unsafe
+    //   - NaN * finite = NaN → clamping silently produces NaN output
+    //   - Inf - Inf = NaN → acceleration check produces NaN, passes as 0.0
+    //   - NaN > threshold = false → bicycle model lateral check never fires
+    //
+    // None of these produce a panic in Rust. They silently pass invalid
+    // commands to the actuator — an AV-class safety failure mode.
+    //
+    // Each field gets a distinct denial code for audit forensics: a NaN in
+    // steering_angle_deg implies a different upstream bug than NaN in
+    // linear_velocity_mps. Infinity is rejected alongside NaN.
+    // ------------------------------------------------------------------
+    if !cmd.linear_velocity_mps.is_finite() {
+        return EnforceAction::DenyBreach("NAN_INF_LINEAR_VELOCITY".to_string());
+    }
+    if !cmd.current_velocity_mps.is_finite() {
+        return EnforceAction::DenyBreach("NAN_INF_CURRENT_VELOCITY".to_string());
+    }
+    if !cmd.steering_angle_deg.is_finite() {
+        return EnforceAction::DenyBreach("NAN_INF_STEERING_ANGLE".to_string());
+    }
+    if !cmd.current_steering_angle_deg.is_finite() {
+        return EnforceAction::DenyBreach("NAN_INF_CURRENT_STEERING".to_string());
+    }
+    if !cmd.delta_time_s.is_finite() {
+        return EnforceAction::DenyBreach("NAN_INF_DELTA_TIME".to_string());
+    }
+
     // ------------------------------------------------------------------
     // Priority 1: Non-physical time delta
     // Zero or negative dt makes rate-of-change calculations undefined.
@@ -170,7 +178,7 @@ pub fn validate_vehicle_command(
     // ------------------------------------------------------------------
     // Priority 2: Linear velocity hard ceiling
     // Checked before acceleration rate — a velocity-over-limit command
-    // implies an over-limit acceleration too; no need to compute it.
+    // implies an over-limit acceleration; no need to compute it.
     // ------------------------------------------------------------------
     if cmd.linear_velocity_mps.abs() > contract.max_speed_mps {
         let clamped = contract.max_speed_mps * cmd.linear_velocity_mps.signum();
@@ -219,14 +227,10 @@ pub fn validate_vehicle_command(
     //
     //   a_lat = (v² × |tan(δ)|) / L
     //
-    // If implied lateral acceleration exceeds the contract limit, back-solve
-    // the maximum safe steering angle for the current velocity:
-    //
+    // Back-solve max safe steering angle if limit exceeded:
     //   δ_max = atan((a_lat_max × L) / v²)
     //
-    // Guard: skip at near-zero velocity to avoid dividing by v² ≈ 0;
-    // the resulting safe angle would be very large and already bounded
-    // by max_steering_deg above.
+    // Guard: skip at near-zero velocity to avoid dividing by v² ≈ 0.
     // ------------------------------------------------------------------
     let v2 = cmd.linear_velocity_mps.powi(2);
     if v2 > 1e-6 {
@@ -387,7 +391,6 @@ mod kinematics_contract_tests {
             steering_angle_deg: 0.0,
             current_steering_angle_deg: 0.0,
         };
-        // Expected: 10.0 + (2.5 × 0.1) = 10.25
         match validate_vehicle_command(&cmd, &contract) {
             EnforceAction::ClampLinear(clamped) => {
                 let expected = 10.0_f64 + (2.5 * 0.1);
@@ -407,7 +410,6 @@ mod kinematics_contract_tests {
             steering_angle_deg: 0.0,
             current_steering_angle_deg: 0.0,
         };
-        // Expected: 30.0 - (4.5 × 0.1) = 29.55
         match validate_vehicle_command(&cmd, &contract) {
             EnforceAction::ClampLinear(clamped) => {
                 let expected = 30.0_f64 - (4.5 * 0.1);
@@ -427,10 +429,9 @@ mod kinematics_contract_tests {
             linear_velocity_mps: 10.0,
             current_velocity_mps: 10.0,
             delta_time_s: 0.1,
-            steering_angle_deg: 30.0, // 300 deg/s > 45 limit
+            steering_angle_deg: 30.0,
             current_steering_angle_deg: 0.0,
         };
-        // max_delta = 45.0 × 0.1 = 4.5°
         match validate_vehicle_command(&cmd, &contract) {
             EnforceAction::ClampSteering(safe) => {
                 assert!((safe - 4.5_f64).abs() < 1e-9, "expected 4.5, got {safe}");
@@ -445,11 +446,10 @@ mod kinematics_contract_tests {
         let cmd = ProposedVehicleCommand {
             linear_velocity_mps: 30.0,
             current_velocity_mps: 30.0,
-            delta_time_s: 0.5, // Long dt so steering rate check passes
+            delta_time_s: 0.5,
             steering_angle_deg: 20.0,
             current_steering_angle_deg: 0.0,
         };
-        // a_lat = (900 × tan(20°)) / 2.8 ≈ 116.9 m/s² >> 3.5 limit
         match validate_vehicle_command(&cmd, &contract) {
             EnforceAction::ClampSteering(safe) => {
                 assert!(safe < 20.0, "must reduce steering angle");
@@ -468,7 +468,7 @@ mod kinematics_contract_tests {
             current_velocity_mps: 0.001,
             delta_time_s: 0.1,
             steering_angle_deg: 30.0,
-            current_steering_angle_deg: 27.0, // Rate: 30 deg/s < 45 limit
+            current_steering_angle_deg: 27.0,
         };
         assert_eq!(validate_vehicle_command(&cmd, &contract), EnforceAction::Allow);
     }
@@ -503,12 +503,9 @@ mod kinematics_contract_tests {
         };
         let nominal = VehicleKinematicsContract::nominal_reference_profile();
         let mrc = VehicleKinematicsContract::mrc_fallback_profile();
-
         assert_eq!(validate_vehicle_command(&cmd, &nominal), EnforceAction::Allow);
         match validate_vehicle_command(&cmd, &mrc) {
-            EnforceAction::ClampSteering(s) => {
-                assert!(s < 18.0, "MRC must clamp what nominal allows");
-            }
+            EnforceAction::ClampSteering(s) => assert!(s < 18.0),
             other => panic!("MRC should clamp lateral breach, got {other:?}"),
         }
     }
@@ -535,7 +532,7 @@ mod kinematics_contract_tests {
     fn test_speed_check_fires_before_accel_check() {
         let contract = VehicleKinematicsContract::nominal_reference_profile();
         let cmd = ProposedVehicleCommand {
-            linear_velocity_mps: 50.0, // Over 35 m/s ceiling (priority 2)
+            linear_velocity_mps: 50.0,
             current_velocity_mps: 5.0,
             delta_time_s: 0.1,
             steering_angle_deg: 0.0,
@@ -544,6 +541,166 @@ mod kinematics_contract_tests {
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
             EnforceAction::ClampLinear(35.0)
+        );
+    }
+
+    // --- NaN/Inf guard (Priority 0) ----------------------------------------
+
+    #[test]
+    fn test_nan_linear_velocity_is_denied_before_any_arithmetic() {
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: f64::NAN,
+            current_velocity_mps: 10.0,
+            delta_time_s: 0.1,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::DenyBreach("NAN_INF_LINEAR_VELOCITY".to_string())
+        );
+    }
+
+    #[test]
+    fn test_inf_linear_velocity_is_denied() {
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: f64::INFINITY,
+            current_velocity_mps: 10.0,
+            delta_time_s: 0.1,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::DenyBreach("NAN_INF_LINEAR_VELOCITY".to_string())
+        );
+    }
+
+    #[test]
+    fn test_neg_inf_linear_velocity_is_denied() {
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: f64::NEG_INFINITY,
+            current_velocity_mps: 0.0,
+            delta_time_s: 0.1,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::DenyBreach("NAN_INF_LINEAR_VELOCITY".to_string())
+        );
+    }
+
+    #[test]
+    fn test_nan_current_velocity_is_denied_with_specific_code() {
+        // NaN current_velocity_mps poisons acceleration calc:
+        //   implied_accel = (v_cmd - NaN) / dt = NaN
+        //   NaN > max_accel = false → accel check silently passes
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 10.0,
+            current_velocity_mps: f64::NAN,
+            delta_time_s: 0.1,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::DenyBreach("NAN_INF_CURRENT_VELOCITY".to_string())
+        );
+    }
+
+    #[test]
+    fn test_nan_steering_angle_is_denied_with_specific_code() {
+        // NaN steering_angle_deg passed to tan() produces NaN lateral accel.
+        // NaN > max_lateral_accel = false → bicycle model silently passes.
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 10.0,
+            current_velocity_mps: 10.0,
+            delta_time_s: 0.1,
+            steering_angle_deg: f64::NAN,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::DenyBreach("NAN_INF_STEERING_ANGLE".to_string())
+        );
+    }
+
+    #[test]
+    fn test_nan_current_steering_is_denied_with_specific_code() {
+        // NaN current_steering_angle_deg poisons steering rate:
+        //   steering_delta = angle - NaN = NaN; NaN / dt = NaN
+        //   NaN > max_rate = false → rate check silently passes
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 10.0,
+            current_velocity_mps: 10.0,
+            delta_time_s: 0.1,
+            steering_angle_deg: 5.0,
+            current_steering_angle_deg: f64::NAN,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::DenyBreach("NAN_INF_CURRENT_STEERING".to_string())
+        );
+    }
+
+    #[test]
+    fn test_nan_delta_time_is_denied_with_specific_code() {
+        // NaN delta_time_s: NaN <= 0.0 = false → Priority 1 does NOT fire.
+        // Without Priority 0: v_delta / NaN = NaN, silently passes all checks.
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 10.0,
+            current_velocity_mps: 10.0,
+            delta_time_s: f64::NAN,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::DenyBreach("NAN_INF_DELTA_TIME".to_string())
+        );
+    }
+
+    #[test]
+    fn test_inf_delta_time_is_denied_before_zero_check() {
+        // f64::INFINITY > 0.0 is true → Priority 1 would NOT catch it.
+        // v_delta / INFINITY = 0.0 → accel check sees zero, passes everything.
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 10.0,
+            current_velocity_mps: 10.0,
+            delta_time_s: f64::INFINITY,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::DenyBreach("NAN_INF_DELTA_TIME".to_string())
+        );
+    }
+
+    #[test]
+    fn test_nan_guard_fires_before_time_delta_check() {
+        // Both NaN dt AND zero dt present. Priority 0 must fire first.
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: f64::NAN,
+            current_velocity_mps: 0.0,
+            delta_time_s: 0.0,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::DenyBreach("NAN_INF_LINEAR_VELOCITY".to_string()),
+            "NaN guard (priority 0) must fire before zero-dt check (priority 1)"
         );
     }
 }
