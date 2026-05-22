@@ -317,7 +317,11 @@ else
     fi
 fi
 
-# Install binary
+# Install binary — stop the service first if it's running to avoid "text file busy"
+if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+    info "Stopping running service before updating binary..."
+    systemctl stop "${SERVICE_NAME}"
+fi
 chmod 755 "${BINARY_PATH}"
 cp "${BINARY_PATH}" "${INSTALL_DIR}/${BINARY_NAME}"
 success "Binary installed to ${INSTALL_DIR}/${BINARY_NAME}"
