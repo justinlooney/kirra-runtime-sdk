@@ -1,4 +1,26 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, Component } from "react";
+
+export class ErrorBoundary extends Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ background: "#0a0c0f", color: "#e2e8f0", padding: 40, fontFamily: "monospace", minHeight: "100vh" }}>
+          <div style={{ color: "#ef4444", fontSize: 18, marginBottom: 16 }}>Dashboard Error</div>
+          <pre style={{ color: "#fca5a5", background: "#111418", padding: 16, borderRadius: 6, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+            {this.state.error.message}
+          </pre>
+          <button onClick={() => this.setState({ error: null })}
+            style={{ marginTop: 16, padding: "8px 16px", background: "#3b82f6", color: "white", border: "none", borderRadius: 4, cursor: "pointer" }}>
+            Retry
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // ─── Design tokens ───────────────────────────────────────────────────────────
 const CSS = `
@@ -320,8 +342,28 @@ function makeApi(baseUrl, token) {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// Rust serde serializes NodeTrustState as:
+//   "Trusted" | "Unknown" (unit variants → strings)
+//   {"Untrusted": "reason"} (tuple variant → object)
+function normalizeTrustState(t) {
+  if (!t) return "unknown";
+  if (typeof t === "object") return t.Untrusted !== undefined ? "untrusted" : "unknown";
+  return t.toLowerCase();
+}
+
+function formatTrustState(t) {
+  if (!t) return "Unknown";
+  if (typeof t === "object") {
+    if (t.Untrusted !== undefined) return `Untrusted: ${t.Untrusted}`;
+    return JSON.stringify(t);
+  }
+  return String(t);
+}
+
 function postureClass(p) {
   if (!p) return "unknown";
+  if (typeof p === "object") return "unknown";
   const s = p.toLowerCase();
   if (s === "nominal") return "nominal";
   if (s === "degraded") return "degraded";
@@ -330,8 +372,7 @@ function postureClass(p) {
 }
 
 function trustClass(t) {
-  if (!t) return "unknown";
-  const s = t.toLowerCase();
+  const s = normalizeTrustState(t);
   if (s === "trusted") return "trusted";
   if (s.includes("untrusted")) return "untrusted";
   return "unknown";
@@ -402,18 +443,22 @@ export default function AegisDashboard() {
     return () => clearInterval(refreshRef.current);
   }, [connected, loadFleet]);
 
-  // SSE posture stream
+  // SSE posture stream (best-effort; requires x-aegis-client-id header via server config)
   useEffect(() => {
     if (!connected) return;
     const url = `${config.url.replace(/\/$/, "")}/system/posture/stream`;
-    const es = new EventSource(url);
-    es.onmessage = (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        setEvents(prev => [{ ...data, receivedAt: Date.now() }, ...prev].slice(0, 100));
-      } catch {}
-    };
-    return () => es.close();
+    let es;
+    try {
+      es = new EventSource(url);
+      es.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          setEvents(prev => [{ ...data, receivedAt: Date.now() }, ...prev].slice(0, 100));
+        } catch {}
+      };
+      es.onerror = () => { es.close(); };
+    } catch {}
+    return () => { try { es?.close(); } catch {} };
   }, [connected, config.url]);
 
   if (!connected) {
@@ -644,7 +689,7 @@ function NodeCard({ node, detailed }) {
   const trust = trustClass(node.local_status || node.trust_state || node.status);
   const posture = postureClass(node.propagated_status || node.posture);
   const nodeId = node.node_id || node.id || "unknown";
-  const trustRaw = node.local_status || node.trust_state || node.status || "Unknown";
+  const trustRaw = formatTrustState(node.local_status || node.trust_state || node.status);
 
   return (
     <div className={`node-card ${trust}`}>
