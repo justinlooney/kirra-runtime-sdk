@@ -6,7 +6,7 @@
 
 [Unit]
 Description=Aegis Safety Kernel Verifier Service
-Documentation=https://github.com/justinlooney/singnet
+Documentation=https://github.com/justinlooney/aegis
 After=network.target
 Wants=network.target
 

@@ -5,7 +5,7 @@
 # Supports x86_64, aarch64 (NVIDIA Jetson, Raspberry Pi), and armv7.
 #
 # Usage (recommended — pulls latest release from GitHub):
-#   curl -fsSL https://raw.githubusercontent.com/justinlooney/singnet/master/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/justinlooney/aegis/master/install.sh | sudo bash
 #
 # Usage (from downloaded release archive):
 #   sudo bash install.sh
@@ -28,7 +28,7 @@
 #   - sudo / root access
 #   - Internet access (if downloading binary from GitHub)
 #
-# Support: https://github.com/justinlooney/singnet/issues
+# Support: https://github.com/justinlooney/aegis/issues
 
 set -euo pipefail
 
@@ -46,7 +46,7 @@ SERVICE_NAME="aegis-verifier"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 ENV_FILE="${CONFIG_DIR}/aegis.env"
 BINARY_NAME="aegis_verifier_service"
-GITHUB_REPO="justinlooney/singnet"
+GITHUB_REPO="justinlooney/aegis"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 
 # Minimum supported OS versions
@@ -624,6 +624,11 @@ success "Service installed and enabled (will start on boot)"
 
 if [ "${SKIP_SERVICE_START}" = false ]; then
     section "Starting Service"
+
+    # Validate token is present before starting — empty token causes 503 fail-closed
+    if [ -z "${ADMIN_TOKEN:-}" ]; then
+        fatal "AEGIS_ADMIN_TOKEN is empty — cannot start service (service would return 503 on all requests)"
+    fi
 
     systemctl start "${SERVICE_NAME}"
 

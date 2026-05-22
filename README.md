@@ -6,13 +6,16 @@ A distributed runtime legitimacy engine and safety governor for AI-driven roboti
 
 ## Overview
 
-Modern robotic and edge deployments increasingly rely on AI models to generate operational commands. Aegis sits between those models and the physical actuators, acting as a cryptographically-grounded safety layer that:
+Modern robotic and autonomous deployments increasingly rely on AI models to generate operational commands. Aegis sits between those models and the physical actuators, acting as a cryptographically-grounded safety layer that:
 
 - **Attests** each fleet node via HMAC-SHA256 challenge/response
 - **Tracks trust posture** per-node and fleet-wide using a gray/black DAG traversal algorithm
 - **Gates commands** based on live posture — locking out unsafe operations before they reach hardware
+- **Monitors AV sensor health** with a configurable telemetry watchdog and hysteresis-based recovery
+- **Enforces kinematics envelopes** — hard physical limits on velocity, acceleration, and yaw rate
 - **Federates** trust across multiple controllers using Ed25519-signed reports
 - **Audits** all state transitions via a SHA-256 hash-chained tamper-evident ledger
+- **Supports HA deployments** with automatic passive-standby promotion
 
 ---
 
@@ -21,11 +24,20 @@ Modern robotic and edge deployments increasingly rely on AI models to generate o
 - **Fail-closed by design** — missing or invalid credentials yield `503`, never silent pass-through
 - **Constant-time token comparison** — timing-safe token verification throughout
 - **Gray/black DAG traversal** — cycle detection and diamond-DAG memoization for fleet dependency graphs
+- **AV sensor watchdog** — per-node telemetry timeout detection (warn at 1 s, fault at 2 s)
+- **Recovery hysteresis** — 5 consecutive healthy reports required over a 10 s window to restore trust
+- **Posture engine worker** — mpsc channel coalesces burst faults into a single DAG recalculation
+- **Generation persistence** — monotonic posture generation counter survives restarts via SQLite
+- **Kinematics enforcement** — vehicle command envelope validation with forward simulation
 - **SSE posture broadcast** — real-time fleet posture stream for subscribers
 - **Industrial protocol support** — Modbus and OPC-UA event evaluation
 - **DDS bridge** — CDR-encapsulated actuator topics with `Volatile` durability
 - **Ed25519 federation** — cross-controller trust reports with replay prevention and nonce burning
+- **Federation reconciliation** — generation-ordered conflict resolution for multi-controller deployments
+- **HA standby/promotion** — heartbeat-based automatic promotion from passive standby to active
 - **WAL-mode SQLite** — durable persistence with fail-closed write ordering (disk before memory)
+- **Deterministic test harness** — `ScenarioRunner` with virtual clock injection for temporal integration tests
+- **CARLA integration** — `aegis_carla_client` binary for AV simulator connectivity
 
 ---
 
@@ -33,23 +45,41 @@ Modern robotic and edge deployments increasingly rely on AI models to generate o
 
 ```
 src/
-├── verifier.rs                — AppState, FleetPosture, DAG traversal
-├── verifier_store.rs          — SQLite persistence layer
-├── posture_cache.rs           — SharedPostureCache, command routing logic
-├── federation.rs              — Ed25519 trust federation
+├── verifier.rs                — AppState, FleetPosture, DAG traversal, TransportIdentityConfig
+├── verifier_store.rs          — SQLite persistence (all tables; WAL mode)
+├── posture_cache.rs           — SharedPostureCache, CachedFleetPosture, ServiceState,
+│                                OperationalCommand, should_route_command
+├── posture_engine.rs          — recalculate_and_broadcast, derive_fleet_posture,
+│                                generation counter, init_generation_from_store
+├── posture_engine_v2.rs       — LockoutReason, PostureRecalcTrigger, PostureEngineSender,
+│                                start_posture_engine_worker, resolve_posture_with_reason
+├── recovery_hysteresis.rs     — evaluate_recovery_report, HysteresisDecision
+├── telemetry_watchdog.rs      — spawn_telemetry_watchdog (AV sensor health monitoring)
+├── clock.rs                   — Clock trait, SystemClock, VirtualClock (test injection)
+├── scenario_runner.rs         — ScenarioRunner, ScenarioEvent, PostureAssertion
+├── standby_monitor.rs         — spawn_heartbeat_writer, spawn_promotion_monitor
+├── federation.rs              — FederatedTrustReport, Ed25519 verify pipeline
+├── federation_reconciliation.rs — FederatedTrustReportV2, reconcile_reports
 ├── audit_chain.rs             — SHA-256 hash-chained audit log
-├── action_filter.rs           — ActionClaim evaluation
-├── protocol_adapter.rs        — Modbus/OPC-UA industrial event mapping
-├── security.rs                — constant_time_compare
-├── aegis_core.rs              — AegisKernelGovernor (clamping + rate limiting)
+├── kinematics_contract.rs     — KinematicContract, scalar envelope clamping
+├── kinematics_sim.rs          — VehicleState, forward simulator, apply_enforcement
+├── action_filter.rs           — ActionFilter<C>, ActionClaim evaluation
 ├── action_policy.rs           — LLM JSON → typed AgentAction parser
+├── security.rs                — constant_time_compare
+├── protocol_adapter.rs        — Modbus/OPC-UA industrial event mapping
+├── aegis_core.rs              — AegisKernelGovernor (clamping + rate limiting)
 ├── ros2_adapter.rs            — NaN/Inf rejection before ROS2 publish
 ├── dds_bridge.rs              — CDR encapsulation, Volatile durability
-└── gateway/
-    ├── policy.rs              — classify_command (path + method → OperationalCommand)
-    ├── policy_layer.rs        — Tower AegisPolicyLayer middleware
-    ├── cmd_vel.rs             — CmdVel validation
-    └── interceptor.rs         — gateway interceptor
+├── gateway/
+│   ├── policy.rs              — classify_command (path + method → OperationalCommand)
+│   ├── policy_layer.rs        — Tower AegisPolicyLayer middleware
+│   ├── cmd_vel.rs             — CmdVel validation, DEFAULT_CMD_VEL_LIMITS
+│   ├── interceptor.rs         — gateway interceptor
+│   ├── kinematics_contract.rs — VehicleKinematicsContract, validate_vehicle_command
+│   └── kinematics_proptest.rs — property-based tests for kinematics validation
+└── bin/
+    ├── aegis_verifier_service.rs — axum HTTP service, all route handlers
+    └── aegis_carla_client.rs     — CARLA AV simulator integration
 ```
 
 ### Fleet Posture States
@@ -67,6 +97,14 @@ src/
 3. Node responds with a proof; verifier computes and compares HMAC-SHA256
 4. Trust state (`Trusted` / `Untrusted` / `Unknown`) stored to SQLite
 5. Fleet posture recalculated via DAG traversal; broadcast over SSE
+
+### AV Sensor Recovery Pipeline
+
+1. Sensor reports arrive with confidence score and hardware fault flag
+2. Below-floor confidence or `hw_fault=true` marks the node `Untrusted` immediately
+3. Recovery requires **5 consecutive healthy reports** within a **10 s window**
+4. A new fault during recovery resets the streak to 0
+5. Telemetry watchdog independently monitors for silence — faults at 2 s, warns at 1 s
 
 ---
 
@@ -93,13 +131,19 @@ cargo run --bin aegis_verifier_service
 
 The service listens on `0.0.0.0:8090` by default.
 
+### Install (Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/justinlooney/aegis/master/install.sh | sudo bash
+```
+
+See [INSTALL.md](INSTALL.md) for full installation documentation including non-interactive mode, HA setup, and upgrade/uninstall instructions.
+
 ### Test
 
 ```bash
 cargo test
 ```
-
-Current status: **66 passing, 0 failing**.
 
 ---
 
@@ -111,11 +155,14 @@ All configuration is via environment variables.
 |----------|----------|---------|-------------|
 | `AEGIS_ADMIN_TOKEN` | Yes (mutation routes) | — | Bearer token for admin endpoints. Absent or empty → `503`. |
 | `AEGIS_SUPERVISOR_RESET_KEY` | Yes (reset ops) | — | Reset authorization key. Must be non-empty, ≤ 64 bytes. |
-| `AEGIS_VERIFIER_MODE` | No | `active` | Set to `passive` / `passive_standby` / `standby` for read-only mode. |
+| `AEGIS_VERIFIER_MODE` | No | `active` | `passive_standby` → read-only. Runtime-promotable via HA monitor. |
 | `AEGIS_DB_PATH` | No | `aegis_verifier.sqlite` | Path to the SQLite database file. |
 | `AEGIS_VERIFIER_ADDR` | No | `0.0.0.0:8090` | Listen address. |
 | `AEGIS_TRUSTED_INGRESS_MODE` | No | `false` | Enforce `x-aegis-client-id` header on identity-gated routes. |
 | `AEGIS_CLIENT_ID_HEADER` | No | `x-aegis-client-id` | Header name for client identity. |
+| `AEGIS_INSTANCE_ID` | No | hostname | Unique identifier for this instance in HA deployments. |
+| `AEGIS_HEARTBEAT_INTERVAL` | No | `2000` | HA heartbeat write interval (ms). |
+| `AEGIS_PROMOTION_TIMEOUT` | No | `10000` | Standby promotes if primary silent for this many ms. |
 
 ---
 
@@ -140,7 +187,7 @@ All configuration is via environment variables.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/system/posture/stream` | SSE stream of posture events |
+| `GET` | `/system/posture/stream` | SSE stream of real-time posture events |
 | `POST` | `/federation/reports/submit` | Submit signed federated trust report |
 | `POST` | `/action_filter/evaluate` | Evaluate an action claim against posture |
 | `POST` | `/industrial/evaluate` | Evaluate a Modbus/OPC-UA industrial event |
@@ -165,13 +212,35 @@ All configuration is via environment variables.
 - **No hardcoded secrets** — `AEGIS_ADMIN_TOKEN` and `AEGIS_SUPERVISOR_RESET_KEY` must come from environment variables. No fallback values exist in code.
 - **Volatile DDS durability** — actuator topics are never persisted via `TransientLocal`.
 - **Ordered SQLite writes** — disk persistence always precedes in-memory state updates.
+- **Nonce burning** — federation report nonces are stored and checked before acceptance; replays are rejected.
+- **Posture-gated routing** — `OperationalCommand::Unknown` is rejected in all posture states, including `Nominal`.
+
+---
+
+## High Availability
+
+Aegis supports active/passive HA with automatic failover.
+
+**Primary** (`AEGIS_VERIFIER_MODE=active`): writes a heartbeat to the shared database every 2 s.
+
+**Standby** (`AEGIS_VERIFIER_MODE=passive_standby`): polls the heartbeat. If the primary is silent for 10 s (`AEGIS_PROMOTION_TIMEOUT`), the standby automatically promotes itself to active and begins enforcing posture.
+
+Both instances must share the same SQLite database (NFS mount, shared block storage, or equivalent).
+
+```bash
+# Primary
+AEGIS_VERIFIER_MODE=active AEGIS_INSTANCE_ID=aegis-primary ./aegis_verifier_service
+
+# Standby
+AEGIS_VERIFIER_MODE=passive_standby AEGIS_INSTANCE_ID=aegis-standby ./aegis_verifier_service
+```
 
 ---
 
 ## Dependencies
 
 | Crate | Version | Purpose |
-|-------|---------|--------|
+|-------|---------|---------|
 | `axum` | 0.8 | HTTP framework |
 | `tokio` | 1 | Async runtime |
 | `tower` | 0.5 | Middleware (`AegisPolicyLayer`) |
@@ -181,7 +250,9 @@ All configuration is via environment variables.
 | `hmac` + `sha2` | 0.12 / 0.10 | Attestation proof computation |
 | `base64` | 0.22 | Encoding |
 | `tokio-stream` | 0.1 | SSE broadcast |
+| `reqwest` | 0.12 | CARLA client HTTP |
 | `tracing` | 0.1 | Structured logging |
+| `proptest` | 1 | Kinematics property-based tests |
 
 ---
 
