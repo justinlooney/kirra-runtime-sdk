@@ -3,10 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::verifier::{AppState, FleetNodePosture, FleetPosture, VerifierOperationMode};
-use crate::posture_cache::{CachedFleetPosture, SharedPostureCache, POSTURE_CACHE_TTL_MS, now_ms};
+use crate::posture_cache::{CachedFleetPosture, SharedPostureCache, now_ms};
 
-// Re-export so external consumers can import POSTURE_CACHE_TTL_MS from here.
-pub use crate::posture_cache::POSTURE_CACHE_TTL_MS as POSTURE_CACHE_TTL_MS_REEXPORT;
+pub use crate::posture_cache::POSTURE_CACHE_TTL_MS;
 
 // ---------------------------------------------------------------------------
 // Generation counter — monotonic across process lifetime
