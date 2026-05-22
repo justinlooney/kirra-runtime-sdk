@@ -481,7 +481,7 @@ DEFAULT_MODE="active"
 if [ "${NON_INTERACTIVE}" = true ]; then
     VERIFIER_MODE="${AEGIS_VERIFIER_MODE:-${DEFAULT_MODE}}"
 else
-    echo -n "  Mode [${DEFAULT_MODE}]: "
+    echo -n "  Mode - active or passive_standby [${DEFAULT_MODE}]: "
     read -r VERIFIER_MODE
     VERIFIER_MODE="${VERIFIER_MODE:-${DEFAULT_MODE}}"
 fi
