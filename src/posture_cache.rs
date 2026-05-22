@@ -26,22 +26,8 @@
 // This file is the single definition of CachedFleetPosture.
 // SharedPostureCache = Arc<RwLock<Option<CachedFleetPosture>>> (unchanged).
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::verifier::{AppState, FleetNodePosture, FleetPosture, OperationalCommand};
-
-/// Returns the current time as milliseconds since UNIX epoch.
-/// Exported for use by service binary and test infrastructure.
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-/// Posture cache entries older than this are treated as stale (fail-closed).
-pub const POSTURE_CACHE_TTL_MS: u64 = 5_000;
+use crate::verifier::{FleetPosture, OperationalCommand};
+use crate::posture_engine::POSTURE_CACHE_TTL_MS;
 
 // ---------------------------------------------------------------------------
 // CachedFleetPosture
@@ -100,24 +86,19 @@ impl CachedFleetPosture {
     /// Uses generation=1 and the current system time.
     /// For production engine writes, use `new_with_generation` instead.
     pub fn new(posture: FleetPosture) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         Self {
             posture,
-            generated_at_ms: now_ms(),
+            generated_at_ms: now,
             ttl_ms: POSTURE_CACHE_TTL_MS,
             generation: 1,
         }
     }
 
-    /// Constructs a cache entry from a per-node FleetNodePosture snapshot.
-    /// Used by the service binary's get_node_posture handler.
-    pub fn from_posture(posture: &FleetNodePosture, ts: u64) -> Self {
-        Self {
-            posture: posture.propagated_status.clone(),
-            generated_at_ms: ts,
-            ttl_ms: POSTURE_CACHE_TTL_MS,
-            generation: 1,
-        }
-    }
 
     /// Returns true if this entry has exceeded its TTL relative to `now_ms`.
     pub fn is_stale(&self, now_ms: u64) -> bool {
@@ -132,16 +113,7 @@ impl CachedFleetPosture {
 ///   - `RwLock` — concurrent reads, exclusive writes
 ///   - `Option` — `None` = cold start / cache cleared (fail-closed in middleware)
 ///   - `CachedFleetPosture` — complete atomic snapshot (never partially updated)
-pub type SharedPostureCache = Arc<std::sync::RwLock<Option<CachedFleetPosture>>>;
-
-/// Shared service state threaded through all axum handlers.
-///
-/// Security invariant #11: All handlers MUST use State<Arc<ServiceState>>,
-/// never State<Arc<AppState>>.
-pub struct ServiceState {
-    pub app: Arc<AppState>,
-    pub posture_cache: SharedPostureCache,
-}
+pub type SharedPostureCache = std::sync::Arc<tokio::sync::RwLock<Option<CachedFleetPosture>>>;
 
 // ---------------------------------------------------------------------------
 // Command routing gate
@@ -200,6 +172,14 @@ pub fn should_route_command(
 mod posture_cache_tests {
     use super::*;
     use crate::verifier::FleetPosture;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
 
     #[test]
     fn test_new_entry_is_not_stale() {
@@ -256,21 +236,6 @@ mod posture_cache_tests {
         let rt: CachedFleetPosture = serde_json::from_str(&json).expect("must deserialize");
         assert_eq!(entry.posture, rt.posture);
         assert_eq!(entry.generation, rt.generation);
-    }
-
-    #[test]
-    fn test_from_posture_copies_propagated_status() {
-        use crate::verifier::{FleetNodePosture, NodeTrustState};
-        let fp = FleetNodePosture {
-            node_id: "test".to_string(),
-            local_status: NodeTrustState::Trusted,
-            propagated_status: FleetPosture::Degraded,
-            blocked_by: vec![],
-        };
-        let ts = now_ms();
-        let cached = CachedFleetPosture::from_posture(&fp, ts);
-        assert_eq!(cached.posture, FleetPosture::Degraded);
-        assert_eq!(cached.generated_at_ms, ts);
     }
 
     // -----------------------------------------------------------------------
