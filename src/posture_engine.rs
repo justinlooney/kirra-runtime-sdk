@@ -2,7 +2,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::verifier::{AppState, FleetNodePosture, FleetPosture, VerifierOperationMode};
+use crate::verifier::{AppState, FleetNodePosture, FleetPosture};
 use crate::posture_cache::{CachedFleetPosture, SharedPostureCache, now_ms};
 
 pub use crate::posture_cache::POSTURE_CACHE_TTL_MS;
@@ -125,7 +125,7 @@ pub fn recalculate_and_broadcast(app: &Arc<AppState>, cache: &SharedPostureCache
     }
 
     // Step 5: PassiveStandby — audit only, no cache or broadcast mutation.
-    if app.mode == VerifierOperationMode::PassiveStandby {
+    if !app.is_active() {
         tracing::debug!(
             posture    = ?new_posture,
             generation = generation,
