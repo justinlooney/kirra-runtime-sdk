@@ -227,12 +227,10 @@ if [ -f "${INSTALL_DIR}/${BINARY_NAME}" ] && [ "${FORCE_REINSTALL}" = false ]; t
     exit 0
 fi
 
-# Required tools
-for tool in curl sha256sum; do
-    if ! command -v "${tool}" &>/dev/null; then
-        fatal "${tool} is required but not installed. Run: sudo apt-get install -y curl coreutils"
-    fi
-done
+# Required tools (sha256sum always needed; curl only if we have to download)
+if ! command -v sha256sum &>/dev/null; then
+    fatal "sha256sum is required but not installed. Run: sudo apt-get install -y coreutils"
+fi
 success "Required tools available"
 
 # ---------------------------------------------------------------------------
@@ -250,6 +248,10 @@ if [ -f "${BUNDLED_BINARY}" ]; then
     BINARY_PATH="${BUNDLED_BINARY}"
 else
     info "Downloading from GitHub releases..."
+
+    if ! command -v curl &>/dev/null; then
+        fatal "curl is required to download Aegis. Run: sudo apt-get install -y curl"
+    fi
 
     # Get latest release URL
     RELEASE_JSON=$(curl -fsSL "${GITHUB_API}" 2>/dev/null) || \
