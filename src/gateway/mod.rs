@@ -6,6 +6,9 @@ pub mod policy_layer;
 pub mod cmd_vel;
 pub mod kinematics_contract;
 
+#[cfg(test)]
+mod kinematics_proptest;
+
 use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
 use std::thread;
