@@ -34,6 +34,8 @@ use aegis_runtime_sdk::federation::{
     ReportEvaluation,
 };
 use aegis_runtime_sdk::standby_monitor::{spawn_heartbeat_writer, spawn_promotion_monitor};
+use aegis_runtime_sdk::gateway::kinematics_contract::ProposedVehicleCommand;
+use aegis_runtime_sdk::gateway::policy_layer::enforce_actuator_safety_envelope;
 
 // --- Auth middleware ---------------------------------------------------------
 
@@ -134,6 +136,22 @@ struct AttestationStatusResponse {
     node_id: String,
     status: String,
     registered_at_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct SensorFaultReportRequest {
+    source_node_id: String,
+    confidence_score: f64,
+    hardware_fault_detected: bool,
+}
+
+#[derive(Deserialize)]
+struct RegisterAvAssetRequest {
+    node_id: String,
+    subsystem_type: String,
+    hardware_id: String,
+    #[serde(default)]
+    confidence_floor: Option<f64>,
 }
 
 // --- Handlers ----------------------------------------------------------------
@@ -627,6 +645,179 @@ async fn get_federated_reports(
     }
 }
 
+/// Receives a proposed vehicle motion command from the autonomous planner.
+///
+/// The enforce_actuator_safety_envelope middleware runs before this handler:
+///   - Reads fleet posture from SharedPostureCache
+///   - LockedOut → 403 FORBIDDEN before reaching this handler
+///   - Selects kinematic profile: Nominal → nominal_reference_profile(),
+///     Degraded → mrc_fallback_profile()
+///   - Runs validate_vehicle_command through the 7-priority pipeline
+///   - Allow → request forwarded unchanged
+///   - ClampLinear/ClampSteering → request body mutated with safe values
+///   - DenyBreach → 400 BAD REQUEST before reaching this handler
+///
+/// By the time this handler runs, cmd contains the post-enforcement values.
+async fn handle_actuator_motion_command(
+    State(svc): State<Arc<ServiceState>>,
+    Json(cmd): Json<ProposedVehicleCommand>,
+) -> impl IntoResponse {
+    let now = now_ms();
+
+    tracing::info!(
+        linear_velocity_mps = %cmd.linear_velocity_mps,
+        steering_angle_deg  = %cmd.steering_angle_deg,
+        delta_time_s        = %cmd.delta_time_s,
+        "Actuator motion command admitted through safety envelope"
+    );
+
+    let audit = serde_json::json!({
+        "linear_velocity_mps":        cmd.linear_velocity_mps,
+        "steering_angle_deg":         cmd.steering_angle_deg,
+        "current_velocity_mps":       cmd.current_velocity_mps,
+        "current_steering_angle_deg": cmd.current_steering_angle_deg,
+        "delta_time_s":               cmd.delta_time_s,
+        "admitted_at_ms":             now,
+    });
+    if let Ok(store) = svc.app.store.lock() {
+        let _ = store.save_posture_event(
+            "actuator_motion", "MOTION_COMMAND_ADMITTED",
+            &audit.to_string(), None, now,
+        );
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "linear_velocity_mps": cmd.linear_velocity_mps,
+        "steering_angle_deg":  cmd.steering_angle_deg,
+        "enforcement_action":  "Allow",
+    }))).into_response()
+}
+
+/// Accepts a sensor health report and updates the node's trust state.
+/// Low confidence or hardware fault marks the node Untrusted immediately.
+/// Recovery requires RECOVERY_STREAK_REQUIRED consecutive healthy reports.
+async fn handle_sensor_fault_report(
+    State(svc): State<Arc<ServiceState>>,
+    Json(req): Json<SensorFaultReportRequest>,
+) -> impl IntoResponse {
+    const CONFIDENCE_FLOOR: f64 = 0.70;
+    const RECOVERY_STREAK_REQUIRED: u32 = 5;
+
+    if req.source_node_id.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "source_node_id is required" }))).into_response();
+    }
+    if !svc.app.nodes.contains_key(&req.source_node_id) {
+        return (StatusCode::NOT_FOUND,
+                Json(json!({ "error": "node not registered" }))).into_response();
+    }
+
+    let now = now_ms();
+    let is_healthy = !req.hardware_fault_detected && req.confidence_score >= CONFIDENCE_FLOOR;
+    let streak_key = format!("recovery_streak_{}", req.source_node_id);
+
+    let (new_status, new_streak) = match svc.app.store.lock() {
+        Ok(store) => {
+            let streak: u32 = if is_healthy {
+                store.load_engine_state(&streak_key)
+                    .unwrap_or(None)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0) + 1
+            } else {
+                0
+            };
+            let _ = store.save_engine_state(&streak_key, &streak.to_string());
+
+            let status = if !is_healthy {
+                NodeTrustState::Untrusted("sensor_fault".to_string())
+            } else if streak >= RECOVERY_STREAK_REQUIRED {
+                NodeTrustState::Trusted
+            } else {
+                // Mid-recovery: preserve existing status until streak threshold met
+                svc.app.nodes.get(&req.source_node_id)
+                    .map(|n| n.status.clone())
+                    .unwrap_or(NodeTrustState::Unknown)
+            };
+            (status, streak)
+        }
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    };
+
+    let updated = match svc.app.nodes.get(&req.source_node_id) {
+        Some(n) => RegisteredNode {
+            node_id:              n.node_id.clone(),
+            status:               new_status,
+            registered_at_ms:     n.registered_at_ms,
+            last_trust_update_ms: now,
+            ak_public_pem:        n.ak_public_pem.clone(),
+            expected_pcr16_digest_hex: n.expected_pcr16_digest_hex.clone(),
+        },
+        None => return (StatusCode::NOT_FOUND,
+                        Json(json!({ "error": "node not found" }))).into_response(),
+    };
+
+    if svc.app.persist_and_insert_node(updated).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to persist node state" }))).into_response();
+    }
+
+    let event_type = if is_healthy { "SENSOR_HEALTH_REPORT_NOMINAL" } else { "SENSOR_HEALTH_REPORT_FAULT" };
+    let event = json!({
+        "source_node_id":          req.source_node_id,
+        "confidence_score":        req.confidence_score,
+        "hardware_fault_detected": req.hardware_fault_detected,
+        "recovery_streak":         new_streak,
+    });
+    if let Ok(store) = svc.app.store.lock() {
+        let _ = store.save_posture_event(
+            &req.source_node_id, event_type, &event.to_string(), None, now,
+        );
+    }
+
+    emit_posture_event(&svc.app, "NODE_STATUS_CHANGED", Some(req.source_node_id.clone()));
+
+    (StatusCode::OK, Json(json!({
+        "source_node_id": req.source_node_id,
+        "accepted": true,
+        "recovery_streak": new_streak,
+    }))).into_response()
+}
+
+/// Registers AV subsystem metadata for an existing fleet node.
+/// The node must already be registered via /attestation/register.
+async fn handle_register_av_asset(
+    State(svc): State<Arc<ServiceState>>,
+    Json(req): Json<RegisterAvAssetRequest>,
+) -> impl IntoResponse {
+    if req.node_id.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "node_id is required" }))).into_response();
+    }
+    if !svc.app.nodes.contains_key(&req.node_id) {
+        return (StatusCode::NOT_FOUND,
+                Json(json!({ "error": "node not registered" }))).into_response();
+    }
+
+    let now = now_ms();
+    let meta = json!({
+        "subsystem_type":  req.subsystem_type,
+        "hardware_id":     req.hardware_id,
+        "confidence_floor": req.confidence_floor.unwrap_or(0.70),
+    });
+    match svc.app.store.lock() {
+        Ok(store) => {
+            let _ = store.save_posture_event(
+                &req.node_id, "AV_ASSET_REGISTERED", &meta.to_string(), None, now,
+            );
+        }
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+
+    (StatusCode::OK, Json(json!({ "node_id": req.node_id, "registered": true }))).into_response()
+}
+
 // --- Entry point ------------------------------------------------------------
 
 #[tokio::main]
@@ -663,9 +854,6 @@ async fn main() {
         posture_cache: Arc::new(std::sync::RwLock::new(None)),
     });
 
-    // Wire HA promotion infrastructure based on startup mode.
-    // Active instances write heartbeats so standbys can detect failure.
-    // PassiveStandby instances monitor heartbeats and promote if primary is lost.
     match mode {
         VerifierOperationMode::Active => {
             spawn_heartbeat_writer(Arc::clone(&svc_state.app));
@@ -691,10 +879,20 @@ async fn main() {
     let admin_routes = Router::new()
         .route("/attestation/register", post(register_node))
         .route("/fleet/dependencies", post(register_dependencies))
+        .route("/fleet/diagnostics/report", post(handle_sensor_fault_report))
+        .route("/fleet/assets/register", post(handle_register_av_asset))
         .route("/system/backup/export", post(export_backup))
         .route("/system/audit/verify", get(verify_audit_chain))
         .route("/federation/controllers/register", post(register_federation_controller))
         .route("/attestation/identity/register", post(register_node_identity))
+        .layer(middleware::from_fn(require_admin_token));
+
+    let actuator_routes = Router::new()
+        .route("/actuator/motion/command", post(handle_actuator_motion_command))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&svc_state),
+            enforce_actuator_safety_envelope,
+        ))
         .layer(middleware::from_fn(require_admin_token));
 
     let attestation_routes = Router::new()
@@ -717,6 +915,7 @@ async fn main() {
         .merge(probe_routes)
         .merge(identity_gated_routes)
         .merge(admin_routes)
+        .merge(actuator_routes)
         .merge(attestation_routes)
         .merge(read_routes)
         .with_state(svc_state);
