@@ -944,7 +944,7 @@ async fn main() {
         .layer(middleware::from_fn(require_admin_token));
 
     let attestation_routes = Router::new()
-        .route("/attestation/challenge/:node_id", post(issue_challenge))
+        .route("/attestation/challenge/{node_id}", post(issue_challenge))
         .route("/attestation/verify", post(verify_attestation));
 
     let probe_routes = Router::new()
@@ -952,12 +952,12 @@ async fn main() {
         .route("/ready", get(ready));
 
     let read_routes = Router::new()
-        .route("/attestation/status/:node_id", get(get_node_status))
+        .route("/attestation/status/{node_id}", get(get_node_status))
         .route("/fleet/posture", get(get_fleet_posture))
-        .route("/fleet/posture/:node_id", get(get_node_posture))
-        .route("/fleet/history/:node_id", get(get_node_history))
-        .route("/fleet/flapping/:node_id", get(get_node_flap_status))
-        .route("/federation/reports/:asset_id", get(get_federated_reports));
+        .route("/fleet/posture/{node_id}", get(get_node_posture))
+        .route("/fleet/history/{node_id}", get(get_node_history))
+        .route("/fleet/flapping/{node_id}", get(get_node_flap_status))
+        .route("/federation/reports/{asset_id}", get(get_federated_reports));
 
     let app = Router::new()
         .merge(probe_routes)
