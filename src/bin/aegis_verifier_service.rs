@@ -444,7 +444,7 @@ async fn evaluate_action_filter(
     let posture = svc.posture_cache
         .read()
         .ok()
-        .and_then(|g| g.as_ref().map(|c| c.propagated_status.clone()))
+        .and_then(|g| g.as_ref().map(|c| c.posture.clone()))
         .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
 
     let decision = evaluate_action_claim(claim.clone(), posture);
@@ -473,7 +473,7 @@ async fn evaluate_industrial_adapter(
     let posture = svc.posture_cache
         .read()
         .ok()
-        .and_then(|g| g.as_ref().map(|c| c.propagated_status.clone()))
+        .and_then(|g| g.as_ref().map(|c| c.posture.clone()))
         .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
 
     let asset_id = event.asset_id.clone();
@@ -647,11 +647,7 @@ async fn get_federated_reports(
 }
 
 /// Receives a proposed vehicle motion command from the autonomous planner.
-/// The enforce_actuator_safety_envelope middleware runs before this handler:
-///   - LockedOut fleet posture → 403 before reaching here
-///   - Selects profile: Nominal → nominal_reference_profile(), Degraded → mrc_fallback_profile()
-///   - Runs validate_vehicle_command; DenyBreach → 400 before reaching here
-/// cmd contains post-enforcement values by the time this handler runs.
+/// The enforce_actuator_safety_envelope middleware runs before this handler.
 async fn handle_actuator_motion_command(
     State(svc): State<Arc<ServiceState>>,
     Json(cmd): Json<ProposedVehicleCommand>,
@@ -688,14 +684,6 @@ async fn handle_actuator_motion_command(
 }
 
 /// Accepts a sensor health report and updates the node's trust state.
-///
-/// Fault path: immediately marks Untrusted, resets recovery streak on disk
-/// (disk-first before memory mutation).
-///
-/// Healthy path: delegates to evaluate_recovery_report() from recovery_hysteresis.rs
-/// which enforces the time-bounded streak (5 reports within 10s). Trust state
-/// is updated only on RecoveryConfirmed; streak data lives in av_subsystem_meta,
-/// not posture_engine_state.
 async fn handle_sensor_fault_report(
     State(svc): State<Arc<ServiceState>>,
     Json(req): Json<SensorFaultReportRequest>,
@@ -711,7 +699,6 @@ async fn handle_sensor_fault_report(
 
     let now = now_ms();
 
-    // Load per-node confidence floor from av_subsystem_meta; fall back to 0.70.
     let confidence_floor = match svc.app.store.lock() {
         Ok(store) => store.load_av_confidence_floor(&req.source_node_id)
             .unwrap_or(None)
@@ -725,7 +712,6 @@ async fn handle_sensor_fault_report(
     if is_degraded {
         let reason = if req.hardware_fault_detected { "hardware_fault" } else { "low_confidence" };
 
-        // Disk-first: reset streak on disk before mutating in-memory trust state.
         if let Ok(store) = svc.app.store.lock() {
             let _ = store.reset_recovery_streak(&req.source_node_id, now);
         }
@@ -770,13 +756,11 @@ async fn handle_sensor_fault_report(
         }))).into_response();
     }
 
-    // Healthy report. Only run hysteresis if the node is currently untrusted.
     let currently_untrusted = svc.app.nodes.get(&req.source_node_id)
         .map(|n| matches!(n.status, NodeTrustState::Untrusted(_)))
         .unwrap_or(false);
 
     if !currently_untrusted {
-        // Already trusted — just touch the telemetry timestamp.
         if let Ok(store) = svc.app.store.lock() {
             let _ = store.touch_av_telemetry_timestamp(&req.source_node_id, now);
         }
@@ -787,8 +771,6 @@ async fn handle_sensor_fault_report(
         }))).into_response();
     }
 
-    // Node is untrusted — evaluate time-bounded hysteresis.
-    // evaluate_recovery_report performs all streak disk writes internally (disk-first).
     let decision = match svc.app.store.lock() {
         Ok(store) => evaluate_recovery_report(&store, &req.source_node_id, now),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
@@ -815,7 +797,6 @@ async fn handle_sensor_fault_report(
                         Json(json!({ "error": "failed to persist node state" }))).into_response();
             }
 
-            // Reset streak after re-trust and record audit event.
             if let Ok(store) = svc.app.store.lock() {
                 let _ = store.reset_recovery_streak(&req.source_node_id, now);
                 let event = json!({
@@ -830,9 +811,7 @@ async fn handle_sensor_fault_report(
 
             emit_posture_event(&svc.app, "NODE_STATUS_CHANGED", Some(req.source_node_id.clone()));
         }
-        HysteresisDecision::StreakBuilding { .. } | HysteresisDecision::WindowExpired { .. } => {
-            // No trust change — node remains Untrusted, streak state managed by evaluate_recovery_report.
-        }
+        HysteresisDecision::StreakBuilding { .. } | HysteresisDecision::WindowExpired { .. } => {}
         HysteresisDecision::NotApplicable => {
             if let Ok(store) = svc.app.store.lock() {
                 let _ = store.touch_av_telemetry_timestamp(&req.source_node_id, now);
@@ -849,8 +828,6 @@ async fn handle_sensor_fault_report(
 }
 
 /// Registers AV subsystem metadata for an existing fleet node.
-/// Populates av_subsystem_meta so confidence floor and recovery streak
-/// columns are available for subsequent sensor health reports.
 async fn handle_register_av_asset(
     State(svc): State<Arc<ServiceState>>,
     Json(req): Json<RegisterAvAssetRequest>,
@@ -869,8 +846,6 @@ async fn handle_register_av_asset(
 
     match svc.app.store.lock() {
         Ok(store) => {
-            // Upsert av_subsystem_meta so load_av_confidence_floor and
-            // recovery streak methods have a row to operate on.
             if let Err(e) = store.register_av_subsystem_meta(
                 &req.node_id, &req.subsystem_type, &req.hardware_id, floor, now,
             ) {
