@@ -33,6 +33,7 @@ use aegis_runtime_sdk::federation::{
     RegisterFederationControllerRequest,
     ReportEvaluation,
 };
+use aegis_runtime_sdk::standby_monitor::{spawn_heartbeat_writer, spawn_promotion_monitor};
 
 // --- Auth middleware ---------------------------------------------------------
 
@@ -190,7 +191,7 @@ async fn register_node(
     State(svc): State<Arc<ServiceState>>,
     Json(req): Json<RegisterNodeRequest>,
 ) -> impl IntoResponse {
-    if !svc.app.mode.allows_mutation() {
+    if !svc.app.is_active() {
         return (StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "error": "instance is in passive standby mode" }))).into_response();
     }
@@ -216,7 +217,7 @@ async fn issue_challenge(
     State(svc): State<Arc<ServiceState>>,
     Path(node_id): Path<String>,
 ) -> impl IntoResponse {
-    if !svc.app.mode.allows_mutation() {
+    if !svc.app.is_active() {
         return (StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "error": "instance is in passive standby mode" }))).into_response();
     }
@@ -236,7 +237,7 @@ async fn verify_attestation(
     State(svc): State<Arc<ServiceState>>,
     Json(req): Json<VerifyAttestationRequest>,
 ) -> impl IntoResponse {
-    if !svc.app.mode.allows_mutation() {
+    if !svc.app.is_active() {
         return (StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "error": "instance is in passive standby mode" }))).into_response();
     }
@@ -342,7 +343,7 @@ async fn register_dependencies(
     State(svc): State<Arc<ServiceState>>,
     Json(req): Json<RegisterDependenciesRequest>,
 ) -> impl IntoResponse {
-    if !svc.app.mode.allows_mutation() {
+    if !svc.app.is_active() {
         return (StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "error": "instance is in passive standby mode" }))).into_response();
     }
@@ -661,6 +662,23 @@ async fn main() {
         app: app_state,
         posture_cache: Arc::new(std::sync::RwLock::new(None)),
     });
+
+    // Wire HA promotion infrastructure based on startup mode.
+    // Active instances write heartbeats so standbys can detect failure.
+    // PassiveStandby instances monitor heartbeats and promote if primary is lost.
+    match mode {
+        VerifierOperationMode::Active => {
+            spawn_heartbeat_writer(Arc::clone(&svc_state.app));
+            tracing::info!("Heartbeat writer started (Active mode)");
+        }
+        VerifierOperationMode::PassiveStandby => {
+            spawn_promotion_monitor(
+                Arc::clone(&svc_state.app),
+                Arc::clone(&svc_state.posture_cache),
+            );
+            tracing::info!("Promotion monitor started (PassiveStandby mode)");
+        }
+    }
 
     let identity_gated_routes = Router::new()
         .route("/system/posture/stream", get(system_posture_stream))
