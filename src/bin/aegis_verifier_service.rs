@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use tower_http::cors::{CorsLayer, Any};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::convert::Infallible;
@@ -959,6 +960,11 @@ async fn main() {
         .route("/fleet/flapping/{node_id}", get(get_node_flap_status))
         .route("/federation/reports/{asset_id}", get(get_federated_reports));
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     let app = Router::new()
         .merge(probe_routes)
         .merge(identity_gated_routes)
@@ -966,7 +972,8 @@ async fn main() {
         .merge(actuator_routes)
         .merge(attestation_routes)
         .merge(read_routes)
-        .with_state(svc_state);
+        .with_state(svc_state)
+        .layer(cors);
 
     println!("Aegis Verifier Service listening on {listen_addr} (db: {db_path})");
     let listener = tokio::net::TcpListener::bind(&listen_addr).await

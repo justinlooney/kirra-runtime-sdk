@@ -659,6 +659,77 @@ if [ "${SKIP_SERVICE_START}" = false ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Dashboard (optional)
+# ---------------------------------------------------------------------------
+
+BUNDLED_DASHBOARD="${SCRIPT_DIR}/dashboard"
+DASHBOARD_INSTALLED=false
+DASHBOARD_PORT=8091
+
+if [ -d "${BUNDLED_DASHBOARD}" ]; then
+    section "Web Dashboard"
+    echo ""
+    echo "  A web dashboard is included for monitoring the Aegis fleet."
+    echo "  It will be served on port ${DASHBOARD_PORT} using Python's built-in HTTP server."
+    echo ""
+
+    if [ "${NON_INTERACTIVE}" = true ]; then
+        _install_dash="${AEGIS_INSTALL_DASHBOARD:-Y}"
+    else
+        echo -n "  Install web dashboard? [Y/n]: "
+        read -r _install_dash
+    fi
+
+    if [[ "${_install_dash:-Y}" =~ ^[Yy]$ ]]; then
+        DASHBOARD_SHARE_DIR="/usr/local/share/aegis/dashboard"
+        mkdir -p "${DASHBOARD_SHARE_DIR}"
+        cp -r "${BUNDLED_DASHBOARD}/." "${DASHBOARD_SHARE_DIR}/"
+        chown -R root:${AEGIS_GROUP} "${DASHBOARD_SHARE_DIR}"
+        chmod -R 755 "${DASHBOARD_SHARE_DIR}"
+
+        DASHBOARD_SERVICE_FILE="/etc/systemd/system/aegis-dashboard.service"
+        BUNDLED_DASH_SVC="${SCRIPT_DIR}/systemd/aegis-dashboard.service"
+
+        if [ -f "${BUNDLED_DASH_SVC}" ]; then
+            cp "${BUNDLED_DASH_SVC}" "${DASHBOARD_SERVICE_FILE}"
+        else
+            cat > "${DASHBOARD_SERVICE_FILE}" << EOF
+[Unit]
+Description=Aegis Safety Kernel Web Dashboard
+After=network.target aegis-verifier.service
+Wants=aegis-verifier.service
+
+[Service]
+User=${AEGIS_USER}
+Group=${AEGIS_GROUP}
+ExecStart=/usr/bin/python3 -m http.server ${DASHBOARD_PORT} --directory ${DASHBOARD_SHARE_DIR}
+WorkingDirectory=${DASHBOARD_SHARE_DIR}
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        fi
+
+        chmod 644 "${DASHBOARD_SERVICE_FILE}"
+        systemctl daemon-reload
+        systemctl enable aegis-dashboard
+
+        if [ "${SKIP_SERVICE_START}" = false ]; then
+            systemctl start aegis-dashboard
+            success "Dashboard installed and running on port ${DASHBOARD_PORT}"
+        else
+            success "Dashboard installed (not started)"
+        fi
+
+        DASHBOARD_INSTALLED=true
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Post-install summary
 # ---------------------------------------------------------------------------
 
@@ -677,6 +748,12 @@ bold "API Endpoint:"
 echo "  Health:   http://$(hostname -I | awk '{print $1}'):${PORT}/health"
 echo "  Posture:  http://$(hostname -I | awk '{print $1}'):${PORT}/fleet/posture"
 echo ""
+if [ "${DASHBOARD_INSTALLED}" = true ]; then
+    bold "Web Dashboard:"
+    echo "  http://$(hostname -I | awk '{print $1}'):${DASHBOARD_PORT}"
+    echo "  (enter the API URL and your admin token to connect)"
+    echo ""
+fi
 bold "Configuration:"
 echo "  File:     ${ENV_FILE}"
 echo "  Database: ${DB_PATH}"
