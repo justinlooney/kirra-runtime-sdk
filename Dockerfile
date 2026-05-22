@@ -1,19 +1,34 @@
-FROM rust:1.78-bookworm AS builder
-WORKDIR /app
+# ── Stage 1: build ───────────────────────────────────────────────────────────
+FROM rust:1-alpine AS builder
+
+RUN apk add --no-cache musl-dev gcc
+
+WORKDIR /build
 COPY . .
+
 RUN cargo build --release --bin aegis_verifier_service
 
-FROM debian:bookworm-slim
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY --from=builder /app/target/release/aegis_verifier_service /usr/local/bin/aegis_verifier_service
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+FROM alpine:3
 
-ENV AEGIS_VERIFIER_MODE=active
-ENV AEGIS_DB_PATH=/data/aegis_verifier.sqlite
-ENV RUST_LOG=info
+RUN apk add --no-cache curl && \
+    addgroup -S -g 1000 aegis && \
+    adduser  -S -u 1000 -G aegis -h /var/lib/aegis -s /sbin/nologin aegis && \
+    mkdir -p /var/lib/aegis && \
+    chown aegis:aegis /var/lib/aegis
 
-EXPOSE 8088
-VOLUME ["/data"]
-CMD ["aegis_verifier_service"]
+COPY --from=builder /build/target/release/aegis_verifier_service /usr/local/bin/aegis_verifier_service
+
+USER aegis
+WORKDIR /var/lib/aegis
+
+ENV AEGIS_VERIFIER_ADDR=0.0.0.0:8090
+ENV AEGIS_DB_PATH=/var/lib/aegis/aegis.db
+
+VOLUME ["/var/lib/aegis"]
+EXPOSE 8090
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -fsSL http://localhost:8090/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/aegis_verifier_service"]
