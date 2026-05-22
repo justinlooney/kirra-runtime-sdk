@@ -1,82 +1,48 @@
-// src/posture_cache.rs — CachedFleetPosture definition
-//
-// v2.2.2 — Temporal hardening patch
-//
-// CORRECTIONS vs. milestone doc:
-//
-//   1. Field name is `generated_at_ms`, NOT `updated_at_ms`.
-//      Every existing patch (policy_layer.rs, posture_engine.rs) reads
-//      `cached.generated_at_ms`. Renaming it breaks all those call sites.
-//      We keep the field name consistent with what the engine writes.
-//
-//   2. `ttl_ms` field is RETAINED. The milestone doc dropped it entirely.
-//      policy_layer.rs reads `cached.ttl_ms` to evaluate staleness.
-//      The TTL is owned by the entry (set by the engine), not hardcoded
-//      in the middleware. Dropping it would re-centralize TTL knowledge
-//      in the wrong layer.
-//
-//   3. `CachedFleetPosture::new()` signature kept compatible with existing
-//      test infrastructure. A `new_with_generation(posture, generation, now_ms)`
-//      constructor is added for engine use without breaking existing callers.
-//
-//   4. `should_route_command` retains `OperationalCommand` parameter type.
-//      The milestone doc replaced it with `required_class: &str`, bypassing
-//      the Unknown early-return and losing type safety (invariant #9 violation).
-//
-// This file is the single definition of CachedFleetPosture.
-// SharedPostureCache = Arc<RwLock<Option<CachedFleetPosture>>> (unchanged).
+// src/posture_cache.rs — CachedFleetPosture, SharedPostureCache, ServiceState, now_ms
 
-use crate::verifier::{FleetPosture, OperationalCommand};
-use crate::posture_engine::POSTURE_CACHE_TTL_MS;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-// ---------------------------------------------------------------------------
-// CachedFleetPosture
-// ---------------------------------------------------------------------------
+use crate::verifier::{AppState, FleetNodePosture, FleetPosture};
+
+/// Returns the current time as milliseconds since UNIX epoch.
+/// Exported for use by service binary and test infrastructure.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Posture cache entries older than this are treated as stale (fail-closed).
+pub const POSTURE_CACHE_TTL_MS: u64 = 5_000;
 
 /// A complete, immutable snapshot of the fleet posture at a point in time.
 ///
-/// This struct is atomically replaced (never field-mutated) by
-/// `recalculate_and_broadcast`. Readers always observe a consistent snapshot.
-///
-/// Field ownership:
-///   - `posture`          — derived by `derive_fleet_posture` in posture_engine.rs
-///   - `generated_at_ms`  — timestamp set by the engine at write time
-///   - `ttl_ms`           — staleness window set by the engine (POSTURE_CACHE_TTL_MS)
-///   - `generation`       — monotonic counter from `next_generation()` in posture_engine.rs
-///
-/// The middleware (`resolve_posture`) reads `generated_at_ms` and `ttl_ms`
-/// to evaluate staleness. It does not own either value.
+/// Atomically replaced (never field-mutated) by recalculate_and_broadcast.
+/// Readers always observe a consistent snapshot.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct CachedFleetPosture {
     /// The current aggregated system-wide posture derived from the DAG.
-    pub posture: FleetPosture,
+    pub propagated_status: FleetPosture,
 
     /// Absolute timestamp (ms since UNIX epoch) when this snapshot was computed.
-    /// Named `generated_at_ms` to distinguish from any external "update" event.
-    /// This is when the *engine* computed it, not when a sensor last reported.
     pub generated_at_ms: u64,
 
-    /// Staleness TTL in milliseconds. After `generated_at_ms + ttl_ms < now`,
-    /// `resolve_posture` treats this entry as stale and fails closed.
-    /// Set by the engine from `POSTURE_CACHE_TTL_MS` — not by the middleware.
+    /// Staleness TTL in milliseconds. Set from POSTURE_CACHE_TTL_MS by the engine.
     pub ttl_ms: u64,
 
-    /// Monotonically increasing generation counter. Strictly increasing within
-    /// a process lifetime; persisted across restarts (see posture_engine_v2.rs).
-    /// Useful for ordering guarantees, stale-cache debugging, and federation
-    /// reconciliation.
+    /// Monotonically increasing generation counter from next_generation().
     pub generation: u64,
 }
 
 impl CachedFleetPosture {
-    /// Constructs a new cache entry with engine-assigned fields.
-    ///
-    /// Used by `recalculate_and_broadcast` — callers supply the generation
-    /// (from `next_generation()`) and timestamp (from `now_ms()`).
-    pub fn new_with_generation(posture: FleetPosture, generation: u64, now_ms: u64) -> Self {
+    /// Engine-assigned constructor. Supply generation from next_generation()
+    /// and timestamp from now_ms().
+    pub fn new_with_generation(posture: FleetPosture, generation: u64, ts: u64) -> Self {
         Self {
-            posture,
-            generated_at_ms: now_ms,
+            propagated_status: posture,
+            generated_at_ms: ts,
             ttl_ms: POSTURE_CACHE_TTL_MS,
             generation,
         }
@@ -84,16 +50,21 @@ impl CachedFleetPosture {
 
     /// Convenience constructor for tests and cold-start initialization.
     /// Uses generation=1 and the current system time.
-    /// For production engine writes, use `new_with_generation` instead.
     pub fn new(posture: FleetPosture) -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
         Self {
-            posture,
-            generated_at_ms: now,
+            propagated_status: posture,
+            generated_at_ms: now_ms(),
+            ttl_ms: POSTURE_CACHE_TTL_MS,
+            generation: 1,
+        }
+    }
+
+    /// Constructs a cache entry from a per-node FleetNodePosture snapshot.
+    /// Used by the service binary's get_node_posture handler.
+    pub fn from_posture(posture: &FleetNodePosture, ts: u64) -> Self {
+        Self {
+            propagated_status: posture.propagated_status.clone(),
+            generated_at_ms: ts,
             ttl_ms: POSTURE_CACHE_TTL_MS,
             generation: 1,
         }
@@ -107,78 +78,23 @@ impl CachedFleetPosture {
 
 /// The shared posture cache type.
 ///
-/// `Arc<RwLock<Option<CachedFleetPosture>>>`:
-///   - `Arc` — shared ownership across ServiceState, handlers, middleware
-///   - `RwLock` — concurrent reads, exclusive writes
-///   - `Option` — `None` = cold start / cache cleared (fail-closed in middleware)
-///   - `CachedFleetPosture` — complete atomic snapshot (never partially updated)
-pub type SharedPostureCache = std::sync::Arc<tokio::sync::RwLock<Option<CachedFleetPosture>>>;
+/// Uses std::sync::RwLock (sync, not tokio) to match the service binary.
+/// None = cold start / cache cleared (fail-closed in middleware).
+pub type SharedPostureCache = Arc<std::sync::RwLock<Option<CachedFleetPosture>>>;
 
-// ---------------------------------------------------------------------------
-// Command routing gate
-// ---------------------------------------------------------------------------
-
-/// Routes or blocks an operational command based on fleet posture and cache freshness.
+/// Shared service state threaded through all axum handlers.
 ///
-/// Invariants preserved:
-///   - OperationalCommand::Unknown → false BEFORE posture check (invariant #9)
-///   - Stale cache → false (fail-closed, uses entry.is_stale() from CachedFleetPosture)
-///   - LockedOut → false for all commands
-///   - Degraded → true for ReadTelemetry only
-///   - Nominal → true for all except Unknown
-///
-/// The `now_ms` parameter accepts an injected clock value. In tests, pass
-/// `virtual_clock.now_ms()`; in production, pass `crate::clock::SystemClock.now_ms()`.
-/// This keeps the function testable without syscall access.
-#[must_use]
-pub fn should_route_command(
-    cache: &Option<CachedFleetPosture>,
-    now_ms: u64,
-    command: OperationalCommand,
-) -> bool {
-    // Invariant #9: Unknown is denied before any posture evaluation.
-    // This early return must never be removed.
-    if command == OperationalCommand::Unknown {
-        return false;
-    }
-
-    let Some(entry) = cache.as_ref() else {
-        // No cache entry — fail-closed
-        return false;
-    };
-
-    // Staleness check uses entry.is_stale() — the TTL is owned by the entry,
-    // not hardcoded here. This aligns with policy_layer.rs resolve_posture.
-    if entry.is_stale(now_ms) {
-        tracing::warn!(
-            generated_at_ms = entry.generated_at_ms,
-            ttl_ms          = entry.ttl_ms,
-            now_ms          = now_ms,
-            generation      = entry.generation,
-            "should_route_command: cache stale — blocking command"
-        );
-        return false;
-    }
-
-    match entry.posture {
-        FleetPosture::Nominal   => true,
-        FleetPosture::Degraded  => command == OperationalCommand::ReadTelemetry,
-        FleetPosture::LockedOut => false,
-    }
+/// Security invariant #11: All handlers MUST use State<Arc<ServiceState>>,
+/// never State<Arc<AppState>>.
+pub struct ServiceState {
+    pub app: Arc<AppState>,
+    pub posture_cache: SharedPostureCache,
 }
 
 #[cfg(test)]
 mod posture_cache_tests {
     use super::*;
     use crate::verifier::FleetPosture;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    }
 
     #[test]
     fn test_new_entry_is_not_stale() {
@@ -190,7 +106,7 @@ mod posture_cache_tests {
     fn test_entry_beyond_ttl_is_stale() {
         let old_ts = now_ms().saturating_sub(POSTURE_CACHE_TTL_MS + 1);
         let entry = CachedFleetPosture {
-            posture: FleetPosture::Nominal,
+            propagated_status: FleetPosture::Nominal,
             generated_at_ms: old_ts,
             ttl_ms: POSTURE_CACHE_TTL_MS,
             generation: 1,
@@ -200,10 +116,9 @@ mod posture_cache_tests {
 
     #[test]
     fn test_entry_exactly_at_ttl_boundary_is_stale() {
-        // At exactly TTL age the entry is stale (>=, not >).
         let boundary_ts = now_ms().saturating_sub(POSTURE_CACHE_TTL_MS);
         let entry = CachedFleetPosture {
-            posture: FleetPosture::Nominal,
+            propagated_status: FleetPosture::Nominal,
             generated_at_ms: boundary_ts,
             ttl_ms: POSTURE_CACHE_TTL_MS,
             generation: 1,
@@ -215,7 +130,7 @@ mod posture_cache_tests {
     fn test_new_with_generation_sets_all_fields() {
         let ts = now_ms();
         let entry = CachedFleetPosture::new_with_generation(FleetPosture::Degraded, 42, ts);
-        assert_eq!(entry.posture, FleetPosture::Degraded);
+        assert_eq!(entry.propagated_status, FleetPosture::Degraded);
         assert_eq!(entry.generation, 42);
         assert_eq!(entry.generated_at_ms, ts);
         assert_eq!(entry.ttl_ms, POSTURE_CACHE_TTL_MS);
@@ -233,67 +148,22 @@ mod posture_cache_tests {
         let entry = CachedFleetPosture::new(FleetPosture::Nominal);
         let json = serde_json::to_string(&entry).expect("must serialize");
         let rt: CachedFleetPosture = serde_json::from_str(&json).expect("must deserialize");
-        assert_eq!(entry.posture, rt.posture);
+        assert_eq!(entry.propagated_status, rt.propagated_status);
         assert_eq!(entry.generation, rt.generation);
     }
 
-    // -----------------------------------------------------------------------
-    // should_route_command tests
-    // -----------------------------------------------------------------------
-
-    fn fresh_cache(posture: FleetPosture) -> Option<CachedFleetPosture> {
-        Some(CachedFleetPosture::new(posture))
-    }
-
-    fn stale_cache(posture: FleetPosture) -> Option<CachedFleetPosture> {
-        let ts = now_ms().saturating_sub(POSTURE_CACHE_TTL_MS + 1);
-        Some(CachedFleetPosture {
-            posture,
-            generated_at_ms: ts,
-            ttl_ms: POSTURE_CACHE_TTL_MS,
-            generation: 1,
-        })
-    }
-
     #[test]
-    fn test_unknown_command_denied_before_posture_check() {
-        // Invariant #9: Unknown blocked even in Nominal posture.
-        let cache = fresh_cache(FleetPosture::Nominal);
-        assert!(!should_route_command(&cache, now_ms(), OperationalCommand::Unknown));
-    }
-
-    #[test]
-    fn test_none_cache_denies_all_commands() {
+    fn test_from_posture_copies_propagated_status() {
+        use crate::verifier::{FleetNodePosture, NodeTrustState};
+        let fp = FleetNodePosture {
+            node_id: "test".to_string(),
+            local_status: NodeTrustState::Trusted,
+            propagated_status: FleetPosture::Degraded,
+            blocked_by: vec![],
+        };
         let ts = now_ms();
-        assert!(!should_route_command(&None, ts, OperationalCommand::ReadTelemetry));
-        assert!(!should_route_command(&None, ts, OperationalCommand::Unknown));
-    }
-
-    #[test]
-    fn test_stale_cache_denies_all_non_unknown_commands() {
-        let cache = stale_cache(FleetPosture::Nominal);
-        let ts = now_ms();
-        assert!(!should_route_command(&cache, ts, OperationalCommand::ReadTelemetry),
-            "stale Nominal must deny — fail-closed");
-    }
-
-    #[test]
-    fn test_nominal_posture_allows_read_telemetry() {
-        let cache = fresh_cache(FleetPosture::Nominal);
-        assert!(should_route_command(&cache, now_ms(), OperationalCommand::ReadTelemetry));
-    }
-
-    #[test]
-    fn test_degraded_posture_allows_only_read_telemetry() {
-        let cache = fresh_cache(FleetPosture::Degraded);
-        let ts = now_ms();
-        assert!(should_route_command(&cache, ts, OperationalCommand::ReadTelemetry));
-    }
-
-    #[test]
-    fn test_lockedout_posture_denies_all_commands() {
-        let cache = fresh_cache(FleetPosture::LockedOut);
-        let ts = now_ms();
-        assert!(!should_route_command(&cache, ts, OperationalCommand::ReadTelemetry));
+        let cached = CachedFleetPosture::from_posture(&fp, ts);
+        assert_eq!(cached.propagated_status, FleetPosture::Degraded);
+        assert_eq!(cached.generated_at_ms, ts);
     }
 }
