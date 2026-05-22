@@ -36,6 +36,7 @@ use aegis_runtime_sdk::federation::{
 use aegis_runtime_sdk::standby_monitor::{spawn_heartbeat_writer, spawn_promotion_monitor};
 use aegis_runtime_sdk::gateway::kinematics_contract::ProposedVehicleCommand;
 use aegis_runtime_sdk::gateway::policy_layer::enforce_actuator_safety_envelope;
+use aegis_runtime_sdk::recovery_hysteresis::{evaluate_recovery_report, HysteresisDecision};
 
 // --- Auth middleware ---------------------------------------------------------
 
@@ -646,18 +647,11 @@ async fn get_federated_reports(
 }
 
 /// Receives a proposed vehicle motion command from the autonomous planner.
-///
 /// The enforce_actuator_safety_envelope middleware runs before this handler:
-///   - Reads fleet posture from SharedPostureCache
-///   - LockedOut → 403 FORBIDDEN before reaching this handler
-///   - Selects kinematic profile: Nominal → nominal_reference_profile(),
-///     Degraded → mrc_fallback_profile()
-///   - Runs validate_vehicle_command through the 7-priority pipeline
-///   - Allow → request forwarded unchanged
-///   - ClampLinear/ClampSteering → request body mutated with safe values
-///   - DenyBreach → 400 BAD REQUEST before reaching this handler
-///
-/// By the time this handler runs, cmd contains the post-enforcement values.
+///   - LockedOut fleet posture → 403 before reaching here
+///   - Selects profile: Nominal → nominal_reference_profile(), Degraded → mrc_fallback_profile()
+///   - Runs validate_vehicle_command; DenyBreach → 400 before reaching here
+/// cmd contains post-enforcement values by the time this handler runs.
 async fn handle_actuator_motion_command(
     State(svc): State<Arc<ServiceState>>,
     Json(cmd): Json<ProposedVehicleCommand>,
@@ -694,15 +688,18 @@ async fn handle_actuator_motion_command(
 }
 
 /// Accepts a sensor health report and updates the node's trust state.
-/// Low confidence or hardware fault marks the node Untrusted immediately.
-/// Recovery requires RECOVERY_STREAK_REQUIRED consecutive healthy reports.
+///
+/// Fault path: immediately marks Untrusted, resets recovery streak on disk
+/// (disk-first before memory mutation).
+///
+/// Healthy path: delegates to evaluate_recovery_report() from recovery_hysteresis.rs
+/// which enforces the time-bounded streak (5 reports within 10s). Trust state
+/// is updated only on RecoveryConfirmed; streak data lives in av_subsystem_meta,
+/// not posture_engine_state.
 async fn handle_sensor_fault_report(
     State(svc): State<Arc<ServiceState>>,
     Json(req): Json<SensorFaultReportRequest>,
 ) -> impl IntoResponse {
-    const CONFIDENCE_FLOOR: f64 = 0.70;
-    const RECOVERY_STREAK_REQUIRED: u32 = 5;
-
     if req.source_node_id.trim().is_empty() {
         return (StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "source_node_id is required" }))).into_response();
@@ -713,79 +710,147 @@ async fn handle_sensor_fault_report(
     }
 
     let now = now_ms();
-    let is_healthy = !req.hardware_fault_detected && req.confidence_score >= CONFIDENCE_FLOOR;
-    let streak_key = format!("recovery_streak_{}", req.source_node_id);
 
-    let (new_status, new_streak) = match svc.app.store.lock() {
-        Ok(store) => {
-            let streak: u32 = if is_healthy {
-                store.load_engine_state(&streak_key)
-                    .unwrap_or(None)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0) + 1
-            } else {
-                0
-            };
-            let _ = store.save_engine_state(&streak_key, &streak.to_string());
-
-            let status = if !is_healthy {
-                NodeTrustState::Untrusted("sensor_fault".to_string())
-            } else if streak >= RECOVERY_STREAK_REQUIRED {
-                NodeTrustState::Trusted
-            } else {
-                // Mid-recovery: preserve existing status until streak threshold met
-                svc.app.nodes.get(&req.source_node_id)
-                    .map(|n| n.status.clone())
-                    .unwrap_or(NodeTrustState::Unknown)
-            };
-            (status, streak)
-        }
+    // Load per-node confidence floor from av_subsystem_meta; fall back to 0.70.
+    let confidence_floor = match svc.app.store.lock() {
+        Ok(store) => store.load_av_confidence_floor(&req.source_node_id)
+            .unwrap_or(None)
+            .unwrap_or(0.70),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
                           Json(json!({ "error": "store lock poisoned" }))).into_response(),
     };
 
-    let updated = match svc.app.nodes.get(&req.source_node_id) {
-        Some(n) => RegisteredNode {
-            node_id:              n.node_id.clone(),
-            status:               new_status,
-            registered_at_ms:     n.registered_at_ms,
-            last_trust_update_ms: now,
-            ak_public_pem:        n.ak_public_pem.clone(),
-            expected_pcr16_digest_hex: n.expected_pcr16_digest_hex.clone(),
-        },
-        None => return (StatusCode::NOT_FOUND,
-                        Json(json!({ "error": "node not found" }))).into_response(),
+    let is_degraded = req.hardware_fault_detected || req.confidence_score < confidence_floor;
+
+    if is_degraded {
+        let reason = if req.hardware_fault_detected { "hardware_fault" } else { "low_confidence" };
+
+        // Disk-first: reset streak on disk before mutating in-memory trust state.
+        if let Ok(store) = svc.app.store.lock() {
+            let _ = store.reset_recovery_streak(&req.source_node_id, now);
+        }
+
+        let updated = match svc.app.nodes.get(&req.source_node_id) {
+            Some(n) => RegisteredNode {
+                node_id:              n.node_id.clone(),
+                status:               NodeTrustState::Untrusted(reason.to_string()),
+                registered_at_ms:     n.registered_at_ms,
+                last_trust_update_ms: now,
+                ak_public_pem:        n.ak_public_pem.clone(),
+                expected_pcr16_digest_hex: n.expected_pcr16_digest_hex.clone(),
+            },
+            None => return (StatusCode::NOT_FOUND,
+                            Json(json!({ "error": "node not found" }))).into_response(),
+        };
+
+        if svc.app.persist_and_insert_node(updated).is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "failed to persist node state" }))).into_response();
+        }
+
+        let event = json!({
+            "source_node_id":          req.source_node_id,
+            "confidence_score":        req.confidence_score,
+            "hardware_fault_detected": req.hardware_fault_detected,
+            "reason":                  reason,
+        });
+        if let Ok(store) = svc.app.store.lock() {
+            let _ = store.save_posture_event(
+                &req.source_node_id, "SENSOR_HEALTH_REPORT_FAULT",
+                &event.to_string(), None, now,
+            );
+        }
+
+        emit_posture_event(&svc.app, "NODE_STATUS_CHANGED", Some(req.source_node_id.clone()));
+
+        return (StatusCode::OK, Json(json!({
+            "source_node_id": req.source_node_id,
+            "accepted": true,
+            "fault_recorded": true,
+        }))).into_response();
+    }
+
+    // Healthy report. Only run hysteresis if the node is currently untrusted.
+    let currently_untrusted = svc.app.nodes.get(&req.source_node_id)
+        .map(|n| matches!(n.status, NodeTrustState::Untrusted(_)))
+        .unwrap_or(false);
+
+    if !currently_untrusted {
+        // Already trusted — just touch the telemetry timestamp.
+        if let Ok(store) = svc.app.store.lock() {
+            let _ = store.touch_av_telemetry_timestamp(&req.source_node_id, now);
+        }
+        return (StatusCode::OK, Json(json!({
+            "source_node_id": req.source_node_id,
+            "accepted": true,
+            "fault_recorded": false,
+        }))).into_response();
+    }
+
+    // Node is untrusted — evaluate time-bounded hysteresis.
+    // evaluate_recovery_report performs all streak disk writes internally (disk-first).
+    let decision = match svc.app.store.lock() {
+        Ok(store) => evaluate_recovery_report(&store, &req.source_node_id, now),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          Json(json!({ "error": "store lock poisoned" }))).into_response(),
     };
 
-    if svc.app.persist_and_insert_node(updated).is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "failed to persist node state" }))).into_response();
-    }
+    match &decision {
+        HysteresisDecision::RecoveryConfirmed { streak } => {
+            let updated = match svc.app.nodes.get(&req.source_node_id) {
+                Some(n) => RegisteredNode {
+                    node_id:              n.node_id.clone(),
+                    status:               NodeTrustState::Trusted,
+                    registered_at_ms:     n.registered_at_ms,
+                    last_trust_update_ms: now,
+                    ak_public_pem:        n.ak_public_pem.clone(),
+                    expected_pcr16_digest_hex: n.expected_pcr16_digest_hex.clone(),
+                },
+                None => return (StatusCode::NOT_FOUND,
+                                Json(json!({ "error": "node not found" }))).into_response(),
+            };
 
-    let event_type = if is_healthy { "SENSOR_HEALTH_REPORT_NOMINAL" } else { "SENSOR_HEALTH_REPORT_FAULT" };
-    let event = json!({
-        "source_node_id":          req.source_node_id,
-        "confidence_score":        req.confidence_score,
-        "hardware_fault_detected": req.hardware_fault_detected,
-        "recovery_streak":         new_streak,
-    });
-    if let Ok(store) = svc.app.store.lock() {
-        let _ = store.save_posture_event(
-            &req.source_node_id, event_type, &event.to_string(), None, now,
-        );
-    }
+            if svc.app.persist_and_insert_node(updated).is_err() {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "failed to persist node state" }))).into_response();
+            }
 
-    emit_posture_event(&svc.app, "NODE_STATUS_CHANGED", Some(req.source_node_id.clone()));
+            // Reset streak after re-trust and record audit event.
+            if let Ok(store) = svc.app.store.lock() {
+                let _ = store.reset_recovery_streak(&req.source_node_id, now);
+                let event = json!({
+                    "source_node_id": req.source_node_id,
+                    "streak":         streak,
+                });
+                let _ = store.save_posture_event(
+                    &req.source_node_id, "SENSOR_RECOVERY_CONFIRMED",
+                    &event.to_string(), None, now,
+                );
+            }
+
+            emit_posture_event(&svc.app, "NODE_STATUS_CHANGED", Some(req.source_node_id.clone()));
+        }
+        HysteresisDecision::StreakBuilding { .. } | HysteresisDecision::WindowExpired { .. } => {
+            // No trust change — node remains Untrusted, streak state managed by evaluate_recovery_report.
+        }
+        HysteresisDecision::NotApplicable => {
+            if let Ok(store) = svc.app.store.lock() {
+                let _ = store.touch_av_telemetry_timestamp(&req.source_node_id, now);
+            }
+        }
+    }
 
     (StatusCode::OK, Json(json!({
-        "source_node_id": req.source_node_id,
-        "accepted": true,
-        "recovery_streak": new_streak,
+        "source_node_id":      req.source_node_id,
+        "accepted":            true,
+        "fault_recorded":      false,
+        "hysteresis_decision": format!("{:?}", decision),
     }))).into_response()
 }
 
 /// Registers AV subsystem metadata for an existing fleet node.
-/// The node must already be registered via /attestation/register.
+/// Populates av_subsystem_meta so confidence floor and recovery streak
+/// columns are available for subsequent sensor health reports.
 async fn handle_register_av_asset(
     State(svc): State<Arc<ServiceState>>,
     Json(req): Json<RegisterAvAssetRequest>,
@@ -800,13 +865,26 @@ async fn handle_register_av_asset(
     }
 
     let now = now_ms();
-    let meta = json!({
-        "subsystem_type":  req.subsystem_type,
-        "hardware_id":     req.hardware_id,
-        "confidence_floor": req.confidence_floor.unwrap_or(0.70),
-    });
+    let floor = req.confidence_floor.unwrap_or(0.70);
+
     match svc.app.store.lock() {
         Ok(store) => {
+            // Upsert av_subsystem_meta so load_av_confidence_floor and
+            // recovery streak methods have a row to operate on.
+            if let Err(e) = store.register_av_subsystem_meta(
+                &req.node_id, &req.subsystem_type, &req.hardware_id, floor, now,
+            ) {
+                tracing::warn!(
+                    error   = %e,
+                    node_id = %req.node_id,
+                    "Failed to register av_subsystem_meta"
+                );
+            }
+            let meta = json!({
+                "subsystem_type":   req.subsystem_type,
+                "hardware_id":      req.hardware_id,
+                "confidence_floor": floor,
+            });
             let _ = store.save_posture_event(
                 &req.node_id, "AV_ASSET_REGISTERED", &meta.to_string(), None, now,
             );
