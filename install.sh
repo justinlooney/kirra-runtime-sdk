@@ -524,6 +524,10 @@ cat > "${ENV_FILE}" << EOF
 # API usage: Authorization: Bearer <value>
 AEGIS_ADMIN_TOKEN=${ADMIN_TOKEN}
 
+# Log signing key — Ed25519 private key (base64). Leave blank to disable signing.
+# Generate: openssl genpkey -algorithm ed25519 2>/dev/null | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64
+# AEGIS_LOG_SIGNING_KEY=
+
 # ── Network ───────────────────────────────────────────────────────────────
 # Address and port to listen on.
 # Use 127.0.0.1:${PORT} to restrict to localhost (if behind a reverse proxy).

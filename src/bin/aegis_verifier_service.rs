@@ -2,7 +2,7 @@
 // Aegis Verifier Service — distributed legitimacy fabric entry point.
 
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
@@ -422,11 +422,75 @@ async fn get_node_flap_status(
 async fn verify_audit_chain(
     State(svc): State<Arc<ServiceState>>,
 ) -> impl IntoResponse {
+    let vk = svc.audit_verifying_key.as_ref();
     match svc.app.store.lock() {
-        Ok(store) => match store.verify_audit_chain_integrity() {
-            Ok(valid) => Json(json!({ "valid": valid })).into_response(),
+        Ok(store) => match store.verify_audit_chain_full(vk) {
+            Ok(r) => Json(json!({
+                "chain_intact": r.chain_intact,
+                "total_entries": r.total_entries,
+                "latest_hash": r.latest_hash,
+                "signing_enabled": r.signing_enabled,
+                "signed_entries": r.signed_entries,
+                "unsigned_entries": r.unsigned_entries,
+                "signature_valid": r.signature_valid,
+                "first_signed_at_ms": r.first_signed_at_ms,
+                "public_key_b64": r.public_key_b64,
+            })).into_response(),
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
                        Json(json!({ "error": "audit chain query failed" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AuditExportQuery {
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+async fn handle_audit_export(
+    State(svc): State<Arc<ServiceState>>,
+    Query(params): Query<AuditExportQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let offset = params.offset.unwrap_or(0);
+    let vk = svc.audit_verifying_key.as_ref();
+    match svc.app.store.lock() {
+        Ok(store) => match store.load_audit_chain_page(limit, offset, vk) {
+            Ok(page) => Json(page).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "error": "export query failed" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RotateSigningKeyRequest {
+    new_public_key_b64: String,
+    reason: String,
+}
+
+async fn handle_audit_rotate_key(
+    State(svc): State<Arc<ServiceState>>,
+    Json(req): Json<RotateSigningKeyRequest>,
+) -> impl IntoResponse {
+    if !svc.app.is_active() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "instance is in passive standby mode" }))).into_response();
+    }
+    if req.new_public_key_b64.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "new_public_key_b64 is required" }))).into_response();
+    }
+    match svc.app.store.lock() {
+        Ok(mut store) => match store.record_key_rotation(&req.new_public_key_b64, &req.reason, now_ms()) {
+            Ok(_) => Json(json!({ "recorded": true, "event_type": "KEY_ROTATION" })).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "error": "failed to record key rotation" }))).into_response(),
         },
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
                    Json(json!({ "error": "store lock poisoned" }))).into_response(),
@@ -876,11 +940,27 @@ async fn main() {
     let listen_addr = std::env::var("AEGIS_VERIFIER_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8090".to_string());
 
-    let store = VerifierStore::new(&db_path)
+    let mut store = VerifierStore::new(&db_path)
         .expect("failed to initialize verifier store");
 
     let mode = VerifierOperationMode::from_env();
     println!("Aegis Verifier starting in {mode:?} mode (db: {db_path})");
+
+    let audit_signing_key: Option<ed25519_dalek::SigningKey> =
+        std::env::var("AEGIS_LOG_SIGNING_KEY").ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|b64_str| {
+                use base64::{engine::general_purpose::STANDARD as b64e, Engine as _};
+                b64e.decode(&b64_str).ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+                    .map(|seed| ed25519_dalek::SigningKey::from_bytes(&seed))
+            });
+    let audit_verifying_key = audit_signing_key.as_ref().map(|sk| sk.verifying_key());
+
+    // Set signing key on store before putting it in AppState
+    if let Some(ref key) = audit_signing_key {
+        store.set_signing_key(key.clone());
+    }
 
     let app_state = Arc::new(AppState::new(store, mode));
 
@@ -901,6 +981,7 @@ async fn main() {
     let svc_state = Arc::new(ServiceState {
         app: app_state,
         posture_cache: Arc::new(std::sync::RwLock::new(None)),
+        audit_verifying_key,
     });
 
     match mode {
@@ -932,6 +1013,8 @@ async fn main() {
         .route("/fleet/assets/register", post(handle_register_av_asset))
         .route("/system/backup/export", post(export_backup))
         .route("/system/audit/verify", get(verify_audit_chain))
+        .route("/system/audit/export", get(handle_audit_export))
+        .route("/system/audit/rotate-signing-key", post(handle_audit_rotate_key))
         .route("/federation/controllers/register", post(register_federation_controller))
         .route("/attestation/identity/register", post(register_node_identity))
         .layer(middleware::from_fn(require_admin_token));
