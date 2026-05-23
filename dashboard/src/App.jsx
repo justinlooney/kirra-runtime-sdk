@@ -398,6 +398,7 @@ export default function AegisDashboard() {
   const [fleet, setFleet]         = useState(null);
   const [events, setEvents]       = useState([]);
   const [audit, setAudit]         = useState(null);
+  const [fabricState, setFabricState] = useState(null);
   const [loading, setLoading]     = useState(false);
   const [error, setError]         = useState(null);
   const [toast, setToast]         = useState(null);
@@ -436,12 +437,33 @@ export default function AegisDashboard() {
     } catch (e) { setAudit({ error: e.message }); }
   }, []);
 
+  const loadFabricState = useCallback(async () => {
+    try {
+      const baseUrl = config.url.replace(/\/$/, "");
+      const res = await fetch(`${baseUrl}/fabric/state`, {
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${config.token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setFabricState(data);
+      }
+    } catch (e) { /* silent refresh fail */ }
+  }, [config.url, config.token]);
+
   // Auto-refresh fleet every 5s when connected
   useEffect(() => {
     if (!connected) return;
     refreshRef.current = setInterval(() => loadFleet(), 5000);
     return () => clearInterval(refreshRef.current);
   }, [connected, loadFleet]);
+
+  // Auto-refresh fabric state every 5s when connected
+  useEffect(() => {
+    if (!connected) return;
+    loadFabricState();
+    const interval = setInterval(() => loadFabricState(), 5000);
+    return () => clearInterval(interval);
+  }, [connected, loadFabricState]);
 
   // SSE posture stream (best-effort; requires x-aegis-client-id header via server config)
   useEffect(() => {
@@ -509,6 +531,7 @@ export default function AegisDashboard() {
     { id: "fleet",     icon: "⬡", label: "Fleet Nodes" },
     { id: "stream",    icon: "▸", label: "Event Stream" },
     { id: "audit",     icon: "⎗", label: "Audit Chain" },
+    { id: "fabric",    icon: "⬙", label: "Fabric" },
     { id: "register",  icon: "+", label: "Register Node" },
     { id: "deps",      icon: "⇄", label: "Dependencies" },
     { id: "sensor",    icon: "⚡", label: "Sensor Report" },

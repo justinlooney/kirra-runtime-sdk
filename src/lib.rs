@@ -34,6 +34,7 @@ pub mod federation;
 pub mod federation_reconciliation;
 pub mod protocol_adapter;
 pub mod adapters;
+pub mod fabric;
 pub mod standby_monitor;
 pub mod kinematics_sim;
 

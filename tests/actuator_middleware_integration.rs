@@ -23,14 +23,28 @@ fn build_state(posture: FleetPosture) -> Arc<ServiceState> {
     let app = Arc::new(AppState::new(store, VerifierOperationMode::Active));
     let posture_cache: SharedPostureCache =
         Arc::new(std::sync::RwLock::new(Some(CachedFleetPosture::new(posture))));
-    Arc::new(ServiceState { app, posture_cache, audit_verifying_key: None })
+    Arc::new(ServiceState {
+        app,
+        posture_cache,
+        audit_verifying_key: None,
+        fabric_router: Arc::new(aegis_runtime_sdk::fabric::router::FabricRouter::new()),
+        fabric_telemetry: Arc::new(aegis_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
+        fabric_causal_log: Arc::new(aegis_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
+    })
 }
 
 fn build_state_empty_cache() -> Arc<ServiceState> {
     let store = VerifierStore::new(":memory:").expect("in-memory store");
     let app = Arc::new(AppState::new(store, VerifierOperationMode::Active));
     let posture_cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(None));
-    Arc::new(ServiceState { app, posture_cache, audit_verifying_key: None })
+    Arc::new(ServiceState {
+        app,
+        posture_cache,
+        audit_verifying_key: None,
+        fabric_router: Arc::new(aegis_runtime_sdk::fabric::router::FabricRouter::new()),
+        fabric_telemetry: Arc::new(aegis_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
+        fabric_causal_log: Arc::new(aegis_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
+    })
 }
 
 fn resolve_posture_from_state(state: &ServiceState) -> FleetPosture {

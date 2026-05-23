@@ -1,5 +1,8 @@
 // src/posture_cache.rs — CachedFleetPosture definition
 use ed25519_dalek::VerifyingKey;
+use crate::fabric::router::FabricRouter;
+use crate::fabric::telemetry::FabricTelemetry;
+use crate::fabric::causal_log::FabricCausalLog;
 //
 // v2.2.2 — Temporal hardening patch
 //
@@ -128,6 +131,9 @@ pub struct ServiceState {
     pub app: Arc<AppState>,
     pub posture_cache: SharedPostureCache,
     pub audit_verifying_key: Option<VerifyingKey>,
+    pub fabric_router: Arc<FabricRouter>,
+    pub fabric_telemetry: Arc<FabricTelemetry>,
+    pub fabric_causal_log: Arc<FabricCausalLog>,
 }
 
 /// Returns current time as milliseconds since UNIX epoch.

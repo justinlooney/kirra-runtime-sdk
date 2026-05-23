@@ -109,6 +109,35 @@ impl VerifierStore {
 
         Self::init_audit_chain_schema(&conn)?;
 
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS fabric_assets (
+                asset_id          TEXT PRIMARY KEY,
+                asset_type        TEXT NOT NULL,
+                display_name      TEXT NOT NULL,
+                kinematic_profile TEXT NOT NULL,
+                registered_at_ms  INTEGER NOT NULL,
+                last_seen_ms      INTEGER NOT NULL,
+                metadata_json     TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS fabric_causal_log (
+                entry_id          TEXT PRIMARY KEY,
+                timestamp_ms      INTEGER NOT NULL,
+                asset_id          TEXT NOT NULL,
+                event_type        TEXT NOT NULL,
+                payload           TEXT NOT NULL,
+                caused_by_json    TEXT NOT NULL DEFAULT '[]',
+                affects_json      TEXT NOT NULL DEFAULT '[]',
+                fabric_generation INTEGER NOT NULL,
+                signature_b64     TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_causal_log_asset
+                ON fabric_causal_log(asset_id, timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_causal_log_time
+                ON fabric_causal_log(timestamp_ms);"
+        )?;
+
         Ok(Self { conn, signing_key: None })
     }
 
@@ -946,6 +975,83 @@ impl VerifierStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO posture_engine_state (key, value) VALUES (?1, ?2)",
             params![key, value],
+        )?;
+        Ok(())
+    }
+
+    // --- Fabric asset persistence -------------------------------------------
+
+    pub fn save_fabric_asset(&self, asset: &crate::fabric::asset::FabricAsset) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO fabric_assets
+             (asset_id, asset_type, display_name, kinematic_profile, registered_at_ms, last_seen_ms, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                asset.asset_id,
+                serde_json::to_string(&asset.asset_type).unwrap_or_default(),
+                asset.display_name,
+                serde_json::to_string(&asset.kinematic_profile).unwrap_or_default(),
+                asset.registered_at_ms as i64,
+                asset.last_seen_ms as i64,
+                serde_json::to_string(&asset.metadata).unwrap_or_else(|_| "{}".to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_fabric_assets(&self) -> Result<Vec<crate::fabric::asset::FabricAsset>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT asset_id, asset_type, display_name, kinematic_profile, registered_at_ms, last_seen_ms, metadata_json
+             FROM fabric_assets ORDER BY registered_at_ms"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut assets = Vec::new();
+        for row in rows {
+            let (asset_id, asset_type_s, display_name, profile_s, reg_ms, last_ms, meta_s) = row?;
+            let asset_type = serde_json::from_str(&asset_type_s)
+                .unwrap_or(crate::fabric::asset::AssetType::Unknown);
+            let kinematic_profile = serde_json::from_str(&profile_s)
+                .unwrap_or(crate::fabric::asset::KinematicProfileType::Custom);
+            let metadata = serde_json::from_str(&meta_s).unwrap_or_default();
+            assets.push(crate::fabric::asset::FabricAsset {
+                asset_id,
+                asset_type,
+                display_name,
+                kinematic_profile,
+                registered_at_ms: reg_ms as u64,
+                last_seen_ms: last_ms as u64,
+                metadata,
+            });
+        }
+        Ok(assets)
+    }
+
+    pub fn save_causal_log_entry(&self, entry: &crate::fabric::causal_log::CausalLogEntry) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO fabric_causal_log
+             (entry_id, timestamp_ms, asset_id, event_type, payload, caused_by_json, affects_json, fabric_generation, signature_b64)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                entry.entry_id,
+                entry.timestamp_ms as i64,
+                entry.asset_id,
+                entry.event_type,
+                entry.payload,
+                serde_json::to_string(&entry.caused_by).unwrap_or_else(|_| "[]".to_string()),
+                serde_json::to_string(&entry.affects_assets).unwrap_or_else(|_| "[]".to_string()),
+                entry.fabric_generation as i64,
+                entry.signature_b64.as_deref(),
+            ],
         )?;
         Ok(())
     }
