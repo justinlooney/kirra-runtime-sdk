@@ -27,7 +27,12 @@ use aegis_runtime_sdk::verifier_store::VerifierStore;
 use aegis_runtime_sdk::posture_cache::{now_ms, CachedFleetPosture, ServiceState, SharedPostureCache};
 use aegis_runtime_sdk::security::constant_time_compare;
 use aegis_runtime_sdk::action_filter::{evaluate_action_claim, ActionClaim};
-use aegis_runtime_sdk::protocol_adapter::{evaluate_industrial_event, IndustrialEvent};
+use aegis_runtime_sdk::protocol_adapter::{
+    evaluate_unified_industrial_request, UnifiedIndustrialRequest,
+};
+use aegis_runtime_sdk::adapters::ethernet_ip::{EtherNetIpAdapter, EtherNetIpMessage};
+use aegis_runtime_sdk::adapters::canopen::{CanOpenAdapter, CanOpenMessage};
+use aegis_runtime_sdk::adapters::dnp3::{Dnp3Adapter, Dnp3Message};
 use aegis_runtime_sdk::federation::{
     evaluate_federated_report,
     verify_federated_report_signature,
@@ -580,39 +585,262 @@ async fn evaluate_action_filter(
 
 async fn evaluate_industrial_adapter(
     State(svc): State<Arc<ServiceState>>,
-    Json(event): Json<IndustrialEvent>,
+    body: Result<Json<UnifiedIndustrialRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    let req = match body {
+        Ok(Json(r)) => r,
+        Err(rejection) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "error": "MALFORMED_REQUEST",
+                "detail": rejection.body_text(),
+                "allowed": false,
+            }))).into_response();
+        }
+    };
+
     let posture = svc.posture_cache
         .read()
         .ok()
         .and_then(|g| g.as_ref().map(|c| c.posture.clone()))
         .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
 
-    let asset_id = event.asset_id.clone();
-    let protocol = format!("{:?}", event.protocol);
-    let operation = event.operation.clone();
-    let address = event.address.clone();
-    let risk_class = event.risk_class.clone();
+    let audit_ref = now_ms().to_string();
+    let protocol_name = format!("{:?}", req.protocol);
 
-    let decision = evaluate_industrial_event(event, posture);
+    match evaluate_unified_industrial_request(req, posture) {
+        Ok(result) => {
+            // Always log denials and broadcast commands to audit chain
+            let should_audit = !result.allowed
+                || result.adapter_details.get("is_broadcast").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    if !decision.allowed {
-        let audit = json!({
-            "asset_id": asset_id,
-            "protocol": protocol,
-            "operation": operation,
-            "address": address,
-            "risk_class": risk_class,
-            "reason": decision.reason,
-        });
+            if should_audit {
+                let audit = json!({
+                    "protocol": result.protocol,
+                    "command": format!("{:?}", result.command),
+                    "allowed": result.allowed,
+                    "denial_reason": result.denial_reason,
+                    "posture": result.posture_at_evaluation,
+                    "audit_ref": audit_ref,
+                });
+                if let Ok(mut store) = svc.app.store.lock() {
+                    let event_type = if result.allowed {
+                        "INDUSTRIAL_ACTION_ALLOWED_BROADCAST"
+                    } else {
+                        "INDUSTRIAL_ACTION_DENIED"
+                    };
+                    let _ = store.save_posture_event_chained(
+                        "industrial_adapter", event_type,
+                        &audit.to_string(), None, now_ms(),
+                    );
+                }
+            }
+
+            Json(json!({
+                "protocol": result.protocol,
+                "command": format!("{:?}", result.command),
+                "allowed": result.allowed,
+                "denial_reason": result.denial_reason,
+                "posture_at_evaluation": result.posture_at_evaluation,
+                "adapter_details": result.adapter_details,
+                "audit_ref": audit_ref,
+                "triggers_recalculation": result.triggers_recalculation,
+            })).into_response()
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(json!({
+                "error": "ADAPTER_PARSE_FAILURE",
+                "detail": e,
+                "protocol": protocol_name,
+                "allowed": false,
+            }))).into_response()
+        }
+    }
+}
+
+async fn evaluate_ethernet_ip_adapter(
+    State(svc): State<Arc<ServiceState>>,
+    body: Result<Json<EtherNetIpMessage>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let msg = match body {
+        Ok(Json(m)) => m,
+        Err(rejection) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "error": "MALFORMED_REQUEST",
+                "detail": rejection.body_text(),
+                "allowed": false,
+            }))).into_response();
+        }
+    };
+
+    let posture = svc.posture_cache
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.posture.clone()))
+        .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
+
+    let posture_str = format!("{:?}", posture);
+    let eval = EtherNetIpAdapter::evaluate(&msg);
+    let (allowed, denial_reason) = aegis_runtime_sdk::protocol_adapter::command_allowed_for_posture_pub(&eval.command, &posture);
+    let audit_ref = now_ms().to_string();
+
+    if !allowed {
         if let Ok(mut store) = svc.app.store.lock() {
             let _ = store.save_posture_event_chained(
-                "industrial_adapter", "INDUSTRIAL_ACTION_DENIED",
-                &audit.to_string(), Some("industrial action denied"), now_ms(),
+                "ethernet_ip_adapter", "INDUSTRIAL_ACTION_DENIED",
+                &json!({
+                    "service_name": eval.service_name,
+                    "safety_relevant": eval.safety_relevant,
+                    "posture": posture_str,
+                    "denial_reason": denial_reason,
+                }).to_string(),
+                None, now_ms(),
             );
         }
     }
-    Json(decision).into_response()
+
+    Json(json!({
+        "protocol": "ethernet_ip",
+        "command": format!("{:?}", eval.command),
+        "allowed": allowed,
+        "denial_reason": denial_reason,
+        "posture_at_evaluation": posture_str,
+        "adapter_details": {
+            "service_name": eval.service_name,
+            "is_write": eval.is_write,
+            "target_description": eval.target_description,
+            "safety_relevant": eval.safety_relevant,
+        },
+        "audit_ref": audit_ref,
+    })).into_response()
+}
+
+async fn evaluate_canopen_adapter(
+    State(svc): State<Arc<ServiceState>>,
+    body: Result<Json<CanOpenMessage>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let msg = match body {
+        Ok(Json(m)) => m,
+        Err(rejection) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "error": "MALFORMED_REQUEST",
+                "detail": rejection.body_text(),
+                "allowed": false,
+            }))).into_response();
+        }
+    };
+
+    let posture = svc.posture_cache
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.posture.clone()))
+        .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
+
+    let posture_str = format!("{:?}", posture);
+    let eval = CanOpenAdapter::evaluate(&msg);
+    let (allowed, denial_reason) = aegis_runtime_sdk::protocol_adapter::command_allowed_for_posture_pub(&eval.command, &posture);
+    let audit_ref = now_ms().to_string();
+
+    if !allowed || eval.triggers_recalculation {
+        if let Ok(mut store) = svc.app.store.lock() {
+            let event_type = if eval.triggers_recalculation {
+                "CANOPEN_NMT_NODE_OFFLINE"
+            } else {
+                "INDUSTRIAL_ACTION_DENIED"
+            };
+            let _ = store.save_posture_event_chained(
+                "canopen_adapter", event_type,
+                &json!({
+                    "node_id": eval.node_id,
+                    "message_type": format!("{:?}", eval.message_type),
+                    "is_emergency": eval.is_emergency,
+                    "triggers_recalculation": eval.triggers_recalculation,
+                    "posture": posture_str,
+                }).to_string(),
+                None, now_ms(),
+            );
+        }
+    }
+
+    Json(json!({
+        "protocol": "canopen",
+        "command": format!("{:?}", eval.command),
+        "allowed": allowed,
+        "denial_reason": denial_reason,
+        "posture_at_evaluation": posture_str,
+        "adapter_details": {
+            "message_type": format!("{:?}", eval.message_type),
+            "node_id": eval.node_id,
+            "is_emergency": eval.is_emergency,
+            "emergency_code": eval.emergency_code,
+            "triggers_recalculation": eval.triggers_recalculation,
+        },
+        "audit_ref": audit_ref,
+    })).into_response()
+}
+
+async fn evaluate_dnp3_adapter(
+    State(svc): State<Arc<ServiceState>>,
+    body: Result<Json<Dnp3Message>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let msg = match body {
+        Ok(Json(m)) => m,
+        Err(rejection) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "error": "MALFORMED_REQUEST",
+                "detail": rejection.body_text(),
+                "allowed": false,
+            }))).into_response();
+        }
+    };
+
+    let posture = svc.posture_cache
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.posture.clone()))
+        .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
+
+    let posture_str = format!("{:?}", posture);
+    let eval = Dnp3Adapter::evaluate(&msg);
+    let (allowed, denial_reason) = aegis_runtime_sdk::protocol_adapter::command_allowed_for_posture_pub(&eval.command, &posture);
+    let audit_ref = now_ms().to_string();
+
+    // DNP3 broadcast commands ALWAYS get an audit entry regardless of allow/deny
+    if !allowed || eval.is_broadcast {
+        if let Ok(mut store) = svc.app.store.lock() {
+            let event_type = if eval.is_broadcast {
+                "DNP3_BROADCAST_COMMAND"
+            } else {
+                "INDUSTRIAL_ACTION_DENIED"
+            };
+            let _ = store.save_posture_event_chained(
+                "dnp3_adapter", event_type,
+                &json!({
+                    "function_name": eval.function_name,
+                    "is_broadcast": eval.is_broadcast,
+                    "is_control": eval.is_control,
+                    "critical_infrastructure_relevant": eval.critical_infrastructure_relevant,
+                    "dest_address": msg.dest_address,
+                    "posture": posture_str,
+                }).to_string(),
+                None, now_ms(),
+            );
+        }
+    }
+
+    Json(json!({
+        "protocol": "dnp3",
+        "command": format!("{:?}", eval.command),
+        "allowed": allowed,
+        "denial_reason": denial_reason,
+        "posture_at_evaluation": posture_str,
+        "adapter_details": {
+            "function_name": eval.function_name,
+            "is_control": eval.is_control,
+            "is_broadcast": eval.is_broadcast,
+            "critical_infrastructure_relevant": eval.critical_infrastructure_relevant,
+        },
+        "audit_ref": audit_ref,
+    })).into_response()
 }
 
 async fn register_federation_controller(
@@ -1055,6 +1283,9 @@ async fn main() {
         .route("/federation/reports/submit", post(submit_federated_report))
         .route("/action_filter/evaluate", post(evaluate_action_filter))
         .route("/industrial/evaluate", post(evaluate_industrial_adapter))
+        .route("/industrial/ethernet-ip/evaluate", post(evaluate_ethernet_ip_adapter))
+        .route("/industrial/canopen/evaluate", post(evaluate_canopen_adapter))
+        .route("/industrial/dnp3/evaluate", post(evaluate_dnp3_adapter))
         .layer(middleware::from_fn_with_state(svc_state.clone(), require_client_identity))
         .layer(middleware::from_fn(require_admin_token));
 
