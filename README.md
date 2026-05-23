@@ -32,6 +32,23 @@ Compatible with **OpenAI function calling**, **LangChain tools**, or any agent f
 
 ---
 
+## Safety Certification
+
+Aegis is targeting ASIL-D certification under ISO 26262.
+
+| Document | Status |
+|----------|--------|
+| Hazard Analysis and Risk Assessment (HARA) | Draft |
+| Safety Goals | Draft |
+| Safety Architecture | Draft |
+| Requirements Traceability Matrix | Draft |
+| Coding Guidelines | Draft |
+
+See [docs/safety/](docs/safety/) for the complete safety case foundation.
+See [docs/safety/ROADMAP_TO_ASIL_D.md](docs/safety/ROADMAP_TO_ASIL_D.md) for the certification roadmap.
+
+---
+
 ## Overview
 
 Modern robotic and autonomous deployments increasingly rely on AI models to generate operational commands. Aegis sits between those models and the physical actuators, acting as a cryptographically-grounded safety layer that:
