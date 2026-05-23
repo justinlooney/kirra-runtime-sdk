@@ -997,6 +997,114 @@ function SensorPage({ api, nodes, onSuccess }) {
   );
 }
 
+// ─── Fabric ──────────────────────────────────────────────────────────────────
+function postureColor(posture) {
+  if (!posture) return "#64748b";
+  const s = typeof posture === "string" ? posture.toLowerCase() : JSON.stringify(posture).toLowerCase();
+  if (s === "nominal") return "#22c55e";
+  if (s === "degraded") return "#f59e0b";
+  if (s.includes("locked")) return "#ef4444";
+  return "#64748b";
+}
+
+function FabricPage({ fabricState, onRefresh }) {
+  const assets = fabricState?.assets || [];
+  const nominalCount    = fabricState?.nominal_count    ?? 0;
+  const degradedCount   = fabricState?.degraded_count   ?? 0;
+  const lockedOutCount  = fabricState?.locked_out_count ?? 0;
+  const totalAssets     = fabricState?.total_assets     ?? 0;
+
+  return (
+    <div>
+      <div className="page-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div>
+          <div className="page-title">Fabric</div>
+          <div className="page-sub">Multi-Asset Safety Fabric — cross-asset trust posture</div>
+        </div>
+        <button className="btn btn-ghost btn-sm" onClick={onRefresh}>↻ Refresh</button>
+      </div>
+
+      {!fabricState ? (
+        <div className="loading"><span className="spin">↻</span>&nbsp;Loading fabric state…</div>
+      ) : (
+        <>
+          <div className="stats-row">
+            <div className="stat-card">
+              <div className="stat-label">Total Assets</div>
+              <div className="stat-value blue">{totalAssets}</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Nominal</div>
+              <div className="stat-value green">{nominalCount}</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Degraded</div>
+              <div className="stat-value yellow">{degradedCount}</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Locked Out</div>
+              <div className="stat-value red">{lockedOutCount}</div>
+            </div>
+          </div>
+
+          {assets.length === 0 ? (
+            <div className="card">
+              <div className="card-body">
+                <div className="empty">
+                  <div className="empty-icon">⬙</div>
+                  <div className="empty-text">No fabric assets registered yet.<br />Use POST /fabric/assets/register to add assets.</div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="card">
+              <div className="card-header">
+                <div className="card-title">FABRIC ASSETS</div>
+                <div style={{ fontSize: 11, color: "var(--muted)", fontFamily: "var(--mono)" }}>
+                  gen {fabricState.fabric_generation}
+                </div>
+              </div>
+              <div className="card-body">
+                <div className="node-grid">
+                  {assets.map((a, i) => {
+                    const color = postureColor(a.posture);
+                    const postureStr = typeof a.posture === "string" ? a.posture : JSON.stringify(a.posture);
+                    return (
+                      <div key={i} className="node-card" style={{ borderLeft: `3px solid ${color}` }}>
+                        <div className="node-header">
+                          <div>
+                            <div className="node-id">{a.asset_id}</div>
+                            <div className="node-type">{a.asset_type || ""}</div>
+                          </div>
+                          <div style={{
+                            fontFamily: "var(--mono)", fontSize: 10, fontWeight: 700,
+                            padding: "3px 8px", borderRadius: 3, textTransform: "uppercase",
+                            letterSpacing: "0.08em", background: `${color}22`, color,
+                          }}>
+                            {postureStr}
+                          </div>
+                        </div>
+                        {a.blocked_by?.length > 0 && (
+                          <div style={{ marginTop: 8 }}>
+                            {a.blocked_by.map(b => <span key={b} className="tag">{b}</span>)}
+                          </div>
+                        )}
+                        <div className="node-meta" style={{ marginTop: 8 }}>
+                          gen {a.generation}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 // ─── AV Metadata ─────────────────────────────────────────────────────────────
 function AVMetaPage({ api, nodes, onSuccess }) {
   const [form, setForm] = useState({ node_id: "", subsystem_type: "Perception", hardware_id: "", confidence_floor: "0.70" });
