@@ -4,6 +4,34 @@ A distributed runtime legitimacy engine and safety governor for AI-driven roboti
 
 ---
 
+## AI Safety Integration
+
+Aegis is the enforcement layer that prevents LLM hallucinations from reaching physical actuators — drop it between your AI agent and your robot fleet in minutes.
+
+```
+LLM output  →  Aegis Action Filter  →  Actuator
+```
+
+Every AI-generated command is evaluated against the live fleet posture before any hardware interaction occurs. A model that hallucinates a velocity of 999 m/s, invents a non-existent action type, or issues a kinetic command while the fleet is degraded is stopped at the software layer — and the attempt is permanently recorded in a SHA-256 hash-chained audit ledger.
+
+### Posture-Action Matrix
+
+| Action Type | Nominal | Degraded | LockedOut |
+|-------------|---------|----------|-----------|
+| `cmd_vel` (kinetic write) | ✓ with kinematics validation | ✗ | ✗ |
+| `read_telemetry` | ✓ | ✓ | ✗ |
+| Unknown / unrecognized | ✗ | ✗ | ✗ |
+
+Compatible with **OpenAI function calling**, **LangChain tools**, or any agent framework that can make an HTTP POST.
+
+**Docs:**
+- [Action Filter Architecture](docs/action_filter.md) — pipeline, hallucination containment, API reference
+- [LLM Integration Guide](docs/llm_integration_guide.md) — 5-minute quickstart, auth, agent loop patterns, SSE posture stream
+- [OpenAI example](examples/openai_action_filter.py) — GPT function calling with Aegis safety filter
+- [LangChain example](examples/langchain_action_filter.py) — `@tool` decorator pattern with Aegis safety filter
+
+---
+
 ## Overview
 
 Modern robotic and autonomous deployments increasingly rely on AI models to generate operational commands. Aegis sits between those models and the physical actuators, acting as a cryptographically-grounded safety layer that:

@@ -3,6 +3,7 @@
 
 use axum::{
     extract::{Path, Query, Request, State},
+    extract::rejection::JsonRejection,
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
@@ -20,7 +21,7 @@ use tokio_stream::StreamExt as _;
 
 use aegis_runtime_sdk::verifier::{
     validate_client_identity_headers, AppState, BackupExport, FlapStatus, FleetNodePosture,
-    HealthResponse, NodeTrustState, PostureStreamEvent, RegisteredNode, VerifierOperationMode,
+    FleetPosture, HealthResponse, NodeTrustState, PostureStreamEvent, RegisteredNode, VerifierOperationMode,
 };
 use aegis_runtime_sdk::verifier_store::VerifierStore;
 use aegis_runtime_sdk::posture_cache::{now_ms, CachedFleetPosture, ServiceState, SharedPostureCache};
@@ -499,31 +500,82 @@ async fn handle_audit_rotate_key(
 
 async fn evaluate_action_filter(
     State(svc): State<Arc<ServiceState>>,
-    Json(claim): Json<ActionClaim>,
+    body: Result<Json<ActionClaim>, JsonRejection>,
 ) -> impl IntoResponse {
+    let claim = match body {
+        Ok(Json(c)) => c,
+        Err(rejection) => {
+            // Log the malformed request to audit chain
+            if let Ok(mut store) = svc.app.store.lock() {
+                let _ = store.save_posture_event_chained(
+                    "action_filter", "ACTION_FILTER_MALFORMED_REQUEST",
+                    &json!({ "error": rejection.body_text() }).to_string(),
+                    Some("malformed request body"), now_ms(),
+                );
+            }
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "error": "MALFORMED_REQUEST",
+                "detail": rejection.body_text(),
+                "allowed": false,
+            }))).into_response();
+        }
+    };
+
+    let request_id = now_ms().to_string();
+
     let posture = svc.posture_cache
         .read()
         .ok()
         .and_then(|g| g.as_ref().map(|c| c.posture.clone()))
-        .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
+        .unwrap_or(FleetPosture::LockedOut);
 
+    let posture_str = format!("{:?}", posture);
     let decision = evaluate_action_claim(claim.clone(), posture);
 
-    if !decision.allowed {
-        let event = json!({
-            "target_node": claim.target_node,
-            "action_type": claim.action_type,
-            "risk_class": claim.risk_class,
-            "reason": decision.reason,
-        });
-        if let Ok(mut store) = svc.app.store.lock() {
-            let _ = store.save_posture_event_chained(
-                "action_filter", "ACTION_FILTER_DENIED",
-                &event.to_string(), Some("action denied"), now_ms(),
-            );
+    // Determine the specific audit event type
+    let audit_event_type = if !decision.allowed {
+        if decision.reason == "UNKNOWN_ACTION_TYPE" {
+            "ACTION_FILTER_UNKNOWN_TYPE"
+        } else {
+            "ACTION_FILTER_DENIED"
         }
+    } else {
+        "ACTION_FILTER_ALLOWED"
+    };
+
+    // Always log to audit chain
+    let event = json!({
+        "request_id": request_id,
+        "target_node": claim.target_node,
+        "action_type": claim.action_type,
+        "risk_class": claim.risk_class,
+        "allowed": decision.allowed,
+        "reason": decision.reason,
+        "posture": posture_str,
+    });
+    if let Ok(mut store) = svc.app.store.lock() {
+        let _ = store.save_posture_event_chained(
+            "action_filter", audit_event_type,
+            &event.to_string(), None, now_ms(),
+        );
     }
-    Json(decision).into_response()
+
+    tracing::info!(
+        action_type = %claim.action_type,
+        target_node = %claim.target_node,
+        allowed = decision.allowed,
+        posture = %posture_str,
+        reason = %decision.reason,
+        request_id = %request_id,
+        "action_filter evaluated"
+    );
+
+    Json(json!({
+        "allowed": decision.allowed,
+        "reason": decision.reason,
+        "posture_at_evaluation": posture_str,
+        "request_id": request_id,
+    })).into_response()
 }
 
 async fn evaluate_industrial_adapter(
