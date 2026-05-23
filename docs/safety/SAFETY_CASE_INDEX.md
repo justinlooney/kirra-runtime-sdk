@@ -19,6 +19,9 @@ Date: 2026-05-23
 | AEGIS-RTM-001 | Requirements Traceability Matrix | 1.0.0 | Draft | docs/safety/REQUIREMENTS_TRACEABILITY.md | 2026-05-23 |
 | AEGIS-CG-001 | Rust Safety Coding Guidelines | 1.0.0 | Draft | docs/safety/CODING_GUIDELINES.md | 2026-05-23 |
 | AEGIS-ROAD-001 | ASIL-D Certification Roadmap | 1.0.0 | Draft | docs/safety/ROADMAP_TO_ASIL_D.md | 2026-05-23 |
+| AEGIS-STD-001 | Safety Standards Matrix | 1.0.0 | Draft | docs/safety/STANDARDS_MATRIX.md | 2026-05-23 |
+| AEGIS-F3269-001 | ASTM F3269 Run Time Assurance Mapping | 1.0.0 | Draft | docs/safety/ASTM_F3269_MAPPING.md | 2026-05-23 |
+| AEGIS-61508-001 | IEC 61508 SIL 3 Preliminary Claim Mapping | 1.0.0 | Draft | docs/safety/IEC_61508_MAPPING.md | 2026-05-23 |
 
 ---
 
@@ -118,6 +121,10 @@ AEGIS-SG-001 (Safety Goals)
       +---> AEGIS-CG-001 (Coding Guidelines — how to preserve goals in code)
       |
       +---> AEGIS-ROAD-001 (Roadmap — what remains before certification)
+      +---> AEGIS-STD-001 (Standards Matrix — what to certify against)
+            |
+            +---> AEGIS-F3269-001 (ASTM F3269 RTA mapping)
+            +---> AEGIS-61508-001 (IEC 61508 SIL 3 mapping)
 ```
 
 ---

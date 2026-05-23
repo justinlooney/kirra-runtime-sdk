@@ -34,18 +34,22 @@ Compatible with **OpenAI function calling**, **LangChain tools**, or any agent f
 
 ## Safety Certification
 
-Aegis is targeting ASIL-D certification under ISO 26262.
+Aegis is targeting ASIL-D certification under ISO 26262 and SIL 3 under IEC 61508.
 
-| Document | Status |
-|----------|--------|
-| Hazard Analysis and Risk Assessment (HARA) | Draft |
-| Safety Goals | Draft |
-| Safety Architecture | Draft |
-| Requirements Traceability Matrix | Draft |
-| Coding Guidelines | Draft |
+| Document | Doc ID | Status |
+|----------|--------|--------|
+| Hazard Analysis and Risk Assessment (HARA) | AEGIS-HARA-001 | Draft |
+| Safety Goals | AEGIS-SG-001 | Draft |
+| Safety Architecture | AEGIS-SA-001 | Draft |
+| Requirements Traceability Matrix | AEGIS-RTM-001 | Draft |
+| Coding Guidelines | AEGIS-CG-001 | Draft |
+| Safety Standards Matrix (23 standards, 5 verticals) | AEGIS-STD-001 | Draft |
+| ASTM F3269 Run Time Assurance Mapping | AEGIS-F3269-001 | Draft |
+| IEC 61508 SIL 3 Preliminary Claim Mapping | AEGIS-61508-001 | Draft |
 
 See [docs/safety/](docs/safety/) for the complete safety case foundation.
 See [docs/safety/ROADMAP_TO_ASIL_D.md](docs/safety/ROADMAP_TO_ASIL_D.md) for the certification roadmap.
+See [docs/safety/STANDARDS_MATRIX.md](docs/safety/STANDARDS_MATRIX.md) for the full 23-standard matrix with priority ratings and certification paths.
 
 ---
 
