@@ -563,14 +563,14 @@ export default function AegisDashboard() {
           {/* Sidebar */}
           <div className="sidebar">
             <div className="nav-section">Monitor</div>
-            {navItems.slice(0, 4).map(n => (
+            {navItems.slice(0, 5).map(n => (
               <div key={n.id} className={`nav-item ${page === n.id ? "active" : ""}`}
                 onClick={() => { setPage(n.id); if (n.id === "audit") loadAudit(); }}>
                 <span className="nav-icon">{n.icon}</span>{n.label}
               </div>
             ))}
             <div className="nav-section">Manage</div>
-            {navItems.slice(4).map(n => (
+            {navItems.slice(5).map(n => (
               <div key={n.id} className={`nav-item ${page === n.id ? "active" : ""}`}
                 onClick={() => setPage(n.id)}>
                 <span className="nav-icon">{n.icon}</span>{n.label}
@@ -590,6 +590,7 @@ export default function AegisDashboard() {
             {page === "fleet"    && <FleetPage nodes={nodes} onRefresh={() => loadFleet()} />}
             {page === "stream"   && <StreamPage events={events} />}
             {page === "audit"    && <AuditPage audit={audit} onRefresh={loadAudit} />}
+            {page === "fabric"   && <FabricPage fabricState={fabricState} onRefresh={loadFabricState} />}
             {page === "register" && <RegisterPage api={apiRef.current} onSuccess={(m) => { showToast(m); loadFleet(); }} />}
             {page === "deps"     && <DepsPage api={apiRef.current} nodes={nodes} onSuccess={(m) => showToast(m)} />}
             {page === "sensor"   && <SensorPage api={apiRef.current} nodes={nodes} onSuccess={(m) => { showToast(m); loadFleet(); }} />}
