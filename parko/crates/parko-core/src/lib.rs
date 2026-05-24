@@ -13,6 +13,7 @@
 pub mod backend;
 pub mod commands;
 pub mod runtime;
+pub mod scheduler;
 pub mod sensor;
 pub mod telemetry;
 
@@ -28,6 +29,7 @@ pub use backend::{
 
 pub use commands::ControlCommand;
 pub use runtime::{RuntimeClock, RuntimeState, TickStatus};
+pub use scheduler::{DegradationThresholds, InferenceLoop};
 pub use sensor::{SensorFrame, SensorStream};
 pub use telemetry::{
     CumulativeJitterEvaluator,
