@@ -53,6 +53,20 @@ See [docs/safety/STANDARDS_MATRIX.md](docs/safety/STANDARDS_MATRIX.md) for the f
 
 ---
 
+## Roadmap
+
+Pre-execution architecture sketches for planned integrations. Each document
+includes honest caveats, effort estimates, and explicit sequencing dependencies.
+
+| Integration | Description | Status |
+|-------------|-------------|--------|
+| [Apollo AV Stack](docs/roadmap/APOLLO_AEGIS_INTEGRATION.md) | Cyber RT bridge between Apollo Control and Canbus — kinematic enforcement and lockout in the Apollo pipeline | Planned — after QNX + robot demo |
+| [IEEE 2846 / RSS](docs/roadmap/RSS_AEGIS_INTEGRATION.md) | Behavioral safety invariants based on IEEE 2846 — safe distance enforcement given perception state | Planned — after Apollo integration |
+
+See [docs/roadmap/](docs/roadmap/) for sequencing dependencies and execution plans.
+
+---
+
 ## Overview
 
 Modern robotic and autonomous deployments increasingly rely on AI models to generate operational commands. Aegis sits between those models and the physical actuators, acting as a cryptographically-grounded safety layer that:
