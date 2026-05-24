@@ -14,6 +14,7 @@ pub mod backend;
 pub mod commands;
 pub mod control_loop;
 pub mod runtime;
+pub mod safety;
 pub mod scheduler;
 pub mod sensor;
 pub mod telemetry;
@@ -31,6 +32,7 @@ pub use backend::{
 pub use commands::ControlCommand;
 pub use control_loop::ControlLoop;
 pub use runtime::{RuntimeClock, RuntimeState, TickStatus};
+pub use safety::{EnforcementAction, SafetyGovernor};
 pub use scheduler::{DegradationThresholds, InferenceLoop};
 pub use sensor::{SensorFrame, SensorStream};
 pub use telemetry::{
