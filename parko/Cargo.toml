@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/parko-core"]
+members = ["crates/parko-core", "crates/parko-onnx"]
 resolver = "2"
 
 [profile.release]
