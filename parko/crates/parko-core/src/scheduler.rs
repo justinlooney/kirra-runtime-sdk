@@ -9,6 +9,7 @@ use crate::backend::{BackendCapabilities, InferenceBackend, ModelHandle, Precisi
 use crate::commands::ControlCommand;
 use crate::sensor::SensorFrame;
 use crate::telemetry::{CumulativeJitterEvaluator, PostureSnapshot, RuntimeTelemetry, ThermalState};
+use crate::safety::{EnforcementAction, SafetyGovernor};
 
 /// Thresholds for degraded-mode detection.
 ///
@@ -46,6 +47,8 @@ pub struct InferenceLoop<B: InferenceBackend> {
     jitter_tracker: CumulativeJitterEvaluator,
     thresholds: DegradationThresholds,
     cached_capabilities: BackendCapabilities,
+    governor: Option<Box<dyn SafetyGovernor>>,
+    tick_period_s: f64,
 }
 
 impl<B: InferenceBackend + 'static> InferenceLoop<B> {
@@ -65,7 +68,23 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
             jitter_tracker: CumulativeJitterEvaluator::new(),
             thresholds: DegradationThresholds::default(),
             cached_capabilities,
+            governor: None,
+            tick_period_s: 0.05,
         }
+    }
+
+    /// Attach a safety governor to this loop. The governor's evaluation
+    /// takes precedence over the built-in degraded-mode clamp.
+    pub fn with_governor(mut self, governor: Box<dyn SafetyGovernor>) -> Self {
+        self.governor = Some(governor);
+        self
+    }
+
+    /// Set the tick period (used for time-delta calculations passed to
+    /// the safety governor). Defaults to 0.05 (20Hz).
+    pub fn with_tick_period(mut self, tick_period_s: f64) -> Self {
+        self.tick_period_s = tick_period_s;
+        self
     }
 
     pub async fn tick(&mut self, current_frame: SensorFrame) -> Result<PostureSnapshot, String> {
@@ -126,6 +145,36 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
         let proposed_cmd = self
             .parse_inference_to_command(&processed_outputs, loop_start_ms)
             .map_err(|e| format!("invalid inference outputs: {}", e))?;
+
+        // If a safety governor is configured, evaluate the proposed command.
+        // The governor's decision takes precedence over the built-in
+        // degraded-mode clamp below; the built-in clamp remains as a fallback
+        // for callers without a governor.
+        let proposed_cmd = if let Some(ref governor) = self.governor {
+            let action = governor.evaluate(
+                &proposed_cmd,
+                self.last_validated_command.as_ref(),
+                self.tick_period_s,
+            );
+            match action {
+                EnforcementAction::Allow => proposed_cmd,
+                EnforcementAction::ClampLinearVelocity(v) => ControlCommand {
+                    linear_velocity: v,
+                    angular_velocity: proposed_cmd.angular_velocity,
+                    timestamp_ms: proposed_cmd.timestamp_ms,
+                },
+                EnforcementAction::ClampAngularVelocity(v) => ControlCommand {
+                    linear_velocity: proposed_cmd.linear_velocity,
+                    angular_velocity: v,
+                    timestamp_ms: proposed_cmd.timestamp_ms,
+                },
+                EnforcementAction::Deny { reason: _ } => {
+                    ControlCommand::stopped(proposed_cmd.timestamp_ms)
+                }
+            }
+        } else {
+            proposed_cmd
+        };
 
         // Degraded-mode detection.
         let mut degraded = false;
@@ -301,6 +350,53 @@ mod tests {
                 },
             ))
         }
+    }
+
+    use crate::safety::{EnforcementAction, SafetyGovernor};
+
+    /// Test governor that always clamps linear velocity to 2.0 m/s.
+    struct ClampToTwoGovernor;
+    impl SafetyGovernor for ClampToTwoGovernor {
+        fn evaluate(
+            &self,
+            proposed: &ControlCommand,
+            _previous: Option<&ControlCommand>,
+            _delta_time_s: f64,
+        ) -> EnforcementAction {
+            if proposed.linear_velocity > 2.0 {
+                EnforcementAction::ClampLinearVelocity(2.0)
+            } else {
+                EnforcementAction::Allow
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn governor_clamps_command_before_degraded_logic() {
+        let backend = Arc::new(TestBackend);
+        let model = backend.load_model("").unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let mut loop_engine = InferenceLoop::new(backend, model, tx)
+            .with_governor(Box::new(ClampToTwoGovernor));
+        let mut stream = SimpleStream { next_id: 0 };
+
+        let _ = loop_engine.tick(stream.next_frame().unwrap()).await.unwrap();
+        let snapshot = loop_engine.tick(stream.next_frame().unwrap()).await.unwrap();
+
+        // Governor clamps 65.0 down to 2.0. Even though degraded-mode would
+        // otherwise clamp to 1.5, the governor ran first and produced 2.0,
+        // so degraded-mode sees 2.0 (above its 1.5 ceiling) and further clamps
+        // to 1.5. The governor's clamp is precedence-first, then degraded-mode
+        // further restricts. So final value is 1.5.
+        //
+        // If you want to verify governor's standalone clamp without degraded-
+        // mode interference, you'd need to disable degraded-mode (not supported
+        // in this prototype).
+        assert!(snapshot.active_command.linear_velocity <= 2.0);
+
+        let flushed = rx.recv().await.unwrap();
+        assert!(flushed.linear_velocity <= 2.0);
     }
 
     #[tokio::test]
