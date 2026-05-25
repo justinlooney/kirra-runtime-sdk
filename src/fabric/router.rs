@@ -1,8 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
-use crate::fabric::asset::{AssetPosture, AssetType, FabricAsset, FabricState, KinematicProfileType};
+use crate::fabric::asset::{AssetPosture, AssetType, FabricAsset, FabricState};
 use crate::fabric::governor::AssetGovernor;
 use crate::gateway::kinematics_contract::{EnforceAction, ProposedVehicleCommand};
 use crate::verifier::FleetPosture;
@@ -201,6 +199,7 @@ impl Default for FabricRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::fabric::asset::{AssetType, FabricAsset, KinematicProfileType};
     use std::collections::HashMap;
 

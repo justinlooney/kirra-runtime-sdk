@@ -46,17 +46,17 @@ path = "src/bin/ai_robot_sim_diagnostic.rs"
 
 [[bin]]
 name = "kirra_ros2_demo_node"
-path = "src/bin/aegis_ros2_demo_node.rs"
+path = "src/bin/kirra_ros2_demo_node.rs"
 
 [[bin]]
 name = "kirra_ros2_publisher"
-path = "src/bin/aegis_ros2_publisher.rs"
+path = "src/bin/kirra_ros2_publisher.rs"
 required-features = ["ros2"]
 
 [[bin]]
 name = "kirra_verifier_service"
-path = "src/bin/aegis_verifier_service.rs"
+path = "src/bin/kirra_verifier_service.rs"
 
 [[bin]]
 name = "kirra_carla_client"
-path = "src/bin/aegis_carla_client.rs"
+path = "src/bin/kirra_carla_client.rs"
