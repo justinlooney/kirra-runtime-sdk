@@ -193,17 +193,22 @@ pub fn validate_vehicle_command(
 
     if implied_accel > 0.0 && implied_accel > contract.max_accel_mps2 {
         let safe_speed =
-            cmd.current_velocity_mps + (contract.max_accel_mps2 * cmd.delta_time_s);
+            (cmd.current_velocity_mps + (contract.max_accel_mps2 * cmd.delta_time_s))
+                .clamp(-contract.max_speed_mps, contract.max_speed_mps);
         return EnforceAction::ClampLinear(safe_speed);
     }
 
     // ------------------------------------------------------------------
     // Priority 4: Implied deceleration ceiling
     // Asymmetric from acceleration: braking limit is typically higher.
+    // The result is clamped to [-max_speed, +max_speed] so that a
+    // current velocity already above the envelope cannot produce a
+    // ClampLinear value that still exceeds the speed contract.
     // ------------------------------------------------------------------
     if implied_accel < 0.0 && implied_accel.abs() > contract.max_brake_mps2 {
         let safe_speed =
-            cmd.current_velocity_mps - (contract.max_brake_mps2 * cmd.delta_time_s);
+            (cmd.current_velocity_mps - (contract.max_brake_mps2 * cmd.delta_time_s))
+                .clamp(-contract.max_speed_mps, contract.max_speed_mps);
         return EnforceAction::ClampLinear(safe_speed);
     }
 
