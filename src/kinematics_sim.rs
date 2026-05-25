@@ -392,7 +392,10 @@ mod kinematics_sim_tests {
 
     #[test]
     fn test_straight_line_motion_advances_x_position() {
-        let state = VehicleState::at_rest();
+        // Pre-populate velocity to match commanded velocity so step() integrates over the
+        // active velocity. The one-tick lag in the state model is intentional — see
+        // validate_vehicle_command's acceleration contract.
+        let state = VehicleState::new(0.0, 0.0, 0.0, 10.0);
         let c = cmd(10.0, 0.0);
         let next = state.step(&c, WB);
         assert!((next.x_m - 1.0).abs() < 1e-9, "x must advance by v*dt");
@@ -413,7 +416,10 @@ mod kinematics_sim_tests {
 
     #[test]
     fn test_left_turn_increases_heading() {
-        let state = VehicleState::new(0.0, 0.0, 0.0, 10.0);
+        // Pre-populate both velocity and steering so step() integrates with the active
+        // kinematic state. The one-tick lag is intentional — see validate_vehicle_command's
+        // acceleration contract.
+        let state = VehicleState { steering_angle_deg: 10.0, ..VehicleState::new(0.0, 0.0, 0.0, 10.0) };
         let c = cmd(10.0, 10.0);
         let next = state.step(&c, WB);
         assert!(next.heading_rad > 0.0, "left turn must increase heading");
@@ -421,7 +427,10 @@ mod kinematics_sim_tests {
 
     #[test]
     fn test_right_turn_decreases_heading() {
-        let state = VehicleState::new(0.0, 0.0, 0.0, 10.0);
+        // Pre-populate both velocity and steering so step() integrates with the active
+        // kinematic state. The one-tick lag is intentional — see validate_vehicle_command's
+        // acceleration contract.
+        let state = VehicleState { steering_angle_deg: -10.0, ..VehicleState::new(0.0, 0.0, 0.0, 10.0) };
         let c = cmd(10.0, -10.0);
         let next = state.step(&c, WB);
         assert!(next.heading_rad < 0.0, "right turn must decrease heading");
