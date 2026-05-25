@@ -1,5 +1,5 @@
-// src/bin/aegis_verifier_service.rs
-// Aegis Verifier Service — distributed legitimacy fabric entry point.
+// src/bin/kirra_verifier_service.rs
+// Kirra Verifier Service — distributed legitimacy fabric entry point.
 
 use axum::{
     extract::{Path, Query, Request, State},
@@ -19,40 +19,40 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 
-use aegis_runtime_sdk::verifier::{
+use kirra_runtime_sdk::verifier::{
     validate_client_identity_headers, AppState, BackupExport, FlapStatus, FleetNodePosture,
     FleetPosture, HealthResponse, NodeTrustState, PostureStreamEvent, RegisteredNode, VerifierOperationMode,
 };
-use aegis_runtime_sdk::verifier_store::VerifierStore;
-use aegis_runtime_sdk::posture_cache::{now_ms, CachedFleetPosture, ServiceState, SharedPostureCache};
-use aegis_runtime_sdk::security::constant_time_compare;
-use aegis_runtime_sdk::action_filter::{evaluate_action_claim, ActionClaim};
-use aegis_runtime_sdk::protocol_adapter::{
+use kirra_runtime_sdk::verifier_store::VerifierStore;
+use kirra_runtime_sdk::posture_cache::{now_ms, CachedFleetPosture, ServiceState, SharedPostureCache};
+use kirra_runtime_sdk::security::constant_time_compare;
+use kirra_runtime_sdk::action_filter::{evaluate_action_claim, ActionClaim};
+use kirra_runtime_sdk::protocol_adapter::{
     evaluate_unified_industrial_request, UnifiedIndustrialRequest,
 };
-use aegis_runtime_sdk::adapters::ethernet_ip::{EtherNetIpAdapter, EtherNetIpMessage};
-use aegis_runtime_sdk::adapters::canopen::{CanOpenAdapter, CanOpenMessage};
-use aegis_runtime_sdk::adapters::dnp3::{Dnp3Adapter, Dnp3Message};
-use aegis_runtime_sdk::federation::{
+use kirra_runtime_sdk::adapters::ethernet_ip::{EtherNetIpAdapter, EtherNetIpMessage};
+use kirra_runtime_sdk::adapters::canopen::{CanOpenAdapter, CanOpenMessage};
+use kirra_runtime_sdk::adapters::dnp3::{Dnp3Adapter, Dnp3Message};
+use kirra_runtime_sdk::federation::{
     evaluate_federated_report,
     verify_federated_report_signature,
     FederatedTrustReport,
     RegisterFederationControllerRequest,
     ReportEvaluation,
 };
-use aegis_runtime_sdk::standby_monitor::{spawn_heartbeat_writer, spawn_promotion_monitor};
-use aegis_runtime_sdk::gateway::kinematics_contract::ProposedVehicleCommand;
-use aegis_runtime_sdk::gateway::policy_layer::enforce_actuator_safety_envelope;
-use aegis_runtime_sdk::recovery_hysteresis::{evaluate_recovery_report, HysteresisDecision};
-use aegis_runtime_sdk::fabric::asset::{AssetPosture, AssetType, FabricAsset, KinematicProfileType};
-use aegis_runtime_sdk::fabric::router::FabricRouter;
-use aegis_runtime_sdk::fabric::telemetry::{AssetTelemetrySnapshot, FabricTelemetry};
-use aegis_runtime_sdk::fabric::causal_log::FabricCausalLog;
+use kirra_runtime_sdk::standby_monitor::{spawn_heartbeat_writer, spawn_promotion_monitor};
+use kirra_runtime_sdk::gateway::kinematics_contract::ProposedVehicleCommand;
+use kirra_runtime_sdk::gateway::policy_layer::enforce_actuator_safety_envelope;
+use kirra_runtime_sdk::recovery_hysteresis::{evaluate_recovery_report, HysteresisDecision};
+use kirra_runtime_sdk::fabric::asset::{AssetPosture, AssetType, FabricAsset, KinematicProfileType};
+use kirra_runtime_sdk::fabric::router::FabricRouter;
+use kirra_runtime_sdk::fabric::telemetry::{AssetTelemetrySnapshot, FabricTelemetry};
+use kirra_runtime_sdk::fabric::causal_log::FabricCausalLog;
 
 // --- Auth middleware ---------------------------------------------------------
 
 async fn require_admin_token(request: Request, next: Next) -> Result<Response, StatusCode> {
-    let expected = std::env::var("AEGIS_ADMIN_TOKEN")
+    let expected = std::env::var("KIRRA_ADMIN_TOKEN")
         .unwrap_or_default();
 
     if expected.is_empty() {
@@ -273,7 +273,7 @@ async fn verify_attestation(
     }
     let now = now_ms();
 
-    let admin_token = match std::env::var("AEGIS_ADMIN_TOKEN").ok().filter(|s| !s.is_empty()) {
+    let admin_token = match std::env::var("KIRRA_ADMIN_TOKEN").ok().filter(|s| !s.is_empty()) {
         Some(t) => t,
         None => return (StatusCode::SERVICE_UNAVAILABLE,
                         Json(json!({ "error": "attestation key not configured" }))).into_response(),
@@ -606,7 +606,7 @@ async fn evaluate_industrial_adapter(
         .read()
         .ok()
         .and_then(|g| g.as_ref().map(|c| c.posture.clone()))
-        .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
+        .unwrap_or(kirra_runtime_sdk::verifier::FleetPosture::LockedOut);
 
     let audit_ref = now_ms().to_string();
     let protocol_name = format!("{:?}", req.protocol);
@@ -680,11 +680,11 @@ async fn evaluate_ethernet_ip_adapter(
         .read()
         .ok()
         .and_then(|g| g.as_ref().map(|c| c.posture.clone()))
-        .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
+        .unwrap_or(kirra_runtime_sdk::verifier::FleetPosture::LockedOut);
 
     let posture_str = format!("{:?}", posture);
     let eval = EtherNetIpAdapter::evaluate(&msg);
-    let (allowed, denial_reason) = aegis_runtime_sdk::protocol_adapter::command_allowed_for_posture_pub(&eval.command, &posture);
+    let (allowed, denial_reason) = kirra_runtime_sdk::protocol_adapter::command_allowed_for_posture_pub(&eval.command, &posture);
     let audit_ref = now_ms().to_string();
 
     if !allowed {
@@ -737,11 +737,11 @@ async fn evaluate_canopen_adapter(
         .read()
         .ok()
         .and_then(|g| g.as_ref().map(|c| c.posture.clone()))
-        .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
+        .unwrap_or(kirra_runtime_sdk::verifier::FleetPosture::LockedOut);
 
     let posture_str = format!("{:?}", posture);
     let eval = CanOpenAdapter::evaluate(&msg);
-    let (allowed, denial_reason) = aegis_runtime_sdk::protocol_adapter::command_allowed_for_posture_pub(&eval.command, &posture);
+    let (allowed, denial_reason) = kirra_runtime_sdk::protocol_adapter::command_allowed_for_posture_pub(&eval.command, &posture);
     let audit_ref = now_ms().to_string();
 
     if !allowed || eval.triggers_recalculation {
@@ -801,11 +801,11 @@ async fn evaluate_dnp3_adapter(
         .read()
         .ok()
         .and_then(|g| g.as_ref().map(|c| c.posture.clone()))
-        .unwrap_or(aegis_runtime_sdk::verifier::FleetPosture::LockedOut);
+        .unwrap_or(kirra_runtime_sdk::verifier::FleetPosture::LockedOut);
 
     let posture_str = format!("{:?}", posture);
     let eval = Dnp3Adapter::evaluate(&msg);
-    let (allowed, denial_reason) = aegis_runtime_sdk::protocol_adapter::command_allowed_for_posture_pub(&eval.command, &posture);
+    let (allowed, denial_reason) = kirra_runtime_sdk::protocol_adapter::command_allowed_for_posture_pub(&eval.command, &posture);
     let audit_ref = now_ms().to_string();
 
     // DNP3 broadcast commands ALWAYS get an audit entry regardless of allow/deny
@@ -1317,12 +1317,12 @@ async fn handle_fabric_command(
     match svc.fabric_router.route_command(&asset_id, &cmd) {
         Ok(action) => {
             let action_str = format!("{:?}", action);
-            let allowed = !matches!(action, aegis_runtime_sdk::gateway::kinematics_contract::EnforceAction::DenyBreach(_));
+            let allowed = !matches!(action, kirra_runtime_sdk::gateway::kinematics_contract::EnforceAction::DenyBreach(_));
 
             let now = now_ms();
             // Record to causal log on denial
             if !allowed {
-                let denial_reason = if let aegis_runtime_sdk::gateway::kinematics_contract::EnforceAction::DenyBreach(ref r) = action { r.clone() } else { String::new() };
+                let denial_reason = if let kirra_runtime_sdk::gateway::kinematics_contract::EnforceAction::DenyBreach(ref r) = action { r.clone() } else { String::new() };
                 svc.fabric_causal_log.record(
                     &asset_id,
                     "COMMAND_DENIED",
@@ -1387,19 +1387,19 @@ async fn handle_fabric_causal_chain(
 
 #[tokio::main]
 async fn main() {
-    let db_path = std::env::var("AEGIS_DB_PATH")
-        .unwrap_or_else(|_| "aegis_verifier.sqlite".to_string());
-    let listen_addr = std::env::var("AEGIS_VERIFIER_ADDR")
+    let db_path = std::env::var("KIRRA_DB_PATH")
+        .unwrap_or_else(|_| "kirra_verifier.sqlite".to_string());
+    let listen_addr = std::env::var("KIRRA_VERIFIER_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8090".to_string());
 
     let mut store = VerifierStore::new(&db_path)
         .expect("failed to initialize verifier store");
 
     let mode = VerifierOperationMode::from_env();
-    println!("Aegis Verifier starting in {mode:?} mode (db: {db_path})");
+    println!("Kirra Verifier starting in {mode:?} mode (db: {db_path})");
 
     let audit_signing_key: Option<ed25519_dalek::SigningKey> =
-        std::env::var("AEGIS_LOG_SIGNING_KEY").ok()
+        std::env::var("KIRRA_LOG_SIGNING_KEY").ok()
             .filter(|s| !s.is_empty())
             .and_then(|b64_str| {
                 use base64::{engine::general_purpose::STANDARD as b64e, Engine as _};
@@ -1543,7 +1543,7 @@ async fn main() {
         .with_state(svc_state)
         .layer(cors);
 
-    println!("Aegis Verifier Service listening on {listen_addr} (db: {db_path})");
+    println!("Kirra Verifier Service listening on {listen_addr} (db: {db_path})");
     let listener = tokio::net::TcpListener::bind(&listen_addr).await
         .expect("failed to bind listener");
     axum::serve(listener, app).await

@@ -1,44 +1,44 @@
-// crates/parko-aegis/src/lib.rs
+// crates/parko-kirra/src/lib.rs
 //
 // Adapter from parko-core's SafetyGovernor trait to the
-// aegis-runtime-sdk vehicle kinematics contract.
+// kirra-runtime-sdk vehicle kinematics contract.
 //
 // LIMITATIONS:
 //
 // parko's ControlCommand uses a differential-drive Twist model
 // (linear_velocity, angular_velocity in m/s and rad/s respectively).
-// Aegis's ProposedVehicleCommand uses a bicycle/Ackermann model
+// Kirra's ProposedVehicleCommand uses a bicycle/Ackermann model
 // (linear_velocity_mps, steering_angle_deg). These are semantically
 // different control representations.
 //
 // This adapter enforces ONLY the linear velocity dimension. The steering
 // angle dimension is set to zero (current and proposed both 0.0 degrees),
-// which means Aegis's steering rate-of-change check effectively becomes a
+// which means Kirra's steering rate-of-change check effectively becomes a
 // no-op for this dimension.
 //
 // Differential-drive robots that need angular velocity bounds checking
 // should add a separate governor or extend this one with a wheelbase-
 // dependent kinematic bicycle conversion. That is future work.
 
-use aegis_runtime_sdk::gateway::kinematics_contract::{
+use kirra_runtime_sdk::gateway::kinematics_contract::{
     validate_vehicle_command, EnforceAction, ProposedVehicleCommand, VehicleKinematicsContract,
 };
-use aegis_runtime_sdk::verifier::FleetPosture;
+use kirra_runtime_sdk::verifier::FleetPosture;
 
 use parko_core::commands::ControlCommand;
 use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 
-/// A safety governor backed by the Aegis runtime SDK's vehicle kinematics
+/// A safety governor backed by the Kirra runtime SDK's vehicle kinematics
 /// contract.
 ///
 /// Holds both nominal and MRC fallback contract profiles and selects
 /// between them per-call based on the posture passed to `evaluate()`.
-pub struct AegisGovernor {
+pub struct KirraGovernor {
     nominal_contract: VehicleKinematicsContract,
     fallback_contract: VehicleKinematicsContract,
 }
 
-impl AegisGovernor {
+impl KirraGovernor {
     /// Construct a governor that holds both nominal and MRC fallback
     /// contract profiles and selects between them per-call based on
     /// the posture passed to `evaluate()`.
@@ -81,7 +81,7 @@ impl AegisGovernor {
     }
 }
 
-impl SafetyGovernor for AegisGovernor {
+impl SafetyGovernor for KirraGovernor {
     fn evaluate(
         &self,
         proposed: &ControlCommand,
@@ -96,7 +96,7 @@ impl SafetyGovernor for AegisGovernor {
             SafetyPosture::Degraded | SafetyPosture::LockedOut => &self.fallback_contract,
         };
 
-        let aegis_input = ProposedVehicleCommand {
+        let kirra_input = ProposedVehicleCommand {
             linear_velocity_mps: proposed.linear_velocity,
             current_velocity_mps: current_velocity,
             delta_time_s,
@@ -106,7 +106,7 @@ impl SafetyGovernor for AegisGovernor {
             current_steering_angle_deg: 0.0,
         };
 
-        match validate_vehicle_command(&aegis_input, contract) {
+        match validate_vehicle_command(&kirra_input, contract) {
             EnforceAction::Allow => EnforcementAction::Allow,
             EnforceAction::ClampLinear(safe_value) => {
                 EnforcementAction::ClampLinearVelocity(safe_value)

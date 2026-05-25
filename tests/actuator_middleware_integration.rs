@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use aegis_runtime_sdk::{
+use kirra_runtime_sdk::{
     posture_cache::{CachedFleetPosture, ServiceState, SharedPostureCache},
     verifier::{AppState, FleetPosture, VerifierOperationMode},
     verifier_store::VerifierStore,
@@ -27,9 +27,9 @@ fn build_state(posture: FleetPosture) -> Arc<ServiceState> {
         app,
         posture_cache,
         audit_verifying_key: None,
-        fabric_router: Arc::new(aegis_runtime_sdk::fabric::router::FabricRouter::new()),
-        fabric_telemetry: Arc::new(aegis_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
-        fabric_causal_log: Arc::new(aegis_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
+        fabric_router: Arc::new(kirra_runtime_sdk::fabric::router::FabricRouter::new()),
+        fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
+        fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
     })
 }
 
@@ -41,9 +41,9 @@ fn build_state_empty_cache() -> Arc<ServiceState> {
         app,
         posture_cache,
         audit_verifying_key: None,
-        fabric_router: Arc::new(aegis_runtime_sdk::fabric::router::FabricRouter::new()),
-        fabric_telemetry: Arc::new(aegis_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
-        fabric_causal_log: Arc::new(aegis_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
+        fabric_router: Arc::new(kirra_runtime_sdk::fabric::router::FabricRouter::new()),
+        fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
+        fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
     })
 }
 

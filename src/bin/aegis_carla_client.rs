@@ -1,26 +1,26 @@
-// src/bin/aegis_carla_client.rs
+// src/bin/kirra_carla_client.rs
 //
-// CARLA ↔ Aegis AV Safety Integration
+// CARLA ↔ Kirra AV Safety Integration
 //
 // WHAT THIS IS
 // ============
 // A Rust binary that bridges the CARLA autonomous driving simulator to the
-// Aegis AV safety stack. It runs alongside a CARLA server and the Aegis
+// Kirra AV safety stack. It runs alongside a CARLA server and the Kirra
 // verifier service, acting as both:
 //
 //   1. A CARLA ego vehicle controller — reads vehicle state from CARLA,
-//      generates planner commands, submits them through Aegis enforcement,
+//      generates planner commands, submits them through Kirra enforcement,
 //      applies the enforced result back to CARLA
 //
 //   2. A sensor health reporter — reads CARLA sensor data (LiDAR, camera,
 //      GPS, IMU), derives confidence scores, and posts health reports to
-//      Aegis so the fleet posture engine can respond to sensor degradation
+//      Kirra so the fleet posture engine can respond to sensor degradation
 //
 // The integration exercises the complete path that no unit test covers:
 //
 //   CARLA vehicle state
 //     → planner generates ProposedVehicleCommand
-//     → POST /actuator/motion/command (Aegis enforces)
+//     → POST /actuator/motion/command (Kirra enforces)
 //     → enforced command applied to CARLA
 //     → CARLA steps forward
 //     → sensor readings derived from CARLA state
@@ -40,25 +40,25 @@
 //
 // For environments without CARLA, a built-in kinematic simulator (using
 // kinematics_sim.rs) provides a headless fallback that exercises the full
-// Aegis enforcement stack without requiring a CARLA server.
+// Kirra enforcement stack without requiring a CARLA server.
 //
 // USAGE
 // =====
 //   # With CARLA server running on localhost:2000
-//   AEGIS_VERIFIER_URL=http://localhost:8090 \
-//   AEGIS_ADMIN_TOKEN=test-token \
-//   cargo run --bin aegis_carla_client -- --mode carla --scenario sensor_fault
+//   KIRRA_VERIFIER_URL=http://localhost:8090 \
+//   KIRRA_ADMIN_TOKEN=test-token \
+//   cargo run --bin kirra_carla_client -- --mode carla --scenario sensor_fault
 //
 //   # Headless simulation (no CARLA required)
-//   AEGIS_VERIFIER_URL=http://localhost:8090 \
-//   AEGIS_ADMIN_TOKEN=test-token \
-//   cargo run --bin aegis_carla_client -- --mode headless --scenario all
+//   KIRRA_VERIFIER_URL=http://localhost:8090 \
+//   KIRRA_ADMIN_TOKEN=test-token \
+//   cargo run --bin kirra_carla_client -- --mode headless --scenario all
 
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Aegis HTTP client types
+// Kirra HTTP client types
 // (mirrors the verifier service request/response shapes)
 // ---------------------------------------------------------------------------
 
@@ -244,16 +244,16 @@ impl Scenario {
 }
 
 // ---------------------------------------------------------------------------
-// Aegis HTTP client
+// Kirra HTTP client
 // ---------------------------------------------------------------------------
 
-struct AegisClient {
+struct KirraClient {
     base_url: String,
     admin_token: String,
     client: reqwest::blocking::Client,
 }
 
-impl AegisClient {
+impl KirraClient {
     fn new(base_url: &str, admin_token: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -536,7 +536,7 @@ impl SimplePlanner {
 // ---------------------------------------------------------------------------
 
 fn run_scenario_headless(
-    client: &AegisClient,
+    client: &KirraClient,
     scenario: &Scenario,
     wheelbase_m: f64,
     max_lateral_accel: f64,
@@ -668,7 +668,7 @@ fn run_scenario_headless(
 // Fleet setup
 // ---------------------------------------------------------------------------
 
-fn setup_av_fleet(client: &AegisClient) -> Result<(), String> {
+fn setup_av_fleet(client: &KirraClient) -> Result<(), String> {
     println!("Setting up AV fleet node graph...");
 
     let nodes = [
@@ -703,9 +703,9 @@ fn setup_av_fleet(client: &AegisClient) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    let base_url = std::env::var("AEGIS_VERIFIER_URL")
+    let base_url = std::env::var("KIRRA_VERIFIER_URL")
         .unwrap_or_else(|_| "http://localhost:8090".to_string());
-    let admin_token = std::env::var("AEGIS_ADMIN_TOKEN")
+    let admin_token = std::env::var("KIRRA_ADMIN_TOKEN")
         .unwrap_or_else(|_| "dev-token".to_string());
 
     let args: Vec<String> = std::env::args().collect();
@@ -716,14 +716,14 @@ fn main() {
         .and_then(|a| a.strip_prefix("--scenario="))
         .unwrap_or("all");
 
-    println!("Aegis CARLA Integration Client");
+    println!("Kirra CARLA Integration Client");
     println!("  Verifier URL: {base_url}");
     println!("  Mode:         {mode}");
     println!("  Scenario:     {scenario_name}");
 
-    let client = AegisClient::new(&base_url, &admin_token);
+    let client = KirraClient::new(&base_url, &admin_token);
 
-    print!("Waiting for Aegis verifier...");
+    print!("Waiting for Kirra verifier...");
     let start = Instant::now();
     loop {
         if client.health_check() { println!(" ready."); break; }

@@ -1,4 +1,4 @@
-// src/aegis_core.rs
+// src/kirra_core.rs
 
 use crate::{SafetyContract, SafetyGovernor, GovernorInterceptResult, TrustMode};
 use crate::security::constant_time_compare;
@@ -115,7 +115,7 @@ impl RuntimeTrustEngine {
     }
 }
 
-pub struct AegisKernelGovernor<C: SafetyContract> {
+pub struct KirraKernelGovernor<C: SafetyContract> {
     pub contract: C,
     pub trust_engine: RuntimeTrustEngine,
     pub last_validated_scalar: f64,
@@ -124,7 +124,7 @@ pub struct AegisKernelGovernor<C: SafetyContract> {
     pub constraint_cap_max: f64,
 }
 
-impl<C: SafetyContract> AegisKernelGovernor<C> {
+impl<C: SafetyContract> KirraKernelGovernor<C> {
     pub fn new(contract: C, initial_scalar: f64, cap_min: f64, cap_max: f64) -> Self {
         Self {
             contract,
@@ -137,7 +137,7 @@ impl<C: SafetyContract> AegisKernelGovernor<C> {
     }
 }
 
-impl<C: SafetyContract> SafetyGovernor for AegisKernelGovernor<C> {
+impl<C: SafetyContract> SafetyGovernor for KirraKernelGovernor<C> {
     fn evaluate(&mut self, proposed_demand: f64, mut dt: f64) -> GovernorInterceptResult {
         if dt <= 0.001 { dt = 0.050; }
 

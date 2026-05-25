@@ -10,7 +10,7 @@ Parko combines three things that existing runtimes typically handle separately:
 
 - **ML inference** — running ONNX (and eventually other) models against tensor inputs
 - **Real-time control loops** — fixed-frequency tick scheduling, drop-frame detection, jitter measurement, and degraded-mode behavior
-- **Safety governance integration** — pluggable safety governors via the `SafetyGovernor` trait, with a working adapter to the Aegis kinematics contract via the `parko-aegis` crate. Posture-driven contract selection (Nominal → nominal_reference_profile, Degraded → mrc_fallback_profile) is verified end-to-end by integration tests. Linear velocity dimension only; see limitations.
+- **Safety governance integration** — pluggable safety governors via the `SafetyGovernor` trait, with a working adapter to the Kirra kinematics contract via the `parko-kirra` crate. Posture-driven contract selection (Nominal → nominal_reference_profile, Degraded → mrc_fallback_profile) is verified end-to-end by integration tests. Linear velocity dimension only; see limitations.
 
 The intended use case is robotics and edge systems where ML perception drives actuator commands and runtime safety matters. The intended hardware targets include Linux servers (today), Jetson edge devices, and eventually edge NPUs (Qualcomm QNN, NXP eIQ, TI TIDL).
 
@@ -18,7 +18,7 @@ The intended use case is robotics and edge systems where ML perception drives ac
 
 - Not a competitor to ONNX Runtime, TVM, or Modular MAX for general ML inference. Parko uses ONNX Runtime as a backend; it doesn't reimplement what those projects do well.
 - Not a replacement for ROS2 or other robotics middleware. Parko provides a control loop primitive, not a full middleware stack.
-- Not a safety-certified runtime. The integration with the Aegis safety kernel is partially implemented for linear velocity bounds (via parko-aegis); broader safety properties are not yet bridged. The placeholder degraded-mode logic in the scheduler is explicitly marked as substitute-for-Aegis and is not a safety guarantee.
+- Not a safety-certified runtime. The integration with the Kirra safety kernel is partially implemented for linear velocity bounds (via parko-kirra); broader safety properties are not yet bridged. The placeholder degraded-mode logic in the scheduler is explicitly marked as substitute-for-Kirra and is not a safety guarantee.
 - Not yet validated on real hardware beyond CPU testing. Real benchmarks await Jetson hardware.
 
 ## Current capabilities
@@ -39,10 +39,10 @@ The workspace contains three crates:
 - One backend implementation: `OrtBackend` (CPU only)
 - Integration test passing against MNIST-12
 
-**`parko-aegis`** — Aegis safety kernel adapter.
-- Implements `SafetyGovernor` via the Aegis kinematics contract
+**`parko-kirra`** — Kirra safety kernel adapter.
+- Implements `SafetyGovernor` via the Kirra kinematics contract
 - Enforces linear velocity bounds; selects nominal or MRC fallback profile by `FleetPosture`
-- 3 integration tests against real Aegis contract profiles. Posture-driven divergence (Nominal clamps to 35.0 m/s, Degraded MRC clamps to 5.0 m/s) is verified by parko-core's test_posture_divergence integration tests.
+- 3 integration tests against real Kirra contract profiles. Posture-driven divergence (Nominal clamps to 35.0 m/s, Degraded MRC clamps to 5.0 m/s) is verified by parko-core's test_posture_divergence integration tests.
 
 ## Building
 
@@ -72,12 +72,12 @@ Run the tests with `ORT_DYLIB_PATH` set:
 cd parko && ORT_DYLIB_PATH=$HOME/.local/onnxruntime/lib/libonnxruntime.so cargo test -p parko-onnx 2>&1
 ```
 
-## Running parko-aegis tests
+## Running parko-kirra tests
 
-parko-aegis depends on the aegis-runtime-sdk at the repository root. No additional setup is required beyond a standard cargo test.
+parko-kirra depends on the kirra-runtime-sdk at the repository root. No additional setup is required beyond a standard cargo test.
 
 ```bash
-cd parko && cargo test -p parko-aegis 2>&1
+cd parko && cargo test -p parko-kirra 2>&1
 ```
 
 ## Design notes
@@ -86,7 +86,7 @@ cd parko && cargo test -p parko-aegis 2>&1
 
 Existing ONNX-related Rust crates couple the inference API tightly to the underlying ONNX Runtime API. Parko's `InferenceBackend` trait abstracts over the backend, so the same `InferenceLoop` and `ControlLoop` code can run with future implementations against Qualcomm QNN, NXP eIQ, or other NPU SDKs without changes to the control logic.
 
-The same plugin pattern applies to safety: `SafetyGovernor` is a trait in parko-core, with `AegisGovernor` (in parko-aegis) as one implementation. A future TÜV-certified, ISO 26262 SEooC, or custom governor would slot in the same way. Parko-core has no Aegis dependency; the bridge lives only in parko-aegis.
+The same plugin pattern applies to safety: `SafetyGovernor` is a trait in parko-core, with `KirraGovernor` (in parko-kirra) as one implementation. A future TÜV-certified, ISO 26262 SEooC, or custom governor would slot in the same way. Parko-core has no Kirra dependency; the bridge lives only in parko-kirra.
 
 This is an investment in flexibility, paid for in indirection. For a single-backend, single-platform deployment, the trait abstraction is overhead. For a multi-backend, multi-governor roadmap, it's the foundation.
 
@@ -109,14 +109,14 @@ If a `SafetyGovernor` is attached via `InferenceLoop::with_governor()`, it runs 
 - The built-in degraded-mode policy clamps linear velocity to a hardcoded ceiling (1.5 m/s) when no `SafetyGovernor` is attached. When a governor is attached via `with_governor()`, the built-in clamp is suppressed and the governor has full authority over command modification.
 - The `Mutex<Session>` serialization means parko-onnx is single-inference-at-a-time per backend instance. Multiple models or concurrent inference would require multiple backend instances.
 - ONNX Runtime via `ort 2.0.0-rc.12` has a re-entrant Once-lock deadlock in its error handling path when `ORT_API_VERSION` mismatch occurs. Pinning to the matching runtime version (v1.24.x) avoids triggering it, but the bug exists.
-- parko-aegis bridges only the linear velocity dimension to the Aegis kinematics contract. Angular velocity is not currently enforced. See `crates/parko-aegis/README.md` for details.
+- parko-kirra bridges only the linear velocity dimension to the Kirra kinematics contract. Angular velocity is not currently enforced. See `crates/parko-kirra/README.md` for details.
 
 ## License
 
 Apache-2.0
 
-## Relationship to Aegis
+## Relationship to Kirra
 
-Parko is developed alongside Aegis but is a separate experiment. Parko-core has no dependency on Aegis. The parko-aegis adapter crate depends on aegis-runtime-sdk and implements parko-core's `SafetyGovernor` trait, bridging to the existing Aegis kinematics contract. This integration enforces linear velocity bounds; broader safety properties (steering, audit chain, posture engine, federation) are not yet bridged.
+Parko is developed alongside Kirra but is a separate experiment. Parko-core has no dependency on Kirra. The parko-kirra adapter crate depends on kirra-runtime-sdk and implements parko-core's `SafetyGovernor` trait, bridging to the existing Kirra kinematics contract. This integration enforces linear velocity bounds; broader safety properties (steering, audit chain, posture engine, federation) are not yet bridged.
 
-Parko's existence does not change Aegis's roadmap or commercial focus.
+Parko's existence does not change Kirra's roadmap or commercial focus.

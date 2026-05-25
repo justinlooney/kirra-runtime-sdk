@@ -1,11 +1,11 @@
 // crates/parko-core/tests/test_posture_divergence.rs
 //
-// Verifies that ControlLoop with an AegisGovernor selects different
+// Verifies that ControlLoop with an KirraGovernor selects different
 // kinematic contract profiles based on derived SafetyPosture, and that
 // this produces materially different clamping behavior for the same input.
 //
-// Confirmed Aegis profile values (surveyed from
-// aegis_runtime_sdk::gateway::kinematics_contract):
+// Confirmed Kirra profile values (surveyed from
+// kirra_runtime_sdk::gateway::kinematics_contract):
 // - nominal_reference_profile().max_speed_mps == 35.0
 // - mrc_fallback_profile().max_speed_mps == 5.0
 
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use parko_aegis::AegisGovernor;
+use parko_kirra::KirraGovernor;
 use parko_core::{
     backend::{
         BackendCapabilities, BackendError, InferenceBackend, ModelHandle,
@@ -91,7 +91,7 @@ fn make_loop() -> (
     };
     let (tx, rx) = mpsc::channel(8);
     let control = ControlLoop::new(backend, model, stream, tx, 20.0)
-        .with_governor(Box::new(AegisGovernor::new()));
+        .with_governor(Box::new(KirraGovernor::new()));
     (control, rx)
 }
 

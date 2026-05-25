@@ -1,6 +1,6 @@
 // src/kinematics_sim.rs
 //
-// Kinematic forward simulator for Aegis safety verification.
+// Kinematic forward simulator for Kirra safety verification.
 //
 // PURPOSE
 // =======
@@ -20,7 +20,7 @@
 //
 //   let mut state = VehicleState::at_rest();
 //   for cmd in command_sequence {
-//       let enforced = enforce(cmd, &contract);  // Aegis enforcement
+//       let enforced = enforce(cmd, &contract);  // Kirra enforcement
 //       state = state.step(&enforced, DT);
 //       assert!(state.lateral_accel_mps2(contract.wheelbase_m)
 //               <= contract.max_lateral_accel_mps2 + FLOAT_EPSILON);
@@ -112,7 +112,7 @@ impl VehicleState {
     ///
     /// The command is applied as-is — this is the post-enforcement state.
     /// Callers should pass the result of `apply_enforcement()` rather than
-    /// raw planner output to test that Aegis enforcement keeps the vehicle
+    /// raw planner output to test that Kirra enforcement keeps the vehicle
     /// within physical bounds.
     ///
     /// # Arguments
@@ -192,7 +192,7 @@ impl VehicleState {
 // Enforcement application
 // ---------------------------------------------------------------------------
 
-/// Applies Aegis enforcement to a proposed command and returns the
+/// Applies Kirra enforcement to a proposed command and returns the
 /// post-enforcement command ready for simulation.
 ///
 /// - `Allow`        → command passes through unchanged
@@ -251,11 +251,11 @@ pub struct SimulationResult {
     pub violation_description: Option<String>,
 }
 
-/// Runs a sequence of proposed commands through Aegis enforcement and the
+/// Runs a sequence of proposed commands through Kirra enforcement and the
 /// kinematic forward simulator.
 ///
 /// For each command:
-///   1. Applies Aegis enforcement (`validate_vehicle_command`)
+///   1. Applies Kirra enforcement (`validate_vehicle_command`)
 ///   2. Steps the vehicle state forward using the bicycle model
 ///   3. Checks physical invariants against the contract
 ///   4. Records statistics

@@ -1,10 +1,10 @@
-use parko_aegis::AegisGovernor;
+use parko_kirra::KirraGovernor;
 use parko_core::commands::ControlCommand;
 use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 
 #[test]
 fn nominal_governor_allows_low_velocity_command() {
-    let governor = AegisGovernor::nominal();
+    let governor = KirraGovernor::nominal();
     let cmd = ControlCommand {
         linear_velocity: 0.1,
         angular_velocity: 0.0,
@@ -19,7 +19,7 @@ fn nominal_governor_allows_low_velocity_command() {
 
 #[test]
 fn nominal_governor_clamps_excessive_velocity_command() {
-    let governor = AegisGovernor::nominal();
+    let governor = KirraGovernor::nominal();
 
     // 65.0 m/s is intentionally absurd (140 mph). Whatever
     // nominal_reference_profile's max_linear_velocity is, it will be less
@@ -57,7 +57,7 @@ fn nominal_governor_clamps_excessive_velocity_command() {
 
 #[test]
 fn mrc_fallback_governor_constructs_and_evaluates() {
-    let governor = AegisGovernor::mrc_fallback();
+    let governor = KirraGovernor::mrc_fallback();
     let cmd = ControlCommand {
         linear_velocity: 0.1,
         angular_velocity: 0.0,

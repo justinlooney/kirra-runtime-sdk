@@ -249,7 +249,7 @@ pub fn increment_recovery_streak(&self, node_id: &str, now_ms: u64) -> rusqlite:
 // Updated handle_sensor_fault_report using hysteresis module
 // ---------------------------------------------------------------------------
 //
-// Apply this to src/bin/aegis_verifier_service.rs, replacing the existing
+// Apply this to src/bin/kirra_verifier_service.rs, replacing the existing
 // handle_sensor_fault_report implementation.
 //
 // Key changes from the milestone doc version:

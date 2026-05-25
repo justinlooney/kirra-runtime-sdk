@@ -1,13 +1,13 @@
-// src/bin/aegis_ros2_publisher.rs
-// ROS2 publisher for Aegis-filtered twist commands.
+// src/bin/kirra_ros2_publisher.rs
+// ROS2 publisher for Kirra-filtered twist commands.
 // Build with: cargo build --features ros2
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "ros2")]
     {
-        use aegis_runtime_sdk::kinematics_contract::KinematicContract;
-        use aegis_runtime_sdk::robotics_alignment::AlignmentBridge;
-        use aegis_runtime_sdk::dds_bridge::DdsPublisherBridge;
+        use kirra_runtime_sdk::kinematics_contract::KinematicContract;
+        use kirra_runtime_sdk::robotics_alignment::AlignmentBridge;
+        use kirra_runtime_sdk::dds_bridge::DdsPublisherBridge;
 
         let contract = KinematicContract {
             max_linear_velocity: 2.0,
@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let context = rclrs::Context::new(std::env::args())?;
-        let node = rclrs::create_node(&context, "aegis_twist_publisher")?;
+        let node = rclrs::create_node(&context, "kirra_twist_publisher")?;
 
         let qos_policy = rclrs::QoSProfile {
             durability: rclrs::DurabilityPolicy::Volatile,

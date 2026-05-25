@@ -27,14 +27,14 @@
 
 use std::sync::Arc;
 
-use aegis_runtime_sdk::verifier::{AppState, FleetPosture, NodeTrustState, VerifierOperationMode};
-use aegis_runtime_sdk::posture_cache::{CachedFleetPosture, SharedPostureCache};
-use aegis_runtime_sdk::scenario_runner::{
+use kirra_runtime_sdk::verifier::{AppState, FleetPosture, NodeTrustState, VerifierOperationMode};
+use kirra_runtime_sdk::posture_cache::{CachedFleetPosture, SharedPostureCache};
+use kirra_runtime_sdk::scenario_runner::{
     PostureAssertion, ScenarioEvent, ScenarioRunner,
 };
-use aegis_runtime_sdk::clock::{Clock, VirtualClock};
-use aegis_runtime_sdk::recovery_hysteresis::AV_RECOVERY_STREAK_THRESHOLD;
-use aegis_runtime_sdk::posture_engine::POSTURE_CACHE_TTL_MS;
+use kirra_runtime_sdk::clock::{Clock, VirtualClock};
+use kirra_runtime_sdk::recovery_hysteresis::AV_RECOVERY_STREAK_THRESHOLD;
+use kirra_runtime_sdk::posture_engine::POSTURE_CACHE_TTL_MS;
 
 // ---------------------------------------------------------------------------
 // Test infrastructure helpers
@@ -54,7 +54,7 @@ async fn build_av_test_infrastructure() -> (
     SharedPostureCache,
     Arc<VirtualClock>,
 ) {
-    use aegis_runtime_sdk::verifier_store::VerifierStore;
+    use kirra_runtime_sdk::verifier_store::VerifierStore;
 
     let store = VerifierStore::new(":memory:").expect("in-memory store");
     let app = Arc::new(AppState::new(store, VerifierOperationMode::Active));
@@ -91,7 +91,7 @@ async fn build_av_test_infrastructure() -> (
     // Initialize all nodes as Trusted in the DashMap
     for node_id in &["lidar_front", "camera_front", "gps_primary",
                      "perception_fusion", "trajectory_planner"] {
-        app.nodes.insert(node_id.to_string(), aegis_runtime_sdk::verifier::RegisteredNode {
+        app.nodes.insert(node_id.to_string(), kirra_runtime_sdk::verifier::RegisteredNode {
             node_id: node_id.to_string(),
             status: NodeTrustState::Trusted,
             registered_at_ms: 0,

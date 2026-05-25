@@ -1,10 +1,10 @@
 [package]
-name = "aegis-runtime-sdk"
+name = "kirra-runtime-sdk"
 version = "1.5.0"
 edition = "2021"
 
 [lib]
-name = "aegis_runtime_sdk"
+name = "kirra_runtime_sdk"
 crate-type = ["rlib", "cdylib"]
 
 [features]
@@ -45,18 +45,18 @@ name = "ai_robot_sim_diagnostic"
 path = "src/bin/ai_robot_sim_diagnostic.rs"
 
 [[bin]]
-name = "aegis_ros2_demo_node"
+name = "kirra_ros2_demo_node"
 path = "src/bin/aegis_ros2_demo_node.rs"
 
 [[bin]]
-name = "aegis_ros2_publisher"
+name = "kirra_ros2_publisher"
 path = "src/bin/aegis_ros2_publisher.rs"
 required-features = ["ros2"]
 
 [[bin]]
-name = "aegis_verifier_service"
+name = "kirra_verifier_service"
 path = "src/bin/aegis_verifier_service.rs"
 
 [[bin]]
-name = "aegis_carla_client"
+name = "kirra_carla_client"
 path = "src/bin/aegis_carla_client.rs"

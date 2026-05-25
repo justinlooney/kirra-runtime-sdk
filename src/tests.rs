@@ -1,6 +1,6 @@
 // src/tests.rs
 
-use crate::aegis_core::{AegisKernelGovernor, ContractProfile};
+use crate::kirra_core::{KirraKernelGovernor, ContractProfile};
 use crate::kinematics_contract::KinematicContract;
 use crate::{AgentAction, ActionResolution};
 use crate::action_filter::ActionFilter;
@@ -28,7 +28,7 @@ fn generate_valid_test_profile() -> ContractProfile {
 #[test]
 fn test_unrestricted_autonomy_envelope_limit_clamping() {
     let profile = generate_valid_test_profile();
-    let mut gov = AegisKernelGovernor::new(profile, 1500.0, 1100.0, 2000.0);
+    let mut gov = KirraKernelGovernor::new(profile, 1500.0, 1100.0, 2000.0);
     let res = gov.evaluate(4500.0, 1.0);
     assert_eq!(res.sanitized_scalar, 3000.0);
     assert!(res.was_unsafe_attempt);
@@ -54,7 +54,7 @@ fn test_action_filter_leverages_dynamic_contract_angular_bounds() {
         max_linear_acceleration: 0.1,
         fallback_linear_speed: 0.0,
     };
-    let mut gov = AegisKernelGovernor::new(contract, 0.0, -0.5, 0.5);
+    let mut gov = KirraKernelGovernor::new(contract, 0.0, -0.5, 0.5);
     let filter = ActionFilter::new(contract);
 
     let over_rotation = AgentAction::Rotate { angular_velocity: 0.8 };
@@ -407,7 +407,7 @@ use crate::verifier::VerifierOperationMode;
 
 #[test]
 fn test_verifier_mode_active_by_default() {
-    // Without AEGIS_VERIFIER_MODE set, mode must be Active.
+    // Without KIRRA_VERIFIER_MODE set, mode must be Active.
     // We can't unset env vars safely in parallel tests, so test the parser directly.
     let mode = match "".to_ascii_lowercase().as_str() {
         "passive" | "passive_standby" | "standby" => VerifierOperationMode::PassiveStandby,

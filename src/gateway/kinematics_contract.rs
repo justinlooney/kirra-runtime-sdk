@@ -1,6 +1,6 @@
 // src/gateway/kinematics_contract.rs
 //
-// Deterministic vehicle kinematics safety contract for Aegis AV flight envelope protection.
+// Deterministic vehicle kinematics safety contract for Kirra AV flight envelope protection.
 //
 // This module answers exactly one question: "Is this proposed vehicle command physically
 // safe to execute on this platform, given the current kinematic state?"
@@ -9,7 +9,7 @@
 // returns immediately. See docs/kinematics_envelope_protection.md for the full spec.
 //
 // Security invariants respected:
-//   - No interaction with AEGIS_ADMIN_TOKEN or any auth primitives (wrong layer)
+//   - No interaction with KIRRA_ADMIN_TOKEN or any auth primitives (wrong layer)
 //   - No DDS/ROS2 publishing (ros2_adapter.rs owns NaN/Inf rejection for that path)
 //   - LockedOut handling belongs to the calling policy layer
 //   - All arithmetic is deterministic; no RNG, no I/O, no async

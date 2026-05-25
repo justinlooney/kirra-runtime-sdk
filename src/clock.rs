@@ -40,7 +40,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `VirtualClock`.
 ///
 /// All timestamps are milliseconds since the UNIX epoch (u64), consistent
-/// with the rest of the Aegis codebase.
+/// with the rest of the Kirra codebase.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
