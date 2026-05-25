@@ -1,6 +1,6 @@
 use parko_aegis::AegisGovernor;
 use parko_core::commands::ControlCommand;
-use parko_core::safety::{EnforcementAction, SafetyGovernor};
+use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 
 #[test]
 fn nominal_governor_allows_low_velocity_command() {
@@ -10,7 +10,7 @@ fn nominal_governor_allows_low_velocity_command() {
         angular_velocity: 0.0,
         timestamp_ms: 0,
     };
-    let action = governor.evaluate(&cmd, None, 0.05);
+    let action = governor.evaluate(&cmd, None, 0.05, SafetyPosture::Nominal);
     match action {
         EnforcementAction::Allow => {}
         other => panic!("expected Allow for low velocity, got {:?}", other),
@@ -29,7 +29,7 @@ fn nominal_governor_clamps_excessive_velocity_command() {
         angular_velocity: 0.0,
         timestamp_ms: 0,
     };
-    let action = governor.evaluate(&cmd, None, 0.05);
+    let action = governor.evaluate(&cmd, None, 0.05, SafetyPosture::Nominal);
 
     match action {
         EnforcementAction::ClampLinearVelocity(clamped) => {
@@ -63,7 +63,7 @@ fn mrc_fallback_governor_constructs_and_evaluates() {
         angular_velocity: 0.0,
         timestamp_ms: 0,
     };
-    let action = governor.evaluate(&cmd, None, 0.05);
+    let action = governor.evaluate(&cmd, None, 0.05, SafetyPosture::Nominal);
     // We don't assert what MRC does at 0.1 m/s; just that it doesn't panic
     // and returns *some* valid EnforcementAction.
     let _ = action;

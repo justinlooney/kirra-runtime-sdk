@@ -2,6 +2,20 @@
 
 use crate::commands::ControlCommand;
 
+/// Operational posture passed to safety governors. Parallel to but
+/// independent of any specific safety system's posture vocabulary.
+/// parko-core owns this type; adapter crates (e.g., parko-aegis) map
+/// it to their respective external types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyPosture {
+    /// Normal operation; full safety envelope.
+    Nominal,
+    /// Degraded operation; conservative safety envelope.
+    Degraded,
+    /// Locked out; all commands should result in safe stop.
+    LockedOut,
+}
+
 /// The action a safety governor decides to take on a proposed command.
 #[derive(Debug, Clone)]
 pub enum EnforcementAction {
@@ -32,6 +46,7 @@ pub trait SafetyGovernor: Send + Sync {
         proposed: &ControlCommand,
         previous: Option<&ControlCommand>,
         delta_time_s: f64,
+        posture: SafetyPosture,
     ) -> EnforcementAction;
 }
 
@@ -47,6 +62,7 @@ mod tests {
             _proposed: &ControlCommand,
             _previous: Option<&ControlCommand>,
             _delta_time_s: f64,
+            _posture: SafetyPosture,
         ) -> EnforcementAction {
             EnforcementAction::Allow
         }
@@ -60,6 +76,7 @@ mod tests {
             proposed: &ControlCommand,
             _previous: Option<&ControlCommand>,
             _delta_time_s: f64,
+            _posture: SafetyPosture,
         ) -> EnforcementAction {
             if proposed.linear_velocity > 1.0 {
                 EnforcementAction::ClampLinearVelocity(1.0)
@@ -77,7 +94,7 @@ mod tests {
             angular_velocity: 5.0,
             timestamp_ms: 0,
         };
-        match g.evaluate(&cmd, None, 0.05) {
+        match g.evaluate(&cmd, None, 0.05, SafetyPosture::Nominal) {
             EnforcementAction::Allow => {}
             other => panic!("expected Allow, got {:?}", other),
         }
@@ -91,7 +108,7 @@ mod tests {
             angular_velocity: 0.0,
             timestamp_ms: 0,
         };
-        match g.evaluate(&cmd, None, 0.05) {
+        match g.evaluate(&cmd, None, 0.05, SafetyPosture::Nominal) {
             EnforcementAction::ClampLinearVelocity(v) => {
                 assert_eq!(v, 1.0);
             }
@@ -107,7 +124,7 @@ mod tests {
             angular_velocity: 0.0,
             timestamp_ms: 0,
         };
-        match g.evaluate(&cmd, None, 0.05) {
+        match g.evaluate(&cmd, None, 0.05, SafetyPosture::Nominal) {
             EnforcementAction::Allow => {}
             other => panic!("expected Allow, got {:?}", other),
         }

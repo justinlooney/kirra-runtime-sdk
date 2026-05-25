@@ -9,7 +9,7 @@ use crate::backend::{BackendCapabilities, InferenceBackend, ModelHandle, Precisi
 use crate::commands::ControlCommand;
 use crate::sensor::SensorFrame;
 use crate::telemetry::{CumulativeJitterEvaluator, PostureSnapshot, RuntimeTelemetry, ThermalState};
-use crate::safety::{EnforcementAction, SafetyGovernor};
+use crate::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 
 /// Thresholds for degraded-mode detection.
 ///
@@ -87,7 +87,7 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
         self
     }
 
-    pub async fn tick(&mut self, current_frame: SensorFrame) -> Result<PostureSnapshot, String> {
+    pub async fn tick(&mut self, current_frame: SensorFrame, posture: SafetyPosture) -> Result<PostureSnapshot, String> {
         let loop_start_ms = crate::sensor::current_time_ms();
 
         // Flush previously validated command (frame N-1).
@@ -155,6 +155,7 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
                 &proposed_cmd,
                 self.last_validated_command.as_ref(),
                 self.tick_period_s,
+                posture,
             );
             match action {
                 EnforcementAction::Allow => proposed_cmd,
@@ -352,7 +353,7 @@ mod tests {
         }
     }
 
-    use crate::safety::{EnforcementAction, SafetyGovernor};
+    use crate::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 
     /// Test governor that always clamps linear velocity to 2.0 m/s.
     struct ClampToTwoGovernor;
@@ -362,6 +363,7 @@ mod tests {
             proposed: &ControlCommand,
             _previous: Option<&ControlCommand>,
             _delta_time_s: f64,
+            _posture: SafetyPosture,
         ) -> EnforcementAction {
             if proposed.linear_velocity > 2.0 {
                 EnforcementAction::ClampLinearVelocity(2.0)
@@ -381,8 +383,8 @@ mod tests {
             .with_governor(Box::new(ClampToTwoGovernor));
         let mut stream = SimpleStream { next_id: 0 };
 
-        let _ = loop_engine.tick(stream.next_frame().unwrap()).await.unwrap();
-        let snapshot = loop_engine.tick(stream.next_frame().unwrap()).await.unwrap();
+        let _ = loop_engine.tick(stream.next_frame().unwrap(), SafetyPosture::Nominal).await.unwrap();
+        let snapshot = loop_engine.tick(stream.next_frame().unwrap(), SafetyPosture::Nominal).await.unwrap();
 
         // Governor clamps 65.0 down to 2.0. Even though degraded-mode would
         // otherwise clamp to 1.5, the governor ran first and produced 2.0,
@@ -409,10 +411,10 @@ mod tests {
         let mut stream = SimpleStream { next_id: 0 };
 
         // First tick: fills last_validated_command, sends nothing yet.
-        let _ = loop_engine.tick(stream.next_frame().unwrap()).await.unwrap();
+        let _ = loop_engine.tick(stream.next_frame().unwrap(), SafetyPosture::Nominal).await.unwrap();
 
         // Second tick: sends previous command, computes a new clamped one.
-        let snapshot = loop_engine.tick(stream.next_frame().unwrap()).await.unwrap();
+        let snapshot = loop_engine.tick(stream.next_frame().unwrap(), SafetyPosture::Nominal).await.unwrap();
 
         assert!(snapshot.active_state_degraded, "expected degraded mode");
         assert!(snapshot.active_command.linear_velocity <= 1.5);

@@ -26,41 +26,53 @@ use aegis_runtime_sdk::gateway::kinematics_contract::{
 use aegis_runtime_sdk::verifier::FleetPosture;
 
 use parko_core::commands::ControlCommand;
-use parko_core::safety::{EnforcementAction, SafetyGovernor};
+use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 
 /// A safety governor backed by the Aegis runtime SDK's vehicle kinematics
 /// contract.
 ///
-/// Construct with a FleetPosture; the appropriate contract profile
-/// (nominal_reference_profile or mrc_fallback_profile) is selected based
-/// on the posture. To change posture between ticks, construct a new
-/// AegisGovernor instance.
+/// Holds both nominal and MRC fallback contract profiles and selects
+/// between them per-call based on the posture passed to `evaluate()`.
 pub struct AegisGovernor {
-    contract: VehicleKinematicsContract,
+    nominal_contract: VehicleKinematicsContract,
+    fallback_contract: VehicleKinematicsContract,
 }
 
 impl AegisGovernor {
-    /// Construct a governor with the Nominal contract profile.
+    /// Construct a governor that holds both nominal and MRC fallback
+    /// contract profiles and selects between them per-call based on
+    /// the posture passed to `evaluate()`.
+    pub fn new() -> Self {
+        Self {
+            nominal_contract: VehicleKinematicsContract::nominal_reference_profile(),
+            fallback_contract: VehicleKinematicsContract::mrc_fallback_profile(),
+        }
+    }
+
+    /// Construct a governor that uses the nominal profile regardless of
+    /// the posture passed to evaluate(). Kept for convenience and
+    /// backward compatibility.
     pub fn nominal() -> Self {
+        let profile = VehicleKinematicsContract::nominal_reference_profile();
         Self {
-            contract: VehicleKinematicsContract::nominal_reference_profile(),
+            nominal_contract: profile.clone(),
+            fallback_contract: profile,
         }
     }
 
-    /// Construct a governor with the MRC (Minimum Risk Condition) fallback
-    /// profile. This is more conservative than nominal and is appropriate
-    /// for degraded operation.
+    /// Construct a governor that uses the MRC fallback profile regardless
+    /// of the posture passed to evaluate(). Kept for convenience and
+    /// backward compatibility.
     pub fn mrc_fallback() -> Self {
+        let profile = VehicleKinematicsContract::mrc_fallback_profile();
         Self {
-            contract: VehicleKinematicsContract::mrc_fallback_profile(),
+            nominal_contract: profile.clone(),
+            fallback_contract: profile,
         }
     }
 
-    /// Construct a governor whose profile is selected by FleetPosture.
-    /// Nominal -> nominal_reference_profile; Degraded -> mrc_fallback_profile;
-    /// LockedOut -> mrc_fallback_profile (the kinematics contract is not the
-    /// right enforcement point for full lockout; the caller should not
-    /// route commands at all in LockedOut posture).
+    /// Backward-compatible posture-based constructor. Equivalent to
+    /// new() but kept for callers using the older API.
     pub fn for_posture(posture: FleetPosture) -> Self {
         match posture {
             FleetPosture::Nominal => Self::nominal(),
@@ -75,8 +87,14 @@ impl SafetyGovernor for AegisGovernor {
         proposed: &ControlCommand,
         previous: Option<&ControlCommand>,
         delta_time_s: f64,
+        posture: SafetyPosture,
     ) -> EnforcementAction {
         let current_velocity = previous.map(|p| p.linear_velocity).unwrap_or(0.0);
+
+        let contract = match posture {
+            SafetyPosture::Nominal => &self.nominal_contract,
+            SafetyPosture::Degraded | SafetyPosture::LockedOut => &self.fallback_contract,
+        };
 
         let aegis_input = ProposedVehicleCommand {
             linear_velocity_mps: proposed.linear_velocity,
@@ -88,20 +106,12 @@ impl SafetyGovernor for AegisGovernor {
             current_steering_angle_deg: 0.0,
         };
 
-        match validate_vehicle_command(&aegis_input, &self.contract) {
+        match validate_vehicle_command(&aegis_input, contract) {
             EnforceAction::Allow => EnforcementAction::Allow,
             EnforceAction::ClampLinear(safe_value) => {
                 EnforcementAction::ClampLinearVelocity(safe_value)
             }
-            EnforceAction::ClampSteering(_) => {
-                // The steering dimension is not bridged from parko. If Aegis
-                // returns ClampSteering for the zero steering input we sent,
-                // it indicates either a contract violation we did not cause
-                // or a contract profile that requires non-zero steering;
-                // treat as Allow for parko's purposes since the proposed
-                // command's angular_velocity was not the cause.
-                EnforcementAction::Allow
-            }
+            EnforceAction::ClampSteering(_) => EnforcementAction::Allow,
             EnforceAction::DenyBreach(reason) => EnforcementAction::Deny { reason },
         }
     }

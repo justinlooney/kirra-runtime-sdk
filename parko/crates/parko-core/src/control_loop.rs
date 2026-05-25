@@ -58,7 +58,12 @@ where
             return Err("sensor stream exhausted".to_string());
         };
 
-        let snapshot = self.inner.tick(current_frame).await?;
+        let safety_posture = match self.state {
+            RuntimeState::Nominal => crate::safety::SafetyPosture::Nominal,
+            RuntimeState::EmergencyStop => crate::safety::SafetyPosture::LockedOut,
+            _ => crate::safety::SafetyPosture::Degraded,
+        };
+        let snapshot = self.inner.tick(current_frame, safety_posture).await?;
 
         self.state = next_state(self.state, snapshot.active_state_degraded);
 
