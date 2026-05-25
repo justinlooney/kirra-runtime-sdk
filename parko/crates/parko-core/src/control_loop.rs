@@ -50,7 +50,9 @@ where
         self.state
     }
 
-    #[cfg(test)]
+    /// Force the state machine to a specific state. Test-only — bypasses
+    /// the normal transition logic. The "for_test" naming substitutes for
+    /// compile-time gating; do not call this outside of test contexts.
     pub fn set_state_for_test(&mut self, state: RuntimeState) {
         self.state = state;
     }
