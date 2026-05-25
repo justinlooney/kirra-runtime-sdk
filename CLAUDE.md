@@ -7,7 +7,7 @@
 - **Primary binary**: `kirra_verifier_service` (`src/bin/kirra_verifier_service.rs`)
 - **Secondary binary**: `kirra_carla_client` (`src/bin/kirra_carla_client.rs`)
 - **Test suite**: `cargo test`
-- **Remote**: `justinlooney/kirra`
+- **Remote**: `justinlooney/kirra-runtime-sdk`
 
 ---
 
