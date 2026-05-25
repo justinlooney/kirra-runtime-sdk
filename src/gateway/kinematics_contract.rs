@@ -208,9 +208,23 @@ pub fn validate_vehicle_command(
     }
 
     // ------------------------------------------------------------------
-    // Priority 5: Steering rate ceiling
+    // Priority 5a: Absolute steering angle hard limit
+    // A commanded angle outside the physical rack limit is rejected
+    // regardless of how slowly it was approached. Must run before the
+    // rate check so that rate-limited outputs also respect this bound.
+    // ------------------------------------------------------------------
+    if cmd.steering_angle_deg.abs() > contract.max_steering_deg {
+        let clamped = contract.max_steering_deg * cmd.steering_angle_deg.signum();
+        return EnforceAction::ClampSteering(clamped);
+    }
+
+    // ------------------------------------------------------------------
+    // Priority 5b: Steering rate ceiling
     // Prevents instantaneous full-lock transitions the physical rack
     // cannot achieve and that produce violent lateral load transfer.
+    // The rate-limited result is additionally clamped to the absolute
+    // steering limit so that a high current angle never produces a
+    // ClampSteering value outside the rack envelope.
     // ------------------------------------------------------------------
     let steering_delta = cmd.steering_angle_deg - cmd.current_steering_angle_deg;
     let implied_steering_rate = steering_delta.abs() / cmd.delta_time_s;
@@ -219,6 +233,8 @@ pub fn validate_vehicle_command(
         let max_delta = contract.max_steering_rate_deg_s * cmd.delta_time_s;
         let safe_steering =
             cmd.current_steering_angle_deg + (max_delta * steering_delta.signum());
+        let safe_steering =
+            safe_steering.clamp(-contract.max_steering_deg, contract.max_steering_deg);
         return EnforceAction::ClampSteering(safe_steering);
     }
 
