@@ -1,10 +1,10 @@
 // src/federation_reconciliation.rs
 //
-// Generation-ordered federation reconciliation for Aegis multi-controller deployments.
+// Generation-ordered federation reconciliation for Kirra multi-controller deployments.
 //
 // WHAT THIS SOLVES
 // ================
-// Two Aegis controllers (A and B) independently observe the same asset fleet.
+// Two Kirra controllers (A and B) independently observe the same asset fleet.
 // Both receive sensor faults, run DAG traversals, and produce posture views.
 // Under network partition or clock skew their views can diverge:
 //
