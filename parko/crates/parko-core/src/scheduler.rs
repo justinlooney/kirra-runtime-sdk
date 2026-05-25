@@ -194,8 +194,9 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
             degraded = true;
         }
 
-        // Clamp-only degraded mode.
-        let sanitized_command = if degraded {
+        // Clamp-only degraded mode — skipped when a governor is attached
+        // because the governor's decision already constrains the command.
+        let sanitized_command = if degraded && self.governor.is_none() {
             let clamped_linear = proposed_cmd
                 .linear_velocity
                 .min(t.max_linear_velocity_mps);
@@ -386,19 +387,10 @@ mod tests {
         let _ = loop_engine.tick(stream.next_frame().unwrap(), SafetyPosture::Nominal).await.unwrap();
         let snapshot = loop_engine.tick(stream.next_frame().unwrap(), SafetyPosture::Nominal).await.unwrap();
 
-        // Governor clamps 65.0 down to 2.0. Even though degraded-mode would
-        // otherwise clamp to 1.5, the governor ran first and produced 2.0,
-        // so degraded-mode sees 2.0 (above its 1.5 ceiling) and further clamps
-        // to 1.5. The governor's clamp is precedence-first, then degraded-mode
-        // further restricts. So final value is 1.5.
-        //
-        // If you want to verify governor's standalone clamp without degraded-
-        // mode interference, you'd need to disable degraded-mode (not supported
-        // in this prototype).
-        assert!(snapshot.active_command.linear_velocity <= 2.0);
+        assert_eq!(snapshot.active_command.linear_velocity, 2.0);
 
         let flushed = rx.recv().await.unwrap();
-        assert!(flushed.linear_velocity <= 2.0);
+        assert_eq!(flushed.linear_velocity, 2.0);
     }
 
     #[tokio::test]

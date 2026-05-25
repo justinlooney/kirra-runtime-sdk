@@ -50,6 +50,19 @@ where
         self.state
     }
 
+    #[cfg(test)]
+    pub fn set_state_for_test(&mut self, state: RuntimeState) {
+        self.state = state;
+    }
+
+    pub fn with_governor(
+        mut self,
+        governor: Box<dyn crate::safety::SafetyGovernor>,
+    ) -> Self {
+        self.inner = self.inner.with_governor(governor);
+        self
+    }
+
     pub async fn tick(&mut self) -> Result<PostureSnapshot, String> {
         let _tick_status = self.clock.wait_for_next_tick().await;
 
