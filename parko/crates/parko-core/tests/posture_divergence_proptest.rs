@@ -4,17 +4,14 @@
 // within the Kirra profile velocity ceiling for each SafetyPosture. This is
 // the core correctness invariant for the governor integration.
 //
-// Kirra profile ceilings (kirra_runtime_sdk::gateway::kinematics_contract):
-//   Nominal  → nominal_reference_profile().max_speed_mps = 35.0
-//   Degraded → mrc_fallback_profile().max_speed_mps      = 5.0
-//   LockedOut → uses the same MRC fallback profile as Degraded (5.0)
+// KirraGovernor posture authority model:
+//   Nominal   → validate_vehicle_command (nominal profile, 35.0 m/s ceiling + rate limits)
+//   Degraded  → direct cap at MRC fallback ceiling (5.0 m/s), no rate limits
+//   LockedOut → hard stop (Deny → 0.0 m/s), regardless of proposed velocity
 //
-// Implementation note: the nominal profile has a tighter acceleration rate
-// limit than the fallback profile. For inputs between the two speed ceilings
-// (5.0–35.0 m/s) with previous=None, nominal output may be lower than
-// degraded output due to the stricter rate-of-change clamp. The properties
-// below test the per-posture speed ceiling invariant rather than cross-posture
-// ordering, which is not a simple monotonicity relationship.
+// The nominal profile also applies rate-of-change limits; with previous=None
+// the effective output is bounded by both the speed cap and the acceleration
+// limit over one tick period.
 //
 // Run with: cargo test -p parko-core
 
@@ -86,36 +83,35 @@ proptest! {
         );
     }
 
-    /// LockedOut posture: KirraGovernor maps LockedOut to the same MRC fallback
-    /// profile as Degraded. Output must not exceed the fallback ceiling (5.0 m/s).
+    /// LockedOut posture: KirraGovernor issues a hard stop (Deny). The effective
+    /// output must always be exactly 0.0 regardless of proposed velocity.
     #[test]
-    fn governor_locked_out_uses_fallback_profile_ceiling(
+    fn governor_locked_out_always_returns_zero(
         proposed in 0.0f64..=1000.0f64
     ) {
         prop_assume!(proposed.is_finite());
         let output = evaluate_governor(proposed, SafetyPosture::LockedOut);
-        prop_assert!(
-            output <= FALLBACK_CEILING_MPS,
-            "KirraGovernor LockedOut output {} > fallback ceiling {} for proposed {}",
-            output, FALLBACK_CEILING_MPS, proposed
+        prop_assert_eq!(
+            output, 0.0,
+            "KirraGovernor LockedOut must be 0.0 (hard stop), got {} for proposed {}",
+            output, proposed
         );
     }
 
-    /// LockedOut and Degraded share the same contract profile: for any input,
-    /// both postures must produce identical outputs (same speed cap and rate
-    /// limits apply). This verifies structural equivalence of the two postures
-    /// at the KirraGovernor level.
+    /// LockedOut is strictly more restrictive than Degraded: for any positive
+    /// proposed velocity, the LockedOut output (0.0) must be less than the
+    /// Degraded output (capped at MRC ceiling, > 0 when proposed > 0).
     #[test]
-    fn locked_out_and_degraded_produce_identical_outputs(
-        proposed in 0.0f64..=1000.0f64
+    fn locked_out_is_more_restrictive_than_degraded(
+        proposed in 0.001f64..=1000.0f64
     ) {
         prop_assume!(proposed.is_finite());
         let degraded_out = evaluate_governor(proposed, SafetyPosture::Degraded);
         let locked_out = evaluate_governor(proposed, SafetyPosture::LockedOut);
-        prop_assert_eq!(
-            degraded_out, locked_out,
-            "Degraded and LockedOut must use the same fallback contract (got {} vs {}) for proposed {}",
-            degraded_out, locked_out, proposed
+        prop_assert!(
+            locked_out < degraded_out,
+            "LockedOut ({}) must be < Degraded ({}) for proposed {}",
+            locked_out, degraded_out, proposed
         );
     }
 }
