@@ -17,14 +17,13 @@
 
 use proptest::prelude::*;
 
-use parko_kirra::KirraGovernor;
+use parko_kirra::{KirraGovernor, MRC_VELOCITY_CEILING_MPS};
 use parko_core::{
     commands::ControlCommand,
     safety::{EnforcementAction, SafetyGovernor, SafetyPosture},
 };
 
 const NOMINAL_CEILING_MPS: f64 = 35.0;
-const FALLBACK_CEILING_MPS: f64 = 5.0;
 
 /// Resolve the governor's EnforcementAction to a concrete linear velocity.
 fn effective_linear_velocity(action: EnforcementAction, proposed: f64) -> f64 {
@@ -68,32 +67,36 @@ proptest! {
         );
     }
 
-    /// Degraded posture: for any positive proposed velocity, the governor output
-    /// must not exceed the MRC fallback profile ceiling (5.0 m/s).
+    /// Degraded posture: output must equal exactly proposed.min(MRC_VELOCITY_CEILING_MPS).
+    /// A ceiling check (<=) is insufficient — the exact contract must hold.
     #[test]
-    fn governor_never_exceeds_degraded_profile_ceiling(
+    fn governor_degraded_applies_exact_mrc_contract(
         proposed in 0.0f64..=1000.0f64
     ) {
         prop_assume!(proposed.is_finite());
         let output = evaluate_governor(proposed, SafetyPosture::Degraded);
-        prop_assert!(
-            output <= FALLBACK_CEILING_MPS,
-            "KirraGovernor Degraded output {} > ceiling {} for proposed {}",
-            output, FALLBACK_CEILING_MPS, proposed
+        prop_assert_eq!(
+            output,
+            proposed.min(MRC_VELOCITY_CEILING_MPS),
+            "Degraded: expected min({}, {}), got {}",
+            proposed, MRC_VELOCITY_CEILING_MPS, output
         );
     }
 
-    /// LockedOut posture: KirraGovernor issues a hard stop (Deny). The effective
-    /// output must always be exactly 0.0 regardless of proposed velocity.
+    // LockedOut: hard stop — safety architecture has failed.
+    // Governor must return 0.0 for ALL inputs, no exceptions.
+    // This is categorically different from Degraded (MRC cap).
+    // Per ADL-001 (corrected after PARK-003 identified the bug).
     #[test]
     fn governor_locked_out_always_returns_zero(
         proposed in 0.0f64..=1000.0f64
     ) {
         prop_assume!(proposed.is_finite());
         let output = evaluate_governor(proposed, SafetyPosture::LockedOut);
-        prop_assert!(
-            output == 0.0,
-            "KirraGovernor LockedOut must be 0.0 (hard stop), got {} for proposed {}",
+        prop_assert_eq!(
+            output,
+            0.0,
+            "LockedOut must always produce hard stop (0.0), got {} for input {}",
             output, proposed
         );
     }
