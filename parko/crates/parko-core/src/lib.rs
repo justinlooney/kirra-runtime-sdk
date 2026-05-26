@@ -22,6 +22,7 @@ pub mod telemetry;
 
 pub use backend::{
     BackendCapabilities,
+    BackendDescriptor,
     BackendError,
     InferenceBackend,
     ModelHandle,
