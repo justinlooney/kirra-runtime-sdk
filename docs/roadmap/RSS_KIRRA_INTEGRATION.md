@@ -1,6 +1,6 @@
-# IEEE 2846 / RSS-Style Safety Extension for Aegis — Architecture Sketch and Execution Plan
+# IEEE 2846 / RSS-Style Safety Extension for Kirra — Architecture Sketch and Execution Plan
 
-**Status:** Pre-execution sketch. Drafted while QNX resource manager work is the active priority. Pick this up after the Apollo integration is shipped (or in parallel with it if you have the bandwidth, but QNX comes first).
+**Status:** Pre-execution sketch. This extension is now mapped to **Increment 3 — Behavioral Safety (PARK-013 through PARK-019)** in `/work/roadmap.md`. The phases described below are the detailed specification for those tasks. Current active work: PARK-001/002/003 (Increment 1). Do not start IEEE 2846 implementation until Increment 1 is tagged (PARK-006) and QNX is unblocked (PARK-024).
 
 **Audience:** You, future you, and any engineer who picks this up cold.
 
@@ -15,11 +15,11 @@
 
 ## 1. What this extension does
 
-Aegis today evaluates commands against a kinematic envelope: physical limits of the vehicle, bounded by mechanical capability and operator policy. It does not consider what's *around* the vehicle.
+Kirra today evaluates commands against a kinematic envelope: physical limits of the vehicle, bounded by mechanical capability and operator policy. It does not consider what's *around* the vehicle.
 
 This extension adds a second evaluation layer: **given what the AV stack's perception reports, does this command maintain safe distances and bounded responsibility relative to other actors?**
 
-The extension is *not* perception. Aegis still does not have its own sensors. It subscribes to the AV stack's perception output and validates commands against it. If perception is wrong, this layer is wrong. That limitation is fundamental and must be stated honestly in every customer-facing artifact.
+The extension is *not* perception. Kirra still does not have its own sensors. It subscribes to the AV stack's perception output and validates commands against it. If perception is wrong, this layer is wrong. That limitation is fundamental and must be stated honestly in every customer-facing artifact.
 
 What this catches:
 - Planner produces a colliding command despite perception correctly identifying the obstacle (planner bug)
@@ -29,13 +29,13 @@ What this catches:
 What this does NOT catch:
 - Perception missing an obstacle entirely (perception failure, out of scope)
 - Misclassification of obstacle type leading to wrong safety parameters (perception failure, out of scope)
-- Failures of physical actuators downstream of Aegis (actuator failure, separate safety layer)
+- Failures of physical actuators downstream of Kirra (actuator failure, separate safety layer)
 
 ---
 
 ## 2. Architectural placement
 
-The existing Aegis evaluation pipeline:
+The existing Kirra evaluation pipeline:
 
 ```
 Command in → [kinematic envelope check] → ValidatedCommand or SafetyFault
@@ -59,7 +59,7 @@ Both checks must pass for a command to be validated. Either failing produces a `
 
 - Preserves existing test coverage and pure-function discipline of the kinematic envelope
 - Isolates perception coupling to one module
-- Allows customers to deploy Aegis with or without the RSS layer depending on whether they expose perception data
+- Allows customers to deploy Kirra with or without the RSS layer depending on whether they expose perception data
 - Makes the IEEE 2846 conformance claim auditable in isolation
 
 The RSS evaluator produces new `SafetyFault` variants that map to new `LockoutReason` variants. The existing fault → audit → lockout pipeline absorbs them without changes.
@@ -104,7 +104,7 @@ pub enum ActorKind {
 }
 ```
 
-Then the AV-stack-specific bridge code (Apollo's `PerceptionObstacles`, Autoware's `PredictedObjects`, ROS2's whatever) transforms into this canonical type. The RSS evaluator only ever sees the canonical type. This isolates AV-stack churn from Aegis core.
+Then the AV-stack-specific bridge code (Apollo's `PerceptionObstacles`, Autoware's `PredictedObjects`, ROS2's whatever) transforms into this canonical type. The RSS evaluator only ever sees the canonical type. This isolates AV-stack churn from Kirra core.
 
 `MAX_ACTORS` is a compile-time bound for the no_std-friendly path. 64 is a defensible starting number (more than enough for any realistic intersection scene). Customers running on Linux with std can override to use `Vec` instead of `heapless::Vec` via a feature flag.
 
@@ -167,7 +167,7 @@ Tasks:
 Goals: define the `PerceptionSnapshot` data contract and write one AV-stack bridge (Apollo recommended, since the Apollo integration is the prior step).
 
 Tasks:
-1. Implement `PerceptionSnapshot`, `EgoState`, `TrackedActor`, `ActorKind` in `aegis_core_logic`
+1. Implement `PerceptionSnapshot`, `EgoState`, `TrackedActor`, `ActorKind` in `parko-core`
 2. Implement the Apollo `PerceptionObstacles` → `PerceptionSnapshot` transform in the Apollo bridge component (extending the bridge built during the Apollo integration phase)
 3. Add tests for the transform with sample protobuf inputs
 
@@ -208,23 +208,23 @@ Tasks:
 2. After the existing kinematic envelope check passes, run the RSS evaluator
 3. Translate RSS faults to `SafetyFault` variants
 4. Ensure audit chain captures the full `RssFault` detail
-5. Update the Apollo bridge to pass perception snapshots into Aegis evaluation
+5. Update the Apollo bridge to pass perception snapshots into Kirra evaluation
 
-**Done when:** end-to-end, an Apollo scenario where the planner produces a tailgating command results in an Aegis lockout with an audit entry that names the actor and the distance violation.
+**Done when:** end-to-end, an Apollo scenario where the planner produces a tailgating command results in an Kirra lockout with an audit entry that names the actor and the distance violation.
 
 ### Phase 5: Demo scenarios (2 weeks)
 
 Goals: 4-6 simulation scenarios that demonstrate the RSS layer catching specific failure modes.
 
 Scenario ideas:
-1. **High-speed tailgating** — planner closes to unsafe longitudinal distance at 30 m/s. Aegis blocks throttle, clamps to maintain safe distance.
-2. **Unsafe lane change** — planner commands a lane change into a gap that's too small at current closing speeds. Aegis rejects.
-3. **Pedestrian within RSS exclusion zone** — perception reports a pedestrian within a kinematically reachable zone. Aegis enforces a hard speed cap.
-4. **Cyclist in adjacent lane** — different ActorKind triggers different RSS parameters; Aegis enforces wider lateral margin than for a vehicle.
-5. **Cut-in scenario** — another vehicle cuts in front of ego; Aegis enforces emergency braking response within IEEE 2846 assumed response time.
-6. **Perception confidence threshold** — low-confidence detection (confidence < 0.6); Aegis treats it conservatively but distinguishes from high-confidence detection in audit chain.
+1. **High-speed tailgating** — planner closes to unsafe longitudinal distance at 30 m/s. Kirra blocks throttle, clamps to maintain safe distance.
+2. **Unsafe lane change** — planner commands a lane change into a gap that's too small at current closing speeds. Kirra rejects.
+3. **Pedestrian within RSS exclusion zone** — perception reports a pedestrian within a kinematically reachable zone. Kirra enforces a hard speed cap.
+4. **Cyclist in adjacent lane** — different ActorKind triggers different RSS parameters; Kirra enforces wider lateral margin than for a vehicle.
+5. **Cut-in scenario** — another vehicle cuts in front of ego; Kirra enforces emergency braking response within IEEE 2846 assumed response time.
+6. **Perception confidence threshold** — low-confidence detection (confidence < 0.6); Kirra treats it conservatively but distinguishes from high-confidence detection in audit chain.
 
-Each scenario gets a side-by-side recording (Apollo alone vs. Apollo + Aegis + RSS) and a one-page analysis.
+Each scenario gets a side-by-side recording (Apollo alone vs. Apollo + Kirra + RSS) and a one-page analysis.
 
 **Done when:** you have 4-6 scenarios with comparative recordings and analyses.
 
@@ -238,7 +238,7 @@ Goals: the public artifact. See section 7 below for the outline.
 
 **Latency budget.** The RSS evaluator runs on every command in the control loop. With perception of 30+ actors and IEEE 2846 calculations per actor, this is non-trivial work. Benchmark early. Target: well under 5ms on the deployment hardware. If you can't hit it, scope cuts: limit max actors evaluated, prioritize closest actors, downsample evaluation rate.
 
-**Perception staleness.** A perception snapshot is a snapshot. By the time Aegis evaluates against it, the snapshot is 10-50ms old. RSS calculations must account for the time delta between snapshot timestamp and evaluation time, propagating actor positions forward. Get this wrong and you'll have spurious violations near the perception cycle boundary.
+**Perception staleness.** A perception snapshot is a snapshot. By the time Kirra evaluates against it, the snapshot is 10-50ms old. RSS calculations must account for the time delta between snapshot timestamp and evaluation time, propagating actor positions forward. Get this wrong and you'll have spurious violations near the perception cycle boundary.
 
 **Parameter calibration is harder than the math.** IEEE 2846 specifies what assumptions to make; it doesn't tell you the numbers. Choosing assumed response time 0.5s vs 1.0s changes behavior dramatically. Conservative parameters mean frequent interventions (annoying); aggressive parameters mean missed violations (unsafe). There is no universally correct value. Document your choices and let customers override.
 
@@ -258,7 +258,7 @@ Goals: the public artifact. See section 7 below for the outline.
 
 ## 7. Writeup outline
 
-Title (working): **Vendor-Neutral IEEE 2846 Safety Governance: Adding Behavioral Safety Invariants to Aegis**
+Title (working): **Vendor-Neutral IEEE 2846 Safety Governance: Adding Behavioral Safety Invariants to Kirra**
 
 Target venue: blog post first, then a workshop submission to IV (Intelligent Vehicles), ITSC (Intelligent Transportation Systems), or SafeAI workshop. If the Apollo writeup exists, this is its sequel.
 
@@ -274,11 +274,11 @@ Target venue: blog post first, then a workshop submission to IV (Intelligent Veh
 2. **Why IEEE 2846 and not RSS directly** (400 words)
    - RSS's contribution: a formal model for assumptions about other actors
    - IEEE 2846's role: standards-body formalization of those assumptions, patent-clean
-   - What Aegis implements: IEEE 2846 conformance with transparent enforcement
-   - What Aegis explicitly does NOT claim: "improvement on" RSS or novel safety theory
+   - What Kirra implements: IEEE 2846 conformance with transparent enforcement
+   - What Kirra explicitly does NOT claim: "improvement on" RSS or novel safety theory
 
 3. **The architectural placement** (500 words plus diagrams)
-   - Existing Aegis kinematic envelope check
+   - Existing Kirra kinematic envelope check
    - Added RSS evaluator as a separate module
    - Perception data contract (`PerceptionSnapshot`)
    - Bridge from AV-stack-specific perception (Apollo example)
@@ -297,7 +297,7 @@ Target venue: blog post first, then a workshop submission to IV (Intelligent Veh
 
 6. **Demo scenarios** (1000-1500 words)
    - 4-6 scenarios from Phase 5
-   - Side-by-side: Apollo alone vs. Apollo + Aegis + RSS
+   - Side-by-side: Apollo alone vs. Apollo + Kirra + RSS
    - Audit chain entries showing the transparency value
 
 7. **Honest limitations** (500 words)
@@ -355,7 +355,7 @@ Scope cuts if you need to ship faster:
 
 When this is done, you have:
 
-1. An RSS evaluator module in `aegis_core_logic` with comprehensive unit tests
+1. An RSS evaluator module in `parko-core` with comprehensive unit tests
 2. A canonical `PerceptionSnapshot` data contract
 3. An Apollo perception bridge (extending the Apollo integration's bridge)
 4. Parameter packs for at least one ODD
@@ -370,17 +370,22 @@ The eighth item is the business value. Everything else is supporting evidence.
 
 ## 10. When to pick this up
 
-Do not start this until:
+This maps to **Increment 3** in `/work/roadmap.md` (PARK-013 through PARK-019). Do not start until:
 
-1. QNX resource manager has shipped
-2. TPM integration has shipped
-3. v1.0.5 is tagged
-4. Robot has arrived and the ROS2 interlock demo is on record
-5. WeRide architecture doc is delivered
-6. Apollo integration is complete (or at least Phase 2 of the Apollo integration is complete)
+1. **PARK-001–006** — Increment 1 complete (parko-core v0.1.0 tagged)
+2. **PARK-007–012** — Increment 2 complete (InferenceBackend finalized, MockBackend in place)
+3. **PARK-024** — QNX deployment spike resolved (TIME-SENSITIVE — do not let this block unrelated work, but it must not be abandoned)
 
-This is item 7 on the priority stack. There is no scenario in which RSS extension is more urgent than QNX. If you find yourself wanting to start this before QNX ships, recognize that as a procrastination signal and go back to QNX.
+PARK-to-phase mapping:
+- Phase 0 (read standard) → prerequisite for PARK-013
+- Phase 1 (canonical types) → maps to `PerceptionSnapshot` struct in parko-core
+- Phase 2 (evaluator core) → PARK-013 (longitudinal) + PARK-014 (lateral)
+- Phase 3 (parameter calibration) → part of PARK-013/014 acceptance criteria
+- Phase 4 (governor integration) → PARK-015 (posture engine) + PARK-016 (KirraGovernor gate)
+- Proptest suite → PARK-017
+- Audit chain → PARK-018
+- Simulation scenarios → PARK-019
 
-The reason this is item 7 and not item 2: the RSS extension adds value to a product that's already valuable. The QNX, TPM, and partnership work converts existing product value into business outcomes. Capability extensions before business conversion is the classic technical-founder failure mode. Don't do it.
+There is no scenario in which RSS extension is more urgent than QNX. If you find yourself wanting to start this before PARK-024 ships, recognize that as a procrastination signal and go back to QNX.
 
 When you do start, the first action is buying IEEE 2846 and reading it. Not coding. Reading. Two weeks of phase 0 prevents three months of phase 2 rework.

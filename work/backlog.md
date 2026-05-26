@@ -1,67 +1,80 @@
 # Backlog
 
-> 40 tasks derived from the roadmap. Every coding task includes a Claude Code
-> Prompt ready to paste. Framing is corrected: hardware backends are first
-> implementations; IEEE 2846 / IEC 61508 / ASTM F3269 integrations are new
-> work, not refinements. The CPU ONNX backend (parko-onnx) already exists.
-> kirra-runtime-sdk holds ~333 tests; parko-core has its own separate test suite.
+> ~40 tasks derived from the roadmap. Every coding task includes a self-contained
+> Claude Code Prompt. Framing is corrected: all hardware backends beyond CPU ONNX
+> are new work; IEEE 2846 / IEC 61508 / ASTM F3269 integrations are new work, not
+> refinements; parko-core has ~30–40 tests (not 333); the MNIST integration test
+> must be verified, not assumed green; the governor crate name must be searched
+> before any rename task is written.
 
 ---
 
-## PARK-001 `control-loop` `feat` `epic:runtime-core`
+## PARK-001 `control-loop` `feat`
 
 **Attach `SafetyGovernor` to `ControlLoop`**
 
 Add `with_governor(impl SafetyGovernor + 'static)` builder to `ControlLoop` in
 `parko-core`. The governor is stored as `Option<Box<dyn SafetyGovernor>>`. When
-present, the built-in scalar clamp is suppressed — both enforcement paths must
-not run on the same tick. This is the foundation for the Kirra governor crate's
+present, the built-in scalar clamp is suppressed entirely — both enforcement paths
+must not fire on the same tick. This is the foundation for KirraGovernor's
 integration with the parko-core inference loop.
 
 ### Claude Code Prompt
 ```
-You are working in the parko-core crate. The file to edit is
-parko-core/src/control_loop.rs (or the equivalent entry point).
+You are working in the parko-core crate. Before writing any code, search the
+workspace for the actual crate and struct names:
 
-Task: Add a `with_governor` builder method to `ControlLoop`.
+  find parko/ -name "*.toml" | xargs grep -l "\[package\]"
+  grep -r "SafetyGovernor\|Governor\|AegisGovernor\|KirraGovernor" parko/ --include="*.rs" -l
+
+If the governor struct is named AegisGovernor or similar, rename it to KirraGovernor
+in the same commit. Use Kirra naming in all new comments and docs.
+
+Task: Add `with_governor` builder to ControlLoop in parko-core/src/control_loop.rs.
 
 Requirements:
 1. Add field: governor: Option<Box<dyn SafetyGovernor>> to ControlLoop struct.
 2. Add method: pub fn with_governor(mut self, g: impl SafetyGovernor + 'static) -> Self
-3. In tick(): if self.governor.is_some() { skip built-in clamp; delegate to governor }
+3. In tick(): if self.governor.is_some() { delegate to governor, skip built-in clamp }
               else { run built-in clamp as before }
-4. SafetyGovernor trait (if not yet defined) lives in parko-core/src/governor.rs:
+4. SafetyGovernor trait (if not yet defined) in parko-core/src/governor.rs:
      pub trait SafetyGovernor: Send + Sync {
          fn enforce(&self, proposed: f64, posture: PostureState) -> f64;
      }
 5. Write test test_builtin_clamp_suppressed:
-   - Create a ZeroGovernor that always returns 0.0.
+   - ZeroGovernor always returns 0.0.
    - Inject via with_governor.
-   - Call tick with a value above the built-in clamp threshold.
-   - Assert result == 0.0 (governor wins, not clamped by built-in).
+   - Call tick with value above built-in clamp threshold.
+   - Assert result == 0.0.
 6. Write test test_no_governor_uses_builtin_clamp:
-   - Create ControlLoop without governor.
-   - Call tick with a value above the clamp threshold.
+   - No governor injected.
+   - Call tick with value above clamp threshold.
    - Assert result == clamped value.
-7. All existing parko-core tests must continue to pass.
+7. Run `cargo test -p parko-core` — confirm exit 0.
+   Do NOT assume any specific test count.
+   Do NOT assume the MNIST integration test is passing.
 8. No unsafe code.
-9. Run `cargo test -p parko-core` and confirm exit 0.
 ```
 
 ---
 
-## PARK-002 `control-loop` `feat` `epic:runtime-core`
+## PARK-002 `control-loop` `feat`
 
 **Add test-only posture state setter**
 
 Add `set_state_for_test(state: PostureState)` to `ControlLoop` in `parko-core`
-behind `#[cfg(test)]`. This is a test seam — it sets internal posture state
-directly without transition validation. It must be absent from release builds
-(verified with `nm`) and present only when running tests.
+behind `#[cfg(test)]`. This is a pure test seam — it mutates internal posture state
+directly without transition validation, unblocking posture-divergence property tests.
+The method must be absent from release builds (verified with `nm`) and present only
+when running tests.
 
 ### Claude Code Prompt
 ```
 In parko-core/src/control_loop.rs, add a cfg(test) method to ControlLoop.
+
+Before writing code, search for the actual governor struct name:
+  grep -r "AegisGovernor\|KirraGovernor\|Governor" parko/ --include="*.rs" -l
+Use Kirra naming in all new comments.
 
 Requirements:
 1. Add this block to the ControlLoop impl:
@@ -70,59 +83,69 @@ Requirements:
          self.posture_state = state;
      }
 2. Do not modify any production code paths.
-3. Write a test in parko-core/tests/ that:
+3. Write a test that:
    - Creates a ControlLoop.
    - Calls set_state_for_test(PostureState::Degraded).
-   - Calls tick and asserts the output is consistent with Degraded behaviour.
-4. After a release build, run:
+   - Calls tick and asserts output consistent with Degraded behaviour.
+4. After release build, run:
      nm target/release/<binary> | grep set_state_for_test
-   and confirm the output is empty.
-5. cargo test -p parko-core must exit 0.
-6. Do not add this method to any non-test module or feature-flagged path.
+   Confirm output is empty. Locate binary name from workspace Cargo.toml.
+5. cargo test -p parko-core exits 0.
+   Do NOT assume any specific test count.
+6. No unsafe code.
 ```
 
 ---
 
-## PARK-003 `control-loop` `test` `epic:runtime-core`
+## PARK-003 `control-loop` `test`
 
-**Posture divergence property test**
+**Write posture divergence property test**
 
-Proptest suite: for all valid `(proposed_output: f64, posture_state: PostureState)`,
-the Kirra governor result must be at least as conservative as the built-in clamp.
-This is the core correctness invariant for the governor integration. Uses
-`set_state_for_test` from PARK-002 to drive posture states in the property loop.
+Proptest suite: for all valid `(proposed_output: f64, posture_state: PostureState)`
+pairs, the KirraGovernor output is at least as conservative as the built-in clamp
+ceiling. This is the core correctness invariant for the governor integration. Depends
+on PARK-002 for posture state injection; requires ≥ 10,000 cases per PostureState
+variant.
 
 ### Claude Code Prompt
 ```
-Create parko-core/tests/posture_divergence.rs.
+PARK-002 must be complete before this task.
+You are working in the parko-core crate.
+
+Before writing code, verify the actual governor crate name:
+  find parko/ -name "*.toml" | xargs grep -l "\[package\]"
+  grep -r "impl.*SafetyGovernor\|KirraGovernor\|AegisGovernor" parko/ --include="*.rs"
+
+Task: Write proptest suite asserting governor output <= builtin clamp ceiling.
 
 Requirements:
 1. Add proptest = "1" to parko-core dev-dependencies if not present.
-2. Generate (proposed: f64, state: PostureState) filtered to exclude NaN/Inf.
-3. For each pair:
-   a. Run proposed through ControlLoop without governor → builtin_result.
-   b. Use set_state_for_test to inject state; run through Kirra governor
-      (via the Kirra governor crate's SafetyGovernor impl) → governor_result.
-   c. For Nominal/Degraded: assert governor_result <= builtin_result.
-   d. For LockedOut: assert governor_result == 0.0 (or EnforcementAction::Halt).
-4. proptest config: cases = 10_000.
-5. Three separate proptest! blocks — one per PostureState variant.
-6. No new non-dev dependencies.
-7. Run `cargo test -p parko-core -- --test-threads=1` to confirm all pass.
-Note: Do not assume 333 tests exist in parko-core; only rely on tests you can
-verify exist in the parko-core test suite.
+2. Create parko-core/tests/posture_divergence.rs.
+3. Expose in parko-core/src/control_loop.rs:
+     pub(crate) fn builtin_clamp_ceiling(proposed: f64, state: PostureState) -> f64
+   Must return exact ceiling the built-in clamp applies — not a copy.
+4. Three proptest! blocks (one per PostureState variant):
+   - Nominal/Degraded: prop_assert!(gov_out <= ceiling)
+   - LockedOut: prop_assert!(gov_out == 0.0)
+5. cases = 10_000 per block.
+6. Add governor crate as dev-dependency in parko-core/Cargo.toml.
+   Verify crate name from workspace Cargo.toml before editing.
+7. cargo test -p parko-core -- --test-threads=1 exits 0.
+   Do NOT assume any specific test count.
+   Do NOT assume MNIST integration test is passing.
+8. No unsafe code.
 ```
 
 ---
 
-## PARK-004 `control-loop` `safety` `epic:runtime-core`
+## PARK-004 `control-loop` `safety`
 
-**NaN/Inf rejection at tick boundary**
+**NaN/Inf input guard at tick boundary**
 
 Input guard at the top of `ControlLoop::tick`: any NaN or Inf input returns
 `EnforcementAction::Halt` before reaching governor or clamp. Prevents undefined
-floating-point behavior from propagating through the safety stack. Must be
-verified by a proptest generating adversarial floats.
+floating-point behavior from propagating through the safety stack. Must be verified
+by a proptest generating adversarial floats (NaN, Inf, -Inf, subnormals).
 
 ### Claude Code Prompt
 ```
@@ -138,119 +161,155 @@ Requirements:
    assert all NaN/Inf inputs → Halt, no panic.
 3. Add unit test: a valid f64 still reaches the governor unchanged.
 4. Do not change governor or clamp logic.
-5. cargo test -p parko-core exits 0.
+5. cargo test -p parko-core exits 0. Do NOT assume specific test count.
 ```
 
 ---
 
-## PARK-005 `control-loop` `feat` `epic:runtime-core`
+## PARK-005 `control-loop` `feat`
 
-**VirtualClock / SystemClock abstraction in ControlLoop**
+**RuntimeClock / MockClock abstraction in ControlLoop**
 
 Wire the `Clock` trait into `ControlLoop` so all timing logic calls
-`self.clock.now_ms()` instead of wall-clock APIs. Use `VirtualClock` for tests
-and `SystemClock` as the default. Eliminates any `sleep` dependency from timing
-tests in parko-core.
+`self.clock.now_ms()` instead of wall-clock APIs. `MockClock` is used in tests
+and `RuntimeClock` wraps wall-clock as the default. Eliminates `sleep` dependencies
+from all timing tests in parko-core.
 
 ### Claude Code Prompt
 ```
 In parko-core/src/control_loop.rs, wire the Clock trait into ControlLoop.
 
 Requirements:
-1. Clock trait (if not already defined in parko-core/src/clock.rs):
-     pub trait Clock: Send + Sync {
-         fn now_ms(&self) -> u64;
-     }
-   pub struct SystemClock;
-   pub struct VirtualClock { current_ms: Arc<AtomicU64> }
-   impl VirtualClock { pub fn advance(&self, ms: u64) }
+1. Clock trait (in parko-core/src/clock.rs if not already defined):
+     pub trait Clock: Send + Sync { fn now_ms(&self) -> u64; }
+   pub struct RuntimeClock;
+   pub struct MockClock { current_ms: Arc<AtomicU64> }
+   impl MockClock { pub fn advance(&self, ms: u64) }
 2. Add field: clock: Arc<dyn Clock> to ControlLoop.
 3. Add builder: pub fn with_clock(mut self, c: Arc<dyn Clock>) -> Self.
-4. Default to Arc::new(SystemClock) in ControlLoop::new().
-5. Replace all direct time reads inside ControlLoop with self.clock.now_ms().
-6. Add test: use VirtualClock, advance manually, assert tick fired correct
-   number of times without any sleep.
-7. cargo test -p parko-core exits 0.
+4. Default: Arc::new(RuntimeClock) in ControlLoop::new().
+5. Replace all direct time reads with self.clock.now_ms().
+6. Test: use MockClock, advance manually, assert tick fired correct count
+   without any sleep.
+7. cargo test -p parko-core exits 0. Do NOT assume specific test count.
 ```
 
 ---
 
-## PARK-006 `chore` `epic:runtime-core`
+## PARK-006 `chore`
 
 **parko-core v0.1.0 release tag**
 
-Set version to `0.1.0` in `parko-core/Cargo.toml`. Verify
-`cargo publish --dry-run -p parko-core` exits cleanly. Tag `parko-core-v0.1.0`
-in the repo. No code changes — version bump and tagging only.
+Set version to `0.1.0` in `parko-core/Cargo.toml`. Verify `cargo publish --dry-run
+-p parko-core` exits cleanly. Tag `parko-core-v0.1.0` in the repo. No code changes
+— version bump and tagging only.
 
 ---
 
-## PARK-007 `control-loop` `feat` `epic:hal`
+## PARK-007 `backend-architecture` `docs`
 
-**Define `InferenceBackend` trait and `BackendDescriptor` enum**
+**Verify crate and struct names in parko/ workspace**
 
-Define the zero-copy `InferenceBackend` trait and `BackendDescriptor` enum in
-`parko-core`. These form the contract that all backends (CPU, QNN, TIDL,
-ROCm/Vitis, OpenVINO) implement. All scratch memory is pre-allocated at init;
-no heap allocation on the hot path.
+Search the parko/ workspace for all crate names, struct names, and governor
+implementations before any rename or refactor. If the governor struct is still
+`AegisGovernor` or a similar legacy name, record the rename target (`KirraGovernor`)
+and any import paths that will be affected. Document findings in `decisions.md`
+before any renaming task is started.
 
 ### Claude Code Prompt
 ```
-Create parko-core/src/backend.rs.
+You are doing a read-only audit of the parko/ workspace. Do NOT rename anything.
+
+Run these commands and report the findings:
+  find parko/ -name "Cargo.toml" -exec grep -l "name" {} \; | xargs grep "^name ="
+  grep -r "struct.*Governor\|AegisGovernor\|KirraGovernor\|SafetyGovernor" \
+       parko/ --include="*.rs" -n
+  grep -r "pub trait SafetyGovernor\|impl SafetyGovernor" parko/ --include="*.rs" -n
+  cat parko/Cargo.toml   # workspace members list
+
+Write a summary to decisions.md under a new section "Crate and Struct Name Audit
+(DATE)" with:
+- Actual crate names in parko/ workspace
+- Actual governor struct name(s)
+- Whether SafetyGovernor trait is defined and where
+- List of files that will need updating when renamed to KirraGovernor
+
+Do NOT modify any Rust source files.
+```
+
+---
+
+## PARK-008 `backend-architecture` `feat`
+
+**Finalize InferenceBackend trait zero-copy boundary**
+
+Finalize the `InferenceBackend` trait with a zero-copy hot-path signature:
+`run(&self, input: &[f32], output: &mut [f32]) -> Result<(), BackendError>`. All
+scratch memory must be pre-allocated at `new()`; no heap allocation on the `run`
+path. Shape mismatch must return `BackendError::ShapeMismatch`, never panic.
+
+### Claude Code Prompt
+```
+In parko-core/src/backend.rs (create if absent), finalize InferenceBackend.
 
 Requirements:
 1. pub trait InferenceBackend: Send + Sync {
        fn run(&self, input: &[f32], output: &mut [f32]) -> Result<(), BackendError>;
        fn descriptor(&self) -> BackendDescriptor;
    }
-2. #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-   pub enum BackendDescriptor { Cpu, QualcommQnn, TiTidl, AmdRocm, IntelOpenVino }
-3. #[derive(Debug)]
-   pub enum BackendError { ShapeMismatch { expected: usize, got: usize }, Io(String), Unsupported }
-4. Re-export from parko_core lib.rs:
-     pub use backend::{InferenceBackend, BackendDescriptor, BackendError};
+2. #[non_exhaustive] pub enum BackendDescriptor {
+       Cpu, TensorRT, QualcommQnn, TiTidl, IntelOpenVino, AmdVitis
+   }
+3. pub enum BackendError {
+       ShapeMismatch { expected: usize, got: usize },
+       Io(String),
+       Unsupported,
+   }
+4. Re-export from parko_core lib.rs.
 5. Unit test: round-trip each BackendDescriptor variant through format!("{:?}", v).
 6. No new dependencies.
-7. cargo test -p parko-core exits 0.
+7. cargo test -p parko-core exits 0. Do NOT assume specific test count.
 ```
 
 ---
 
-## PARK-008 `control-loop` `feat` `epic:hal`
+## PARK-009 `backend-architecture` `feat`
 
 **Validate parko-onnx CPU backend against InferenceBackend trait**
 
 The parko-onnx crate contains a CPU-based ONNX Runtime backend and a MNIST-style
-integration test. Wire it against the `InferenceBackend` trait from PARK-007 and
-confirm the integration test is green before any multi-silicon work begins.
+integration test. Wire it against the finalized `InferenceBackend` trait from
+PARK-008 and verify the MNIST integration test is actually green by running it —
+do not assume it passes without verification. The CPU baseline must be solid before
+multi-silicon work begins.
 
 ### Claude Code Prompt
 ```
-In parko-onnx/src/lib.rs (or the main backend file), implement InferenceBackend.
+In parko-onnx/src/lib.rs, implement InferenceBackend for the existing ORT backend.
 
 Requirements:
 1. Implement parko_core::InferenceBackend for the existing OrtBackend struct.
+   First, find the actual struct name: grep -r "pub struct" parko/crates/parko-onnx/src/
 2. run(&self, input: &[f32], output: &mut [f32]):
-   - Validate input.len() == self.input_size and output.len() == self.output_size;
-     return BackendError::ShapeMismatch on mismatch.
+   - Validate lengths; return BackendError::ShapeMismatch on mismatch.
    - Run ORT session; copy result into output slice.
-   - No Vec<f32> allocation on the hot path (pre-allocate scratch at init).
-3. descriptor(&self) returns BackendDescriptor::Cpu.
-4. Run cargo test -p parko-onnx and confirm the MNIST integration test passes.
-   Do NOT declare this task done if the MNIST test is skipped or ignored.
-5. Add parko-core as a dependency in parko-onnx/Cargo.toml if not present.
+   - No Vec<f32> allocation on the hot path (pre-allocate scratch at new()).
+3. descriptor() returns BackendDescriptor::Cpu.
+4. Run cargo test -p parko-onnx and check whether the MNIST integration test passes.
+   If it fails, fix it or document the failure — do NOT assume it is passing.
+5. Add parko-core as dependency in parko-onnx/Cargo.toml if not present.
 ```
 
 ---
 
-## PARK-009 `control-loop` `feat` `epic:hal`
+## PARK-010 `backend-architecture` `feat`
 
 **Add MockBackend for parko-core unit tests**
 
 Add a `MockBackend` to `parko-core` that accepts configurable output values for
-deterministic testing. Eliminates the dependency on ORT in the parko-core test
-binary. `MockBackend` is the preferred backend for all parko-core unit and
-property tests.
+deterministic testing. Eliminates the ORT dependency from the parko-core test binary.
+`MockBackend` is the preferred backend for all parko-core unit and property tests;
+it must not require any external crate.
 
 ### Claude Code Prompt
 ```
@@ -259,136 +318,100 @@ Create parko-core/src/backends/mock.rs.
 Requirements:
 1. pub struct MockBackend { output: Vec<f32>, descriptor: BackendDescriptor }
 2. impl MockBackend {
-       pub fn new(output: Vec<f32>) -> Self  // descriptor defaults to Cpu
+       pub fn new(output: Vec<f32>) -> Self
        pub fn new_with_descriptor(output: Vec<f32>, d: BackendDescriptor) -> Self
    }
 3. impl InferenceBackend for MockBackend:
-   - run: copy self.output into output slice; return ShapeMismatch if lengths differ.
+   - run: copy self.output into output slice; ShapeMismatch if lengths differ.
    - descriptor: return self.descriptor.
 4. Re-export: pub use backends::mock::MockBackend in parko-core lib.rs.
 5. Test: MockBackend::new(vec![1.0, 2.0]), run with 2-element output, assert values.
 6. Confirm parko-core tests compile without any ORT link.
-7. cargo test -p parko-core exits 0.
+7. cargo test -p parko-core exits 0. Do NOT assume specific test count.
 ```
 
 ---
 
-## PARK-010 `backend-qnn` `backend-tidl` `backend-openvino` `backend-amd` `feat` `epic:hal`
+## PARK-011 `backend-architecture` `feat`
 
-**Feature-gated stub backends (QNN, TIDL, ROCm/Vitis, OpenVINO)**
+**Define backend capability reporting**
 
-Four zero-output stub backends, each gated behind a distinct Cargo feature.
-No hardware required; designed so CI can build and test all four in one run.
-These are stubs only — the real implementations are PARK-020 through PARK-023.
-
-### Claude Code Prompt
-```
-Create stub backends in parko-core/src/backends/:
-  qnn_stub.rs, tidl_stub.rs, rocm_stub.rs, openvino_stub.rs
-
-For each stub (example shown for QNN; repeat pattern for the others):
-1. #[cfg(feature = "backend-qnn")]
-   pub struct QnnStubBackend;
-   impl InferenceBackend for QnnStubBackend {
-       fn run(&self, _input: &[f32], output: &mut [f32]) -> Result<(), BackendError> {
-           output.iter_mut().for_each(|v| *v = 0.0);
-           Ok(())
-       }
-       fn descriptor(&self) -> BackendDescriptor { BackendDescriptor::QualcommQnn }
-   }
-2. Add optional features to parko-core/Cargo.toml:
-     [features]
-     backend-qnn = []
-     backend-tidl = []
-     backend-rocm = []
-     backend-openvino = []
-3. Add mod declarations guarded by cfg(feature) in backends/mod.rs.
-4. Test for each: cargo test -p parko-core --features backend-<name>
-   Run stub, assert all output elements are 0.0, assert descriptor matches.
-5. No hardware, no external dependencies.
-```
-
----
-
-## PARK-011 `control-loop` `safety` `epic:hal`
-
-**Backend latency watchdog in InferenceLoop**
-
-`InferenceLoop` wraps a backend and measures time-per-call using the `Clock`
-abstraction from PARK-005. When a call exceeds `deadline_ms`, it emits a
-`LatencyViolation` event and holds the last safe output. Three consecutive
-violations transition posture to `Degraded`.
+Add a `capabilities()` method to `InferenceBackend` and a `BackendCapabilities`
+struct describing supported features (quantization, int8, fp16, max batch size).
+Each backend reports its descriptor and capabilities at construction time. Enables
+`BackendSelector` runtime decisions and logging in later increments.
 
 ### Claude Code Prompt
 ```
-In parko-core/src/inference_loop.rs (create or extend), add a latency watchdog.
+Extend parko-core/src/backend.rs.
 
 Requirements:
-1. Add field: deadline_ms: Option<u64> to InferenceLoop.
-2. Add builder: pub fn with_deadline(mut self, ms: u64) -> Self.
-3. On each tick:
-   let start = self.clock.now_ms();
-   backend.run(input, output)?;
-   let elapsed = self.clock.now_ms() - start;
-   if let Some(dl) = self.deadline_ms {
-       if elapsed > dl {
-           self.consecutive_violations += 1;
-           // hold last safe output by copying previous output
-           if self.consecutive_violations >= 3 {
-               self.set_posture(PostureState::Degraded);
-           }
-           return Ok(LatencyViolation { elapsed_ms: elapsed, deadline_ms: dl });
-       }
+1. pub struct BackendCapabilities {
+       pub supports_int8: bool,
+       pub supports_fp16: bool,
+       pub max_batch_size: Option<usize>,
    }
-   self.consecutive_violations = 0;  // reset on success
-4. Test: create InferenceLoop with TidlStubBackend latency_ms=5, deadline_ms=1,
-   advance VirtualClock to simulate 5ms per call, run 3 times, assert posture == Degraded.
-5. Test: 1 slow tick then 1 fast tick → posture returns to Nominal.
+2. Add to InferenceBackend trait:
+     fn capabilities(&self) -> BackendCapabilities;
+3. MockBackend::capabilities() returns all false, None.
+4. OrtBackend::capabilities() returns appropriate values for CPU ONNX Runtime.
+5. Unit test: capability struct for MockBackend matches expected defaults.
 6. cargo test -p parko-core exits 0.
 ```
 
 ---
 
-## PARK-012 `chore` `epic:hal`
+## PARK-012 `backend-architecture` `chore`
 
-**CI matrix: all four stub backends**
+**Feature-gated stub backends for CI**
 
-GitHub Actions matrix job that builds and tests all four feature-gated stub
-backends on ubuntu-latest in a single workflow run. Ensures no stub breaks CI
-after backend trait changes.
+Define feature-gated zero-output stub backends for TensorRT, QNN, TIDL, OpenVINO,
+and AMD in `parko-core`. Each stub is gated behind `features = ["backend-<name>"]`
+and returns zeros deterministically. CI builds and tests all stubs without hardware.
+These are stubs only — real implementations are PARK-020 through PARK-030.
 
 ### Claude Code Prompt
 ```
-Add or update .github/workflows/ci.yml with a matrix job for stub backends.
+Create stub backends in parko-core/src/backends/:
+  tensorrt_stub.rs, qnn_stub.rs, tidl_stub.rs, openvino_stub.rs, amd_stub.rs
 
-Requirements:
-1. Add job: test-stub-backends
-   strategy:
-     matrix:
-       features: [backend-qnn, backend-tidl, backend-rocm, backend-openvino]
-   steps:
-     - uses: actions/checkout@v4
-     - uses: dtolnay/rust-toolchain@stable
-     - run: cargo test -p parko-core --features ${{ matrix.features }}
-2. Job runs on ubuntu-latest; no hardware required.
-3. Do not remove or break any existing CI jobs.
-4. All four matrix entries must be green before this task is Done.
+For each stub (example for TensorRT; repeat for others):
+1. #[cfg(feature = "backend-tensorrt")]
+   pub struct TensorRTStubBackend;
+   impl InferenceBackend for TensorRTStubBackend {
+       fn run(&self, _input: &[f32], output: &mut [f32]) -> Result<(), BackendError> {
+           output.iter_mut().for_each(|v| *v = 0.0);
+           Ok(())
+       }
+       fn descriptor(&self) -> BackendDescriptor { BackendDescriptor::TensorRT }
+       fn capabilities(&self) -> BackendCapabilities { BackendCapabilities::default() }
+   }
+2. Add optional features to parko-core/Cargo.toml:
+     [features]
+     backend-tensorrt = []
+     backend-qnn = []
+     backend-tidl = []
+     backend-openvino = []
+     backend-amd = []
+3. Test each: cargo test -p parko-core --features backend-<name>
+   Assert all output elements == 0.0; assert descriptor matches.
+4. No hardware, no external dependencies.
 ```
 
 ---
 
-## PARK-013 `behavioral-safety` `safety` `epic:behavioral-safety`
+## PARK-013 `behavioral-safety` `safety`
 
-**Longitudinal RSS safe-distance (IEEE 2846-2022 §5.1) — first implementation**
+**Longitudinal RSS safe-distance — first implementation**
 
-First implementation of the IEEE 2846 longitudinal safe-distance formula in
-`parko-core::rss`. No prior behavioral-safety code exists in the repository.
-The formula uses ego and lead vehicle kinematics to compute the minimum safe
-following distance.
+First implementation of the IEEE 2846-2022 §5.1 longitudinal safe-distance formula
+in `parko-core::rss`. No prior behavioral-safety code exists in the repository. The
+formula uses ego and lead vehicle kinematics (velocities, reaction time, braking
+limits) to compute the minimum safe following distance.
 
 ### Claude Code Prompt
 ```
-Create parko-core/src/rss.rs and implement longitudinal safe distance.
+Create parko-core/src/rss.rs. This is a first implementation; no prior RSS code exists.
 
 Requirements:
 1. pub fn longitudinal_safe_distance(
@@ -401,145 +424,137 @@ Requirements:
      v_after = ego_vel + accel_max * reaction_time
      d_brake_ego = v_after.powi(2) / (2.0 * brake_min)
      d_brake_lead = lead_vel.powi(2) / (2.0 * brake_max)
-     d_min = d_response + d_brake_ego - d_brake_lead
-     return d_min.max(0.0)
-2. Unit tests:
-   - equal speeds: assert d_min > 0.0
-   - ego faster: assert d_min > equal-speed case
-   - ego slower: assert d_min == 0.0 (lead can brake harder)
-   - both zero: assert d_min == 0.0
-   - very high speed: assert no overflow or NaN
+     d_min = (d_response + d_brake_ego - d_brake_lead).max(0.0)
+2. Unit tests: equal speeds, ego faster, ego slower, both zero, high speed (no NaN).
 3. Add pub mod rss; to parko-core/src/lib.rs.
 4. cargo test -p parko-core exits 0.
 ```
 
 ---
 
-## PARK-014 `behavioral-safety` `safety` `epic:behavioral-safety`
+## PARK-014 `behavioral-safety` `safety`
 
-**Lateral RSS safe-distance (IEEE 2846-2022 §5.2) — first implementation**
+**Lateral RSS safe-distance — first implementation**
 
-First implementation of the IEEE 2846 lateral safe-distance formula.
-Computes minimum lateral separation required given the lateral velocities
-and maximum lateral acceleration of both actors.
+First implementation of the IEEE 2846-2022 §5.2 lateral safe-distance formula.
+Computes minimum lateral separation required given lateral velocities and maximum
+lateral acceleration of both actors. No prior behavioral-safety code exists.
 
 ### Claude Code Prompt
 ```
-In parko-core/src/rss.rs, add lateral safe distance.
+In parko-core/src/rss.rs (created in PARK-013), add lateral safe distance.
 
 Requirements:
 1. pub fn lateral_safe_distance(
        ego_lat_vel: f64, obj_lat_vel: f64,
        lat_accel_max: f64, reaction_time: f64,
    ) -> f64
-   Formula (IEEE 2846-2022 §5.2):
-   Compute reaction distances for both actors (v * t + 0.5 * a * t^2),
-   compute braking distances, return max(0.0, combined margin).
-2. Unit tests:
-   - converging fast: large positive margin
-   - diverging: margin 0 (they are moving apart)
-   - both stationary: margin 0
+   Compute reaction and braking distances for both actors; return max(0.0, margin).
+2. Unit tests: converging fast (large margin), diverging (margin 0), both stationary.
 3. cargo test -p parko-core exits 0.
 ```
 
 ---
 
-## PARK-015 `behavioral-safety` `posture-engine` `safety` `epic:behavioral-safety`
+## PARK-015 `behavioral-safety` `kirra-governor` `safety`
 
 **Wire RssState into kirra-runtime-sdk posture engine**
 
 Define `RssState { safe, longitudinal_margin, lateral_margin }` and wire it into
-the `kirra-runtime-sdk` posture engine. An RSS violation triggers `Degraded`
-posture and uses the existing 5-tick / 10 s recovery hysteresis.
+the `kirra-runtime-sdk` posture engine. An RSS violation triggers `Degraded` posture
+using the existing 5-tick / 10 s recovery hysteresis. An RSS violation resets the
+recovery streak to 0.
 
 ### Claude Code Prompt
 ```
-In kirra-runtime-sdk/src/posture_engine.rs and posture_engine_v2.rs, integrate
-RssState into the posture pipeline.
+In kirra-runtime-sdk/src/posture_engine.rs and posture_engine_v2.rs,
+integrate RssState. The kirra-runtime-sdk has ~333 tests; all must remain green.
 
 Requirements:
 1. pub struct RssState { pub safe: bool, pub longitudinal_margin: f64,
        pub lateral_margin: f64 }
 2. Add PostureRecalcTrigger::RssViolation to the trigger enum.
 3. In start_posture_engine_worker: handle RssViolation → recalculate_and_broadcast.
-4. In derive_fleet_posture: if any active RssViolation → return FleetPosture::Degraded.
-5. Recovery: use existing AV_RECOVERY_STREAK_THRESHOLD=5, AV_RECOVERY_WINDOW_MS=10_000.
+4. In derive_fleet_posture: if any active RssViolation → FleetPosture::Degraded.
+5. Recovery: AV_RECOVERY_STREAK_THRESHOLD=5, AV_RECOVERY_WINDOW_MS=10_000.
    An RssViolation resets the streak to 0.
 6. Integration test using ScenarioRunner:
    - inject RssState { safe: false } → assert Degraded
    - inject 5x RssState { safe: true } within 10s → assert Nominal
-7. cargo test -p kirra-runtime-sdk exits 0.
-Note: kirra-runtime-sdk has ~333 tests; all must remain green.
+7. cargo test -p kirra-runtime-sdk exits 0. ~333 existing tests must remain green.
 ```
 
 ---
 
-## PARK-016 `behavioral-safety` `kirra-governor` `safety` `epic:behavioral-safety`
+## PARK-016 `behavioral-safety` `kirra-governor` `safety`
 
-**RSS pre-actuator gate in Kirra governor crate**
+**RSS pre-actuator gate in KirraGovernor**
 
-Add an RSS pre-actuator gate to the Kirra governor crate (the crate implementing
-`SafetyGovernor` with kinematic contracts and envelope selection). When
-`rss_state.safe == false`, clamp velocity to 0.0 before any kinematic envelope
-check. This is the first integration of behavioral safety into the governor.
+Add an RSS pre-actuator gate to the KirraGovernor crate. When `rss_state.safe ==
+false`, clamp velocity to 0.0 before any kinematic envelope check. KirraGovernor
+already hard-vetoes on Degraded/LockedOut per the authority model; this adds RSS
+as an additional input to Nominal-mode decisions. Verify the actual governor crate
+name before editing.
 
 ### Claude Code Prompt
 ```
-In the Kirra governor crate (verify the crate name in the workspace Cargo.toml
-before editing — it may be named parko-kirra-governor or similar), add RSS gating.
+Before writing code, find the actual Kirra governor crate name and struct name:
+  find parko/ -name "Cargo.toml" | xargs grep "^name ="
+  grep -r "impl.*SafetyGovernor\|pub struct.*Governor" parko/ --include="*.rs" -n
+
+In the Kirra governor crate (verify the crate name first), add RSS gating.
 
 Requirements:
-1. Add field: rss_state: RssState (import from parko-core::rss; default safe=true)
-   to the main governor struct (verify the struct name in the crate).
+1. Add field: rss_state: RssState (import from parko_core::rss) to governor struct.
+   Default: RssState { safe: true, longitudinal_margin: f64::MAX, lateral_margin: f64::MAX }
 2. Add method: pub fn update_rss_state(&mut self, state: RssState)
-3. In enforce() or the equivalent SafetyGovernor::enforce implementation:
-   FIRST check: if !self.rss_state.safe { clamp velocity output to 0.0; return }
-   Then continue with existing kinematic envelope checks.
-4. Unit test A: set rss_state.safe=false, input vel=5.0 → assert output vel==0.0.
-5. Unit test B: set rss_state.safe=true, input vel=5.0 → normal kinematics apply.
-6. Do not change the governor constructor signature.
+3. In enforce() — BEFORE kinematic envelope checks:
+   if !self.rss_state.safe { return 0.0; }
+4. Unit test A: rss_state.safe=false, input vel=5.0 → assert output==0.0.
+5. Unit test B: rss_state.safe=true, input vel=5.0 → normal kinematics apply.
+6. Do not change governor constructor signature.
 7. cargo test -p <governor-crate-name> exits 0.
 ```
 
 ---
 
-## PARK-017 `behavioral-safety` `test` `epic:behavioral-safety`
+## PARK-017 `behavioral-safety` `test`
 
 **RSS property test**
 
 Proptest: for all valid `(ego_vel, lead_vel, gap, commanded_vel)` in physically
-plausible ranges, no RSS-violating command exits the governor for any posture
-state. This is the primary safety property for the behavioral safety increment.
+plausible ranges (all ≥ 0, gap > 0, vel < 150 m/s), no RSS-violating command exits
+the governor for any posture state. 10,000 cases covering Nominal, Degraded, and
+LockedOut.
 
 ### Claude Code Prompt
 ```
-Create parko-core/tests/rss_property.rs (or in the Kirra governor test suite).
+Create parko-core/tests/rss_property.rs or add to the Kirra governor test suite.
 
 Requirements:
 1. proptest generates (ego_vel: f64, lead_vel: f64, gap: f64, commanded_vel: f64)
-   filtered: all >= 0.0, gap > 0.0, vel < 150.0 m/s (physically plausible).
+   filtered: all >= 0.0, gap > 0.0, vels < 150.0.
 2. For each tuple:
    safe_dist = longitudinal_safe_distance(ego_vel, lead_vel, 0.5, 3.0, 6.0, 8.0)
    rss_safe = gap >= safe_dist
-   Set RssState { safe: rss_safe, ... } on the Kirra governor.
-   governor_output = governor.enforce(commanded_vel, PostureState::Nominal)
-   if !rss_safe: assert governor_output == 0.0
-   if rss_safe: assert governor_output <= commanded_vel (kinematics may clamp further)
-3. proptest config: cases = 10_000.
-4. Cover all three PostureState variants: Nominal, Degraded, LockedOut.
-5. All cases must pass. No unsafe code.
+   Set RssState { safe: rss_safe } on the governor.
+   out = governor.enforce(commanded_vel, PostureState::Nominal)
+   if !rss_safe: assert out == 0.0
+   if rss_safe: assert out <= commanded_vel
+3. cases = 10_000. Cover all three PostureState variants.
+4. No unsafe code.
 ```
 
 ---
 
-## PARK-018 `behavioral-safety` `safety` `epic:behavioral-safety`
+## PARK-018 `behavioral-safety` `safety`
 
 **RssViolationEvent in kirra-runtime-sdk audit chain**
 
 `RssViolationEvent { ego_vel, lead_vel, gap, longitudinal_margin, lateral_margin,
-timestamp_ms }` appended to the SHA-256 hash-chained audit ledger in
-`kirra-runtime-sdk`. Tamper detection must work: a single-byte corruption of
-the violation entry must cause `verify_chain()` to fail.
+timestamp_ms }` appended to the SHA-256 hash-chained audit ledger. A single-byte
+corruption of any entry must cause `verify_chain()` to fail. All ~333 existing
+kirra-runtime-sdk tests must remain green.
 
 ### Claude Code Prompt
 ```
@@ -549,26 +564,24 @@ Requirements:
 1. pub struct RssViolationEvent { pub ego_vel: f64, pub lead_vel: f64,
        pub gap: f64, pub longitudinal_margin: f64, pub lateral_margin: f64,
        pub timestamp_ms: u64 }
-2. Add AuditEntry::RssViolation(RssViolationEvent) to the entry enum.
-3. Serialize the event consistently with the existing chain format.
-4. Add to AuditChainLinker:
-     pub fn append_rss_violation(&mut self, e: RssViolationEvent)
-         -> Result<(), AuditError>
-   Include the event bytes in the SHA-256 chain hash.
-5. Test A: append 5 entries including one RssViolation; verify_chain() returns Ok.
-6. Test B: corrupt one byte of the RssViolation entry; verify_chain() returns Err.
-7. cargo test -p kirra-runtime-sdk exits 0. ~333 existing tests must remain green.
+2. Add AuditEntry::RssViolation(RssViolationEvent) variant.
+3. pub fn append_rss_violation(&mut self, e: RssViolationEvent) -> Result<(), AuditError>
+   Include event bytes in the SHA-256 chain hash.
+4. Test A: 5-entry chain including one RssViolation; verify_chain() returns Ok.
+5. Test B: corrupt one byte of the RssViolation entry; verify_chain() returns Err.
+6. cargo test -p kirra-runtime-sdk exits 0. ~333 existing tests must remain green.
 ```
 
 ---
 
-## PARK-019 `behavioral-safety` `simulation` `test` `epic:behavioral-safety`
+## PARK-019 `behavioral-safety` `simulation` `test`
 
-**10 000-scenario adversarial trajectory simulation**
+**10,000-scenario adversarial trajectory simulation**
 
-`ScenarioRunner` + `VirtualClock` simulation: 10 000 scenarios mixing safe and
-unsafe RSS gaps through the full posture engine + governor stack. Assert zero
-unsafe commands exit. Must complete in < 60 s on CI.
+`ScenarioRunner` + `MockClock` simulation: 10,000 scenarios mixing safe and unsafe
+RSS gaps through the full posture engine + governor stack. Assert zero unsafe commands
+exit. Must complete in < 60 s on CI. All ~333 kirra-runtime-sdk tests must remain
+green.
 
 ### Claude Code Prompt
 ```
@@ -576,142 +589,90 @@ Create kirra-runtime-sdk/tests/rss_simulation.rs.
 
 Requirements:
 1. Use ScenarioRunner from kirra_runtime_sdk::scenario_runner.
-2. Use VirtualClock; do not use sleep.
-3. Generate 10_000 scenarios: each is a sequence of 10 ticks with varying
-   ego_vel, lead_vel, gap, commanded_vel (some gaps below safe distance).
+2. Use MockClock (or VirtualClock — check actual name in src/clock.rs); no sleep.
+3. Generate 10_000 scenarios: each is 10 ticks with varying kinematic state.
+   Some gaps below safe distance; some above.
 4. For each tick:
    - Compute RssState from parko_core::rss::longitudinal_safe_distance.
-   - Feed RssState into posture engine via PostureEngineSender.
-   - Feed RssState into the Kirra governor.
+   - Feed into posture engine via PostureEngineSender.
+   - Feed into KirraGovernor (verify struct name before importing).
    - Record output velocity.
-5. Assert: for every tick where gap < safe_distance, output velocity == 0.0.
-6. Assert: posture correctly degrades on violation and recovers after 5 clean ticks.
+5. Assert: every tick where gap < safe_distance → output velocity == 0.0.
+6. Assert: posture degrades on violation; recovers after 5 clean ticks.
 7. Test must complete in < 60 s on CI.
 8. cargo test -p kirra-runtime-sdk exits 0. ~333 existing tests must remain green.
 ```
 
 ---
 
-## PARK-020 `backend-qnn` `feat` `epic:silicon-matrix` `needs-hardware`
+## PARK-020 `backend-tensorrt` `feat`
 
-**QnnBackend — first implementation**
+**TensorRT API spike (TIME-SENSITIVE — Jetson arriving)**
 
-First real implementation of the QNN backend via Qualcomm AI Engine Direct SDK
-C FFI. No prior QNN backend code exists. int8 quantization from tensor metadata.
-Hardware test is `#[ignore]`'d in CI; runs on QCS6490 or SA8295.
+Set up TensorRT FFI bindings (`tensorrt` crate or `trt-sys`) and verify a trivial
+model loads and runs on the Jetson hardware. Document the build toolchain and any
+driver/SDK version requirements in `decisions.md`. Gate everything behind
+`features = ["backend-tensorrt"]`.
 
 ### Claude Code Prompt
 ```
-Create parko-core/src/backends/qnn.rs (first implementation).
+Create parko-core/src/backends/tensorrt_spike.rs. Gate: #[cfg(feature = "backend-tensorrt")].
 
 Requirements:
-1. Use Qualcomm QNN SDK C FFI: Qnn_Interface_t, QnnBackend_Config_t,
-   QnnContext_Config_t, QnnTensor_t.
-2. pub struct QnnBackend { /* context, graph, tensor handles; no per-inference alloc */ }
-3. QnnBackend::new(model_path: &str) -> Result<Self, BackendError>
-   Loads a .serialized QNN context binary.
-4. run: populate input tensor from &[f32]; if int8 model, quantize using
-   scale/offset from tensor metadata; execute graph; dequantize output to &mut [f32].
-5. descriptor() returns BackendDescriptor::QualcommQnn.
-6. Gate entire file: #[cfg(feature = "backend-qnn")].
-7. Hardware test marked #[ignore]:
-     #[ignore] #[test] fn test_qnn_mobilenet_v2() { ... }
-   Load a real model, compare top-1 class with ORT CPU reference.
-8. Stub test (runs in CI without hardware): confirm QnnStubBackend from PARK-010
-   still compiles and outputs zeros.
+1. Find the best available TensorRT Rust binding (check crates.io for tensorrt,
+   trt-sys, or similar). Document choice in decisions.md.
+2. Implement a minimal struct TensorRTBackend with new(engine_path: &str).
+   Load a .trt serialized engine file.
+3. Add a hardware test (mark #[ignore] for CI):
+     #[ignore] #[test]
+     fn test_tensorrt_trivial_model() { /* load model, run inference, check no segfault */ }
+4. The stub (PARK-012 TensorRTStubBackend) must still compile when this file is active.
+5. Add feature = ["backend-tensorrt"] to parko-core/Cargo.toml.
+6. Document: which TRT SDK version was tested, Jetson toolchain commands used.
 ```
 
 ---
 
-## PARK-021 `backend-tidl` `feat` `epic:silicon-matrix` `needs-hardware`
+## PARK-021 `backend-tensorrt` `feat`
 
-**TidlBackend — first implementation**
+**Implement TensorRTBackend struct**
 
-First real implementation of the TIDL backend via TI TIDL runtime C FFI,
-cross-compiled to `aarch64-unknown-linux-gnu`. No prior TIDL backend code
-exists. Target hardware: TDA4VM.
+Full `TensorRTBackend` implementation: `new(engine_path)` deserializes a `.trt`
+plan and pre-allocates CUDA input/output buffers at init. `run()` performs H→D copy,
+execute, D→H copy with no per-inference allocation. Implements `InferenceBackend`.
 
 ### Claude Code Prompt
 ```
-Create parko-core/src/backends/tidl.rs (first implementation).
+In parko-core/src/backends/tensorrt.rs (extend from PARK-020 spike).
 
 Requirements:
-1. Use TI TIDL C FFI (tivxTIDLNode, TIDL_IOBufDesc_t).
-2. Cross-compile target: aarch64-unknown-linux-gnu (use cross or cargo-cross).
-3. TidlBackend::new(model_path: &str) -> Result<Self, BackendError>.
-4. run: copy &[f32] to TIDL input buffer; execute node; copy output to &mut [f32].
-5. descriptor() returns BackendDescriptor::TiTidl.
-6. Gate: #[cfg(feature = "backend-tidl")].
-7. Hardware test marked #[ignore]: compare output within 1e-3 of ORT CPU reference.
-8. Add parko-core/build.rs for TIDL C FFI linking if needed.
+1. pub struct TensorRTBackend {
+       engine: /* TRT engine handle */,
+       input_buf: /* CUDA device buffer, pre-allocated */,
+       output_buf: /* CUDA device buffer, pre-allocated */,
+       input_size: usize,
+       output_size: usize,
+   }
+2. TensorRTBackend::new(engine_path: &str, input_size: usize, output_size: usize)
+   Loads .trt plan; allocates CUDA buffers. No per-inference alloc after this.
+3. impl InferenceBackend:
+   - run: H2D copy input; execute; D2H copy output. Return ShapeMismatch on bad lengths.
+   - descriptor: BackendDescriptor::TensorRT
+4. Hardware test #[ignore]: load real model, run inference, output is not all zeros.
+5. Stub test (runs in CI): TensorRTStubBackend from PARK-012 still outputs zeros.
+6. Gate: #[cfg(feature = "backend-tensorrt")].
 ```
 
 ---
 
-## PARK-022 `backend-amd` `feat` `epic:silicon-matrix` `needs-hardware`
+## PARK-022 `backend-tensorrt` `feat`
 
-**RocmBackend — first implementation**
+**Integrate TensorRT into BackendSelector**
 
-First real implementation of the ROCm/Vitis backend via ROCm HIP C FFI or
-MIGraphX Rust bindings. No prior ROCm backend code exists. GPU memory is
-allocated once at init, not per inference. Target hardware: RX 6000 or MI100.
-
-### Claude Code Prompt
-```
-Create parko-core/src/backends/rocm.rs (first implementation).
-
-Requirements:
-1. Use migraphx crate (add as optional dep) or raw HIP C FFI.
-2. RocmBackend::new(model_path: &str) -> Result<Self, BackendError>
-   Parse ONNX model via migraphx::Program; compile for GPU.
-3. run: copy &[f32] to device; execute; copy output to host &mut [f32].
-4. GPU buffer allocated once at init; zero per-inference alloc.
-5. descriptor() returns BackendDescriptor::AmdRocm.
-6. Gate: #[cfg(feature = "backend-rocm")].
-7. Hardware test marked #[ignore].
-8. Build on ubuntu-latest without GPU: cargo build --features backend-rocm
-   should compile even without a GPU present (stubs the HIP link if needed).
-```
-
----
-
-## PARK-023 `backend-openvino` `feat` `epic:silicon-matrix`
-
-**OpenVinoBackend — first implementation**
-
-First real implementation of the OpenVINO backend using `openvino-rs`. Unlike the
-other three hardware backends, this can be integration-tested in CI without physical
-hardware using the OpenVINO CPU plugin. Includes an identity model fixture.
-
-### Claude Code Prompt
-```
-Create parko-core/src/backends/openvino.rs (first implementation).
-
-Requirements:
-1. Add optional dependency: openvino = { version = "0.7", optional = true }
-   activated by features = ["backend-openvino"] in Cargo.toml.
-2. pub struct OpenVinoBackend { core: openvino::Core,
-       compiled: openvino::CompiledModel, input_size: usize, output_size: usize }
-3. OpenVinoBackend::new(model_xml: &str, model_bin: &str) -> Result<Self, BackendError>
-4. run: validate lengths; create InferRequest; set tensor; infer;
-   read output tensor into &mut [f32]. Return BackendError::ShapeMismatch on mismatch.
-5. Gate: #[cfg(all(feature = "backend-openvino", not(feature = "openvino-stub")))].
-6. Integration test (NOT #[ignore]; runs on CI using the CPU plugin):
-   Use a tiny 2-input/2-output identity model in tests/fixtures/identity.xml +
-   identity.bin. Assert output == input within 1e-6.
-7. Ensure the stub (PARK-010) is still usable when the real backend feature is off.
-```
-
----
-
-## PARK-024 `control-loop` `feat` `epic:silicon-matrix`
-
-**BackendSelector — runtime backend selection with fallback**
-
-`BackendSelector::new(BackendDescriptor)` creates the correct backend for the
-target platform, falling back to the stub (with `tracing::warn!`) when the real
-backend is unavailable or not compiled in. Enables `KIRRA_BACKEND` env-var
-selection at runtime.
+`BackendSelector::new(BackendDescriptor::TensorRT)` creates a `TensorRTBackend`
+when the feature is enabled; falls back to `TensorRTStubBackend` with
+`tracing::warn!` otherwise. Enables `KIRRA_BACKEND=tensorrt` env-var runtime
+selection in the Kirra safety runtime binary.
 
 ### Claude Code Prompt
 ```
@@ -719,343 +680,402 @@ Create parko-core/src/backend_selector.rs.
 
 Requirements:
 1. pub struct BackendSelector(Box<dyn InferenceBackend>);
-2. BackendSelector::new(d: BackendDescriptor) -> Result<Self, BackendError>:
-   QualcommQnn → try QnnBackend::new if feature enabled, else QnnStubBackend
-   TiTidl → try TidlBackend::new if feature enabled, else TidlStubBackend
-   AmdRocm → try RocmBackend::new if feature enabled, else RocmStubBackend
-   IntelOpenVino → try OpenVinoBackend::new if feature enabled, else OpenVinoStubBackend
-   Cpu → OrtBackend (always available via parko-onnx)
-   On fallback: tracing::warn!("Backend {:?} unavailable, using stub", d)
-3. Implement InferenceBackend for BackendSelector (delegates to inner).
-4. Test: BackendSelector::new(QualcommQnn) on CI (no hardware) → Ok;
-   assert descriptor() == QualcommQnn (the stub returns the correct descriptor).
-5. pub use backend_selector::BackendSelector in parko-core lib.rs.
+2. BackendSelector::new(d: BackendDescriptor, model_path: Option<&str>)
+   -> Result<Self, BackendError>:
+   TensorRT → TensorRTBackend if feature enabled + model_path provided,
+              else TensorRTStubBackend with tracing::warn!
+   Cpu → OrtBackend (always available)
+   Others → respective stubs with tracing::warn!
+3. impl InferenceBackend for BackendSelector (delegates to inner).
+4. Test: BackendSelector::new(TensorRT, None) on CI (no GPU) → Ok;
+   descriptor() == TensorRT (stub returns correct descriptor).
+5. pub use backend_selector::BackendSelector in lib.rs.
 ```
 
 ---
 
-## PARK-025 `simulation` `test` `epic:silicon-matrix`
+## PARK-023 `backend-tensorrt` `test`
 
-**Cross-backend determinism validation**
+**CPU vs TensorRT output comparison**
 
-Fixed input through ORT CPU backend + QnnStub + TidlStub must produce outputs
-within 1e-5 element-wise. Since stubs return zeros, this validates the stub
-contract and establishes the tolerance baseline for when real backends arrive.
+Same fixed input through the CPU ONNX backend and the TensorRT backend; outputs must
+be within 1e-3 element-wise. Hardware test `#[ignore]`'d in CI; comment documents
+that the test requires Jetson. Validates the TensorRT implementation against the CPU
+baseline.
 
 ### Claude Code Prompt
 ```
-Create parko-core/tests/cross_backend_determinism.rs.
+Create parko-core/tests/tensorrt_cpu_comparison.rs.
 
 Requirements:
-1. const FIXED_INPUT: [f32; 128] = [/* 0.1 * i as f32 for i in 0..128 */];
-2. Run FIXED_INPUT through: OrtBackend, QnnStubBackend, TidlStubBackend.
-3. Assert all three output slices are within 1e-5 of each other element-wise.
-4. Comment: "Stubs return zeros; this validates stub contract.
-   Update tolerance when real backends available (see PARK-020, PARK-021)."
-5. Test must run on CI without hardware.
-6. cargo test -p parko-core exits 0.
+1. const FIXED_INPUT: [f32; N] = /* deterministic values */;
+2. Load same model on OrtBackend and TensorRTBackend.
+3. Run FIXED_INPUT through both; assert element-wise diff < 1e-3.
+4. Mark the whole test #[ignore]:
+   #[ignore] // requires Jetson with TensorRT runtime
+   #[test]
+   fn test_cpu_vs_tensorrt() { ... }
+5. Comment: "Update tolerance if model quantization changes (see PARK-021)."
 ```
 
 ---
 
-## PARK-026 `packaging` `feat` `epic:packaging`
+## PARK-024 `qnx` `feat`
 
-**Unified kirra_safety_runtime binary**
+**QNX deployment spike (TIME-SENSITIVE — 30-day license)**
 
-A single binary merging the posture engine from `kirra-runtime-sdk` and the
-inference loop from `parko-core`. Configured by env vars; backend selected via
-`KIRRA_BACKEND`; serves `/health` and `/inference/status`.
+Bring up the `kirra_verifier_service` binary on QNX. Identify and document any
+POSIX subset gaps (signal handling, threading model, filesystem paths, dynamic
+linking). Target: service starts and `/health` returns 200 on QNX. Record all
+findings in `decisions.md` before the license expires.
 
 ### Claude Code Prompt
 ```
-Create kirra-runtime-sdk/src/bin/kirra_safety_runtime.rs.
+Target: cross-compile kirra-runtime-sdk for QNX and bring up kirra_verifier_service.
 
 Requirements:
-1. Read env vars: KIRRA_ADMIN_TOKEN, KIRRA_DB_PATH, KIRRA_VERIFIER_ADDR
-   (fail-closed if missing, same semantics as existing kirra_verifier_service),
-   KIRRA_BACKEND (default "ort"), KIRRA_TICK_RATE_HZ (default 100).
-2. Create BackendSelector from KIRRA_BACKEND string.
-3. Start axum HTTP service reusing all routes from kirra_verifier_service.rs.
-4. Start InferenceLoop with selected backend at KIRRA_TICK_RATE_HZ.
-5. Wire InferenceLoop posture output into PostureEngineSender.
-6. GET /health → 200 JSON {"status":"ok","backend":"<name>","tick_hz":N}.
-7. GET /inference/status → {"tick_rate_hz":f64,"backend":String,"p99_latency_ms":f64}.
-8. All ~333 existing kirra-runtime-sdk tests must remain green.
+1. Identify the correct Rust target triple for QNX (e.g., x86_64-pc-nto-qnx710).
+2. Add cross-compilation configuration to .cargo/config.toml.
+3. Identify and fix any POSIX subset issues (signal, threads, sockets, filesystem).
+   Document each issue and fix in decisions.md.
+4. Build kirra_verifier_service for QNX:
+     cargo build --target x86_64-pc-nto-qnx710 --bin kirra_verifier_service
+5. Run on QNX device/VM; confirm /health returns 200 with KIRRA_ADMIN_TOKEN set.
+6. Document in decisions.md: QNX version, SDK version, any feature flags disabled.
+Note: Time-sensitive — 30-day license window. Prioritize getting a binary running
+over feature completeness.
 ```
 
 ---
 
-## PARK-027 `packaging` `chore` `epic:packaging`
+## PARK-025 `qnx` `backend-qnn` `docs`
 
-**systemd unit with watchdog**
+**QNN + QNX compatibility analysis**
 
-`scripts/kirra-safety-runtime.service` with `WatchdogSec=5`, `MemoryMax=512M`,
-`CPUQuota=80%`. Restarts automatically on watchdog timeout or OOM kill. Verify
-with `systemd-analyze verify` before this task is Done.
+Document the Qualcomm AI Engine Direct SDK version requirements on QNX, FFI linking
+differences from Linux, and memory model constraints relevant to the no-alloc backend
+contract. Record findings in `decisions.md`. This analysis gates the QNN backend
+implementation (PARK-027) and must be completed before QNN work starts.
 
-*(Service unit file only — no Claude Code Prompt needed.)*
+### Claude Code Prompt
+```
+Research and document QNN + QNX compatibility. Write findings to decisions.md.
+
+Tasks:
+1. Review Qualcomm AI Engine Direct SDK release notes for QNX support.
+   Document supported QNX versions and SDK version requirements.
+2. Identify FFI linking differences: shared library names, rpath differences,
+   init/teardown order between QNX and Linux.
+3. Document memory model constraints:
+   - Can QNN SDK allocate device memory on QNX without dynamic alloc in run()?
+   - What is the POSIX memory API subset available on QNX?
+4. Identify any features of the InferenceBackend zero-copy contract (ADL-003)
+   that conflict with QNX + QNN requirements.
+5. Write a "QNN + QNX Compatibility" section to decisions.md with:
+   - Go/no-go recommendation for PARK-027 on QNX
+   - Required SDK versions
+   - List of known constraints
+```
 
 ---
 
-## PARK-028 `packaging` `chore` `epic:packaging`
+## PARK-026 `qnx` `backend-architecture` `docs`
+
+**Define QNX-safe backend selection rules**
+
+Document and enforce QNX-safe backend selection: no dynamic allocation in the
+backend hot-path, restricted POSIX API surface, and single-process model constraints.
+Add QNX as a recognized target in `BackendSelector` with appropriate restrictions.
+Blocked until PARK-024 confirms which POSIX features are available.
+
+### Claude Code Prompt
+```
+After PARK-024 is complete, add QNX-safe rules to BackendSelector.
+
+Requirements:
+1. Add compile-time gate:
+     #[cfg(target_os = "nto")]  // QNX Neutrino
+   to any code path that uses features unavailable on QNX (as found in PARK-024).
+2. In BackendSelector::new on QNX targets:
+   - If TensorRT requested: warn + fall back to CPU (TensorRT not available on QNX).
+   - If QNN requested and feature enabled: proceed (per PARK-025 analysis).
+   - Document the QNX-specific fallback table in decisions.md.
+3. Add a doc comment to BackendSelector explaining QNX constraints.
+4. Verify: cargo build --target x86_64-pc-nto-qnx710 -p parko-core succeeds.
+```
+
+---
+
+## PARK-027 `backend-qnn` `feat`
+
+**QNN backend MVP — first implementation**
+
+First real implementation of the QNN backend via Qualcomm AI Engine Direct SDK C
+FFI. No prior QNN backend code exists in this repository. Depends on PARK-025
+(compatibility analysis). Hardware test `#[ignore]`'d in CI; stub from PARK-012
+used for CI validation.
+
+### Claude Code Prompt
+```
+Create parko-core/src/backends/qnn.rs. This is a first implementation.
+Gate: #[cfg(feature = "backend-qnn")].
+
+IMPORTANT: First complete PARK-025 (QNN + QNX compatibility analysis).
+Verify SDK version requirements before writing any FFI bindings.
+
+Requirements:
+1. Use Qualcomm QNN SDK C FFI: Qnn_Interface_t, QnnBackend_Config_t, QnnTensor_t.
+2. pub struct QnnBackend { /* context, graph, tensor handles; no per-run alloc */ }
+3. QnnBackend::new(model_path: &str) -> Result<Self, BackendError>
+4. run: populate input tensor; if int8 model, quantize using scale/offset from metadata;
+   execute; dequantize output to &mut [f32].
+5. descriptor() returns BackendDescriptor::QualcommQnn.
+6. Hardware test #[ignore]: compare top-1 class with CPU reference within tolerance.
+7. CI test: QnnStubBackend from PARK-012 still compiles and outputs zeros.
+```
+
+---
+
+## PARK-028 `backend-tidl` `feat`
+
+**TIDL backend MVP — first implementation**
+
+First real implementation of the TIDL backend via TI TIDL runtime C FFI,
+cross-compiled to `aarch64-unknown-linux-gnu`. No prior TIDL backend code exists.
+Target hardware: TDA4VM. Hardware test `#[ignore]`'d; CI uses the stub from PARK-012.
+
+### Claude Code Prompt
+```
+Create parko-core/src/backends/tidl.rs. This is a first implementation.
+Gate: #[cfg(feature = "backend-tidl")].
+
+Requirements:
+1. Use TI TIDL C FFI (tivxTIDLNode, TIDL_IOBufDesc_t).
+2. Cross-compile target: aarch64-unknown-linux-gnu.
+3. TidlBackend::new(model_path: &str) -> Result<Self, BackendError>.
+4. run: copy &[f32] to TIDL input buffer; execute; copy to &mut [f32].
+5. descriptor() returns BackendDescriptor::TiTidl.
+6. Hardware test #[ignore]: compare output within 1e-3 of CPU reference.
+7. Add parko-core/build.rs for TIDL C FFI linking if needed.
+```
+
+---
+
+## PARK-029 `backend-openvino` `feat`
+
+**OpenVINO backend MVP — first implementation**
+
+First real implementation of the OpenVINO backend using `openvino-rs`. Unlike other
+hardware backends, testable in CI using the OpenVINO CPU plugin. Integration test
+uses an identity model fixture; output must match input within 1e-6. First
+implementation; no prior OpenVINO backend code exists.
+
+### Claude Code Prompt
+```
+Create parko-core/src/backends/openvino.rs. This is a first implementation.
+Gate: #[cfg(feature = "backend-openvino")].
+
+Requirements:
+1. Add openvino = { version = "0.7", optional = true } activated by feature.
+2. pub struct OpenVinoBackend { core, compiled, input_size, output_size }
+3. OpenVinoBackend::new(model_xml: &str, model_bin: &str) -> Result<Self, BackendError>
+4. run: validate lengths; set tensor; infer; copy to output slice.
+5. Integration test (NOT #[ignore]; runs on CI via CPU plugin):
+   Use tiny identity model in tests/fixtures/identity.xml + identity.bin.
+   Assert output == input within 1e-6.
+6. Stub (PARK-012) still usable when feature is off.
+```
+
+---
+
+## PARK-030 `backend-amd` `feat` `docs`
+
+**AMD backend MVP — decide Vitis AI vs ROCm, then implement**
+
+Decide between AMD Vitis AI (Xilinx FPGA path) and AMD ROCm (GPU path) based on
+available hardware and customer requirements. Record the decision in `decisions.md`.
+Implement the chosen path as an MVP; hardware test `#[ignore]`'d in CI. First
+implementation; no prior AMD backend code exists.
+
+### Claude Code Prompt
+```
+Before writing code, record the AMD backend decision in decisions.md:
+- Vitis AI: requires Xilinx FPGA, uses xrt crate or Vitis AI C API.
+- ROCm: requires AMD GPU, uses migraphx crate or HIP C FFI.
+- State which was chosen and why (hardware availability, customer pull).
+
+Then implement the chosen backend:
+Gate: #[cfg(feature = "backend-amd")].
+
+Requirements:
+1. pub struct AmdBackend { /* pre-allocated buffers */ }
+2. AmdBackend::new(model_path: &str) -> Result<Self, BackendError>.
+3. run: no per-inference alloc; copy to output slice.
+4. descriptor() returns BackendDescriptor::AmdVitis.
+5. Hardware test #[ignore].
+6. Stub (PARK-012) still compiles when feature is off.
+```
+
+---
+
+## PARK-031 `packaging` `chore`
+
+**Normalize Kirra naming across Docker/Helm**
+
+Remove remaining Aegis references from Docker image names, Helm chart values,
+environment variable names, service unit files, and install scripts. All deployment
+artifacts must use Kirra naming consistently. A `grep -r aegis` scan (case-insensitive)
+should return only intentional or historical references after this task.
+
+### Claude Code Prompt
+```
+Search for all remaining Aegis references in deployment artifacts:
+  grep -ri "aegis" docker-compose.yml Dockerfile helm/ charts/ scripts/ install.sh
+
+For each reference, either:
+- Rename to Kirra equivalent (e.g. aegis-verifier → kirra-verifier)
+- Or add a comment explaining why the legacy name is intentionally preserved
+
+After renaming:
+- Verify docker-compose.yml builds: docker compose build
+- Verify helm chart lints: helm lint helm/kirra/
+- Verify install.sh --help runs without error
+- Run: grep -ri "aegis" docker-compose.yml Dockerfile helm/ charts/ scripts/ install.sh
+  and confirm only intentional references remain
+```
+
+---
+
+## PARK-032 `packaging` `feat`
+
+**Add Parko runtime into Kirra Docker image**
+
+Extend the Kirra Docker image to include parko-core, the InferenceLoop, and
+`BackendSelector`. One image contains parko runtime + kirra-runtime-sdk +
+KirraGovernor + dashboard. Configured by `KIRRA_BACKEND` env var; both `/health`
+and the inference loop must respond in the combined image.
+
+### Claude Code Prompt
+```
+Update the Kirra Dockerfile to include parko-core.
+
+Requirements:
+1. Add parko workspace to the Dockerfile build stage:
+   COPY parko/ parko/
+   RUN cargo build --release -p parko-core -p parko-onnx (+ any governor crate)
+2. The combined image must start kirra_safety_runtime (or equivalent combined binary)
+   and expose /health + /inference/status.
+3. KIRRA_BACKEND env var selects backend (default: cpu).
+4. Test: docker build -t kirra:test . && docker run --rm -e KIRRA_ADMIN_TOKEN=test
+         kirra:test /health → 200
+5. Update docker-compose.yml to use the combined image.
+6. Image must be < 2 GB uncompressed (document any deviation).
+```
+
+---
+
+## PARK-033 `packaging` `chore`
 
 **Backend-aware installer**
 
-`install.sh --backend <ort|qnn|tidl|openvino|rocm>` downloads the correct binary
-for the host architecture, configures the systemd unit, and completes without
-prompts when `--yes` is passed.
-
-*(Update to existing `install.sh` — bash script work, no Claude Code Prompt needed.)*
+Update `install.sh` to accept `--backend <cpu|tensorrt|qnn|tidl|openvino|amd>`.
+Downloads the correct binary variant for the host architecture, configures the
+systemd unit with the right `KIRRA_BACKEND` value, and completes without prompts
+when `--yes` is passed.
 
 ---
 
-## PARK-029 `packaging` `feat` `epic:packaging`
+## PARK-034 `packaging` `chore`
 
-**Dashboard inference panels**
+**systemd unit with watchdog**
 
-Four React panels in the existing React dashboard: inference tick rate, backend
-P99 latency, RSS margin (longitudinal and lateral), posture sparkline. All panels
-show "—" gracefully when the service is unreachable.
+Create `scripts/kirra-safety-runtime.service` with `WatchdogSec=5`,
+`MemoryMax=512M`, `CPUQuota=80%`. The unit must restart automatically on watchdog
+timeout or OOM kill. Verify with `systemd-analyze verify` before marking Done.
+
+---
+
+## PARK-035 `packaging` `qnx` `chore`
+
+**QNX packaging stub**
+
+Define the `kirra-qnx.tar.gz` artifact structure and a placeholder Makefile for QNX
+deployment. This task is blocked until PARK-024 (QNX deployment spike) produces a
+working binary. Create the stub so the release pipeline has a slot for the QNX
+artifact when QNX work lands.
+
+---
+
+## PARK-036 `ros2` `robot` `chore`
+
+**Bring up ROS2 Jazzy on Ubuntu 24.04**
+
+Install and configure ROS2 Jazzy on Ubuntu 24.04 for the reference robot workspace.
+Verify basic pub/sub with `ros2 topic echo`. Create the colcon workspace with the
+`kirra_safety` package. BLOCKED: requires Hiwonder hardware delivery or an
+alternative simulation environment.
+
+---
+
+## PARK-037 `ros2` `robot` `kirra-governor` `feat`
+
+**Integrate Parko + KirraGovernor with ROS2 cmd_vel topics**
+
+Wire the Parko control loop and KirraGovernor into ROS2 cmd_vel topics:
+`cmd_vel` → governor → `filtered_cmd_vel`. The governor's hard-veto on
+Degraded/LockedOut must be observable on the filtered topic. Depends on PARK-036.
+KirraGovernor authority model: hard-veto on Degraded/LockedOut, clamp on Nominal,
+conservative fallback if unreachable.
 
 ### Claude Code Prompt
 ```
-In dashboard/src/components/ (create new files), add four panels.
+In ros2_ws/src/kirra_safety/kirra_safety/cmd_vel_interceptor.py (or equivalent),
+wire the Parko ControlLoop + KirraGovernor into the ROS2 pipeline.
+
+Before writing code, verify the actual governor struct name:
+  grep -r "AegisGovernor\|KirraGovernor\|Governor" parko/ --include="*.rs" -n
 
 Requirements:
-1. InferenceTickPanel.tsx: polls GET /inference/status every 2s; renders
-   tick_rate_hz and p99_latency_ms; shows "—" on error.
-2. RssMarginPanel.tsx: polls GET /fleet/rss/status every 1s; renders
-   longitudinal_margin and lateral_margin as progress bars (red if safe==false).
-   Add GET /fleet/rss/status to kirra_safety_runtime returning
-   { longitudinal_margin: f64, lateral_margin: f64, safe: bool }.
-3. PostureSparklinePanel.tsx: reads last 60 posture events from SSE
-   /system/posture/stream; renders 60-point sparkline
-   (green=Nominal, yellow=Degraded, red=LockedOut).
-4. BackendLatencyPanel.tsx: buffers last 100 p99_latency_ms samples; mini histogram.
-5. Wire all four panels into the main dashboard layout.
-6. All panels handle fetch errors (no crash; show "—" or "Offline").
-7. Use existing dashboard styling; no new UI libraries.
+1. Subscribe to /cmd_vel (geometry_msgs/Twist).
+2. For each message:
+   a. Query current FleetPosture from kirra-runtime-sdk.
+   b. Call KirraGovernor.enforce(commanded_vel, posture).
+   c. Publish result to /filtered_cmd_vel.
+3. If posture is Degraded or LockedOut: output velocity == 0.0 (hard veto).
+4. If posture is Nominal: apply kinematic clamp; publish clamped value.
+5. Test: inject Degraded posture via set_state_for_test; assert /filtered_cmd_vel == 0.
+6. Use Kirra naming in all comments and docs.
 ```
 
 ---
 
-## PARK-030 `packaging` `chore` `epic:packaging`
+## PARK-038 `ros2` `robot` `simulation` `feat`
 
-**v1.2.0 release pipeline**
+**Build full reference robot stack**
 
-CI matrix builds all backend variants for x86_64, aarch64, and armv7 musl targets.
-All tarballs and a SHA256SUMS file are attached to the GitHub Release.
-
-### Claude Code Prompt
-```
-Update .github/workflows/release.yml.
-
-Requirements:
-1. Add backend dimension to the build matrix:
-     include:
-       - target: x86_64-unknown-linux-musl; backend: ort
-       - target: x86_64-unknown-linux-musl; backend: openvino
-       - target: aarch64-unknown-linux-musl; backend: qnn
-       - target: aarch64-unknown-linux-musl; backend: tidl
-       - target: armv7-unknown-linux-musleabihf; backend: ort
-2. Each entry compiles with --features backend-<backend>.
-3. Archive name: kirra-${VERSION}-${TARGET}-${BACKEND}.tar.gz.
-4. Attach all archives + SHA256SUMS to the GitHub Release.
-5. Do not break existing cross-compilation jobs.
-```
+Full integration: Parko + KirraGovernor + ROS2 Jazzy + kirra_safety interlock +
+CARLA simulation as hardware alternative. Depends on PARK-037 and Hiwonder hardware
+availability. BLOCKED until PARK-037 is complete and physical hardware (Hiwonder
+robot) is available or CARLA simulation is substituted.
 
 ---
 
-## PARK-031 `docs` `safety-case` `epic:certification`
+## PARK-039 `safety-case` `docs`
 
-**Complete RTM (KIRRA-RTM-001)**
-
-Complete the Requirements Traceability Matrix so every ISO 26262 ASIL-D safety
-requirement links to a source line, a test ID, and a coverage entry. The HARA,
-Safety Goals, and Architecture documents already exist; the RTM connects them to
-code and tests.
-
-*(Document work only — no Claude Code Prompt needed.)*
-
----
-
-## PARK-032 `docs` `safety-case` `epic:certification`
-
-**IEC 61508 SIL 3 requirements mapping — first implementation**
+**Map IEC 61508 SIL 3 requirements — first implementation**
 
 IEC 61508 SIL 3 has been identified as a target standard but no mapping document
-exists yet. This task produces the first SIL 3 requirements mapping: identify
-existing safety functions that can claim SIL 3, identify gaps, and document
-required mitigations or additional measures.
-
-*(Document work only — no Claude Code Prompt needed.)*
+exists. Identify existing Kirra safety functions that can claim SIL 3 compliance;
+identify gaps; document required mitigations or additional measures. Every SIL 3
+safety function claim must have an implementation entry or explicit gap note.
 
 ---
 
-## PARK-033 `docs` `safety-case` `epic:certification`
+## PARK-040 `safety-case` `docs`
 
-**ASTM F3269-21 bounded-operation envelope mapping — first implementation**
+**Map ASTM F3269-21 bounded-operation envelope — first implementation**
 
-ASTM F3269 has been identified as a target standard but no mapping exists yet.
-Define the Nominal, Degraded, and BLLOS (Beyond Line of Sight) operational
-envelopes per §6, and trace each to posture engine states and governor limits
-in the codebase.
-
-*(Document work only — no Claude Code Prompt needed.)*
-
----
-
-## PARK-034 `test` `safety-case` `epic:certification`
-
-**MC/DC coverage report**
-
-`cargo-llvm-cov` MC/DC coverage for `posture_cache.rs`, `posture_engine_v2.rs`,
-`kirra_core.rs` (or the Kirra governor crate's core file), and `rss.rs`. CI
-fails if any of the four files is below 100% MC/DC.
-
-### Claude Code Prompt
-```
-Create or update .github/workflows/coverage.yml.
-
-Requirements:
-1. Job: mcdc-coverage, runs-on: ubuntu-latest.
-2. Install: cargo install cargo-llvm-cov.
-3. Run: cargo llvm-cov --mcdc --json --output-path coverage.json
-         -p kirra-runtime-sdk -p parko-core
-4. Parse coverage.json and fail if any of these files is below 100% MC/DC:
-   posture_cache.rs, posture_engine_v2.rs, kirra_core.rs (or governor equiv), rss.rs.
-5. Also generate --html report; upload as artifact "mcdc-coverage".
-6. Trigger on push to main and pull_request.
-```
-
----
-
-## PARK-035 `docs` `safety-case` `epic:certification`
-
-**FMEA (KIRRA-FMEA-001)**
-
-Failure Mode and Effects Analysis covering: posture stale cache, governor bypass,
-attestation replay, nonce exhaustion, RSS numerical overflow, backend latency
-watchdog failure. Each failure mode requires severity, detection method, and
-mitigation entry.
-
-*(Document work only — no Claude Code Prompt needed.)*
-
----
-
-## PARK-036 `docs` `safety-case` `epic:certification`
-
-**DFA (KIRRA-DFA-001)**
-
-Dependent Failure Analysis for common-cause failures in the HA active/passive
-pair on NFS-shared SQLite per ISO 26262 Part 9. Identify all single points of
-failure and propose independent protections.
-
-*(Document work only — no Claude Code Prompt needed.)*
-
----
-
-## PARK-037 `feat` `safety-case` `epic:certification`
-
-**Offline kirra_audit_verify binary**
-
-Reads the audit chain from SQLite, verifies Ed25519 signatures, prints a
-tamper-evidence report, and exits 1 on any corruption. Read-only; does not
-require `KIRRA_ADMIN_TOKEN`. Used by auditors without a running service.
-
-### Claude Code Prompt
-```
-Create kirra-runtime-sdk/src/bin/kirra_audit_verify.rs.
-
-Requirements:
-1. CLI: kirra_audit_verify --db <path> [--verbose]
-   (use clap, which is already a dependency, or std::env::args).
-2. Open SQLite read-only at --db path using VerifierStore.
-3. Read all rows from audit_log_chain ORDER BY id ASC.
-4. For each row:
-   a. Recompute SHA-256(previous_hash || entry_data); compare with stored hash.
-   b. If an Ed25519 signature is present, verify against trusted_federation_controllers.
-   c. Print: "Row NNN: OK" or "Row NNN: TAMPERED (hash mismatch)" etc.
-5. Exit 0 if all rows OK; exit 1 if any row fails.
-6. Does not require KIRRA_ADMIN_TOKEN.
-7. Test A: valid 5-entry chain → exit 0.
-8. Test B: corrupt one byte in row 3 → exit 1; row 3 named in output.
-9. All ~333 existing tests must remain green.
-```
-
----
-
-## PARK-038 `docs` `safety-case` `epic:certification`
-
-**SOTIF analysis (KIRRA-SOTIF-001)**
-
-ISO 21448 SOTIF analysis covering intended function boundaries, triggering
-conditions, and evaluation scenarios for the inference loop + RSS governor
-integration. Identifies conditions where correct function leads to unsafe
-outcomes (e.g., model confidence edge cases, latency-induced RSS gap errors).
-
-*(Document work only — no Claude Code Prompt needed.)*
-
----
-
-## PARK-039 `simulation` `test` `epic:certification`
-
-**HIL test harness**
-
-Scriptable harness connecting `kirra_safety_runtime` to CARLA or a kinematics
-integrator at 100 Hz. Runs 1 000 randomized trajectories from a fixed seed;
-logs all inputs/outputs/posture to a timestamped CSV; exits 1 if any RSS
-violation produces a non-zero output velocity.
-
-### Claude Code Prompt
-```
-Create kirra-runtime-sdk/tests/hil/ directory with the HIL harness.
-
-Requirements:
-1. tests/hil/hil_runner.rs: binary test connecting to a running
-   kirra_safety_runtime via HTTP.
-2. Sends vehicle state updates at 100 Hz via POST /attestation/verify
-   (or the appropriate telemetry endpoint).
-3. Reads posture from GET /fleet/posture or SSE /system/posture/stream.
-4. Logs to tests/hil/output/<timestamp>.csv:
-   tick_ms, ego_vel, lead_vel, gap, commanded_vel, output_vel, posture.
-5. Detects failures:
-   a. Any RSS violation that produces output_vel > 0.
-   b. Posture stays Nominal when gap < safe_distance for > 1 tick.
-   c. Service unreachable → fail immediately.
-6. Run 1_000 randomized trajectories from a fixed seed.
-7. Exit 0 on zero escapes; exit 1 with failing trajectory details.
-8. tests/hil/README.md: how to run against CARLA and against built-in sim.
-```
-
----
-
-## PARK-040 `docs` `epic:certification`
-
-**Update docs/architecture.md**
-
-Update the architecture document to reflect the multi-silicon backend map,
-the RSS governor integration, the IEC 61508 / ASTM F3269 operational envelopes,
-and the ASIL decomposition. Mermaid block diagram must match current codebase.
-
-### Claude Code Prompt
-```
-Update (or create) docs/architecture.md.
-
-Requirements:
-1. Section 1: System Block Diagram (Mermaid flowchart LR).
-   Include: AI Agent → Action Filter → Posture Engine → InferenceLoop →
-   BackendSelector → [ORT, QNN, TIDL, ROCm, OpenVINO] and
-   InferenceLoop → Kirra Governor → RSS Gate → Actuator.
-2. Section 2: Data Flow — describe what crosses each arrow, who owns the buffer,
-   what validation occurs. Do not invent requirements; source from CLAUDE.md and
-   existing source files.
-3. Section 3: Security Boundaries — trust boundary diagram; reference security
-   invariants from CLAUDE.md.
-4. Section 4: ASIL Decomposition Table
-   | Component | ASIL Claim | Justification |
-   Source claims from KIRRA-SA-001 and the HARA in docs/safety/.
-5. Section 5: Operational Envelopes (stub, to be completed in PARK-033):
-   Nominal, Degraded, BLLOS — trace to posture states.
-6. Do not claim IEC 61508 or ASTM F3269 are complete; note "mapping in progress".
-```
+ASTM F3269 has been identified as a target standard but no mapping exists. Define
+the Nominal, Degraded, and BLLOS (Beyond Line of Sight) operational envelopes per
+§6; trace each to the posture engine states and KirraGovernor limits in the codebase.
+Do not claim any ASTM F3269 compliance until this mapping is complete and reviewed.
