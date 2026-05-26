@@ -150,134 +150,72 @@ by a proptest generating adversarial floats (NaN, Inf, -Inf, subnormals).
 ### Claude Code Prompt
 ```
 PREREQUISITE: PARK-001 (with_governor builder) must be complete.
-Verify before proceeding:
-
-  grep -n "governor\|with_governor" parko/parko-core/src/control_loop.rs
-
-If the governor field and delegation are absent, stop and report:
-"PARK-001 not complete."
+Verify: grep -n "governor\|with_governor" parko/parko-core/src/control_loop.rs
+If absent, stop: "PARK-001 not complete."
 
 You are working in the parko-core crate.
 Use Kirra naming in all new comments and docs.
 
-======================================================================
+AUTHORITY MODEL (canonical, commits 9943aa9/e1ba1a2/21c3a35):
+  LockedOut → 0.0 (hard stop, no exceptions)
+  Degraded  → min(proposed, MRC_VELOCITY_CEILING_MPS)
+  Nominal   → nominal profile
+  The NaN/Inf guard fires BEFORE the governor. Its safe return value
+  is the return type's safe floor — NOT the MRC ceiling.
+
 STEP 0: VERIFY TYPES BEFORE WRITING CODE
-======================================================================
 
-1. Check the actual return type of tick():
+  grep -n "fn tick" parko/parko-core/src/control_loop.rs
+  grep -r "EnforcementAction\|enum.*Action" parko/parko-core/src/ --include="*.rs"
+  grep -n "fn tick\|proposed\|input\|cmd" parko/parko-core/src/control_loop.rs | head -20
 
-     grep -n "fn tick" parko/parko-core/src/control_loop.rs
+Determine safe return value:
+- EnforcementAction::Halt if that variant exists
+- 0.0 if tick() returns f64
+- zeroed struct if tick() returns a command struct
+- Err(...) if tick() returns Result
 
-2. Check whether EnforcementAction exists:
+Add comment: // Priority 0: NaN/Inf rejection — guard fires before governor
+             // Safe return is NOT the MRC ceiling — ADL-001
 
-     grep -r "EnforcementAction\|enum.*Action" \
-       parko/parko-core/src/ --include="*.rs"
-
-3. Check the actual input type of tick() (f64, PlannedCommand, slice, etc.):
-
-     grep -n "fn tick\|proposed\|input\|cmd" \
-       parko/parko-core/src/control_loop.rs | head -20
-
-Based on what you find, determine the safe return value for the guard:
-
-- If tick() returns EnforcementAction and a Halt variant exists:
-    safe return = EnforcementAction::Halt
-- If tick() returns f64:
-    safe return = 0.0
-- If tick() returns a command struct:
-    safe return = zeroed/default struct
-- If tick() returns Result<...>:
-    safe return = Err(...) with an appropriate error variant
-
-In all cases, add a comment above the guard:
-    // Priority 0: NaN/Inf rejection — no arithmetic on invalid inputs
-    // Guard fires before governor — safe return is NOT the MRC ceiling
-    // Consistent with validate_vehicle_command in kirra-runtime-sdk
-
-If the input is a struct or slice, check ALL numeric fields for
-NaN/Inf, not just the first.
-
-======================================================================
-AUTHORITY MODEL (corrected per ADL-001, commit 8be497e)
-======================================================================
-
-KirraGovernor applies profile-based enforcement:
-- Degraded/LockedOut: MRC fallback profile — 5.0 m/s ceiling
-- Nominal: 35.0 m/s ceiling, stricter accel rate-limit
-
-The NaN/Inf guard fires BEFORE the governor. The safe return value
-is NOT the MRC ceiling — it is the return type's safe floor from
-STEP 0. The governor profile does not apply to NaN/Inf inputs.
-
-======================================================================
-TASK: Add NaN/Inf input guard at the top of tick()
-======================================================================
-
-File: parko-core/src/control_loop.rs
-
-Requirements:
-1. Add guard at the top of tick(), before any governor or clamp logic:
-
-     // Priority 0: NaN/Inf rejection — no arithmetic on invalid inputs
-     // Guard fires before governor — safe return is NOT the MRC ceiling
-     if proposed_output.is_nan() || proposed_output.is_infinite() {
-         return <safe return value from STEP 0>;
+REQUIREMENTS:
+1. Guard at top of tick(), before any governor or clamp logic:
+     if proposed.is_nan() || proposed.is_infinite() {
+         return <safe return value>;
      }
-
-   If input is a struct, check each numeric field individually.
-   If input is a slice, check all elements in a loop.
-
+   If struct input: check each numeric field.
+   If slice input: check all elements in a loop.
 2. Do not change governor logic.
 3. Do not change clamp logic.
 4. No unsafe code.
 
-Tests:
+TESTS:
 
-TEST 1 — Adversarial proptest (NaN/Inf → safe return, no panic):
-
-  use proptest::prelude::*;
+TEST 1 — Adversarial proptest:
   proptest! {
-      #[test]
       fn test_nan_inf_inputs_guard_fires_no_panic(
           v in prop_oneof![
-              Just(f64::NAN),
-              Just(f64::INFINITY),
-              Just(f64::NEG_INFINITY),
-              proptest::num::f64::SUBNORMAL,
+              Just(f64::NAN), Just(f64::INFINITY),
+              Just(f64::NEG_INFINITY), proptest::num::f64::SUBNORMAL,
           ]
       ) {
-          let mut loop_ = ControlLoop::new();
-          let result = loop_.tick(<command from v>);
-          // Guard fires before governor — safe return is NOT MRC ceiling
-          prop_assert_eq!(result, <safe return value from STEP 0>);
+          let result = ControlLoop::new().tick(<cmd from v>);
+          prop_assert_eq!(result, <safe return value>);
+          // Note: subnormals are finite — assert no panic only
       }
   }
 
-  Note: subnormal f64 values are finite and pass is_nan()||is_infinite().
-  Assert they do not panic — they are not expected to return the safe floor.
-
-TEST 2 — Valid input still reaches the governor unchanged:
-
-  struct RecordingGovernor {
-      last_proposed: Arc<Mutex<Option<f64>>>,
-  }
+TEST 2 — Valid input reaches governor (RecordingGovernor):
+  struct RecordingGovernor { last: Arc<Mutex<Option<f64>>> }
   impl SafetyGovernor for RecordingGovernor {
-      fn enforce(&self, proposed: <cmd type>, posture: PostureState) -> <cmd type> {
-          *self.last_proposed.lock().unwrap() = Some(<value from proposed>);
+      fn enforce(&self, proposed: <type>, _: PostureState) -> <type> {
+          *self.last.lock().unwrap() = Some(<value>);
           proposed
       }
   }
+  - Inject RecordingGovernor, call tick(5.0), assert recorded == 5.0.
 
-  test_valid_input_reaches_governor_unchanged:
-  - Inject RecordingGovernor via with_governor.
-  - Call set_state_for_test(PostureState::Nominal).
-  - Call tick() with valid finite input (e.g. 5.0).
-  - Assert RecordingGovernor recorded exactly 5.0.
-
-Verification:
-  cargo test -p parko-core
-  Confirm exit 0. Do NOT assume specific test count (currently 33).
-
+Verify: cargo test -p parko-core — exit 0. Current count: 33.
 Commit: feat(parko-core): add NaN/Inf input guard at top of tick() — Priority 0
 ```
 
@@ -294,80 +232,52 @@ from all timing tests in parko-core.
 
 ### Claude Code Prompt
 ```
-PREREQUISITE: PARK-001 (with_governor builder) must be complete.
+PREREQUISITE: PARK-001 must be complete.
 Verify: grep -n "with_governor" parko/parko-core/src/control_loop.rs
 
-You are working in the parko-core crate.
 Use Kirra naming in all new comments and docs.
 
-======================================================================
 STEP 0: VERIFY WHAT ALREADY EXISTS
-======================================================================
 
-1. Check whether Clock, RuntimeClock, or MockClock already exist:
-     grep -r "trait Clock\|RuntimeClock\|MockClock" \
-       parko/parko-core/src/ --include="*.rs"
-   If they exist, import from the existing location.
-   Only create parko-core/src/clock.rs if the trait does NOT exist.
+  grep -r "trait Clock\|RuntimeClock\|MockClock" parko/parko-core/src/ --include="*.rs"
+  grep -n "SystemTime\|Instant::now\|now_ms\|elapsed" parko/parko-core/src/control_loop.rs
+  grep -n "tick\|interval\|hz\|period" parko/parko-core/src/control_loop.rs
 
-2. Find all existing time calls in control_loop.rs:
-     grep -n "SystemTime\|Instant::now\|now_ms\|elapsed\|duration" \
-       parko/parko-core/src/control_loop.rs
-   If none exist, skip replacements — add clock field for future use.
+Only create clock.rs if Clock trait does not already exist.
 
-3. Check the tick interval:
-     grep -n "tick\|interval\|hz\|period\|50\|100\|20" \
-       parko/parko-core/src/control_loop.rs
-   Needed for the concrete test assertion.
-
-======================================================================
-TASK: Wire Clock trait into ControlLoop
-======================================================================
-
-Define in parko-core/src/clock.rs ONLY if not already present:
+DEFINE IN parko-core/src/clock.rs (if absent):
 
   pub trait Clock: Send + Sync { fn now_ms(&self) -> u64; }
   pub struct RuntimeClock;
-  impl Clock for RuntimeClock { /* SystemTime::now() */ }
+  impl Clock for RuntimeClock { /* SystemTime::now() as_millis() as u64 */ }
   pub struct MockClock { current_ms: Arc<AtomicU64> }
   impl MockClock {
       pub fn new(start_ms: u64) -> Self { ... }
-      // Use fetch_add so concurrent advances compose correctly
       pub fn advance(&self, ms: u64) {
-          self.current_ms.fetch_add(ms, Ordering::SeqCst);
+          self.current_ms.fetch_add(ms, Ordering::SeqCst); // fetch_add not store
       }
   }
   impl Clock for MockClock { fn now_ms(&self) -> u64 { load(SeqCst) } }
 
-Requirements:
+REQUIREMENTS:
 1. Add field: clock: Arc<dyn Clock> to ControlLoop.
 2. Add builder: pub fn with_clock(mut self, c: Arc<dyn Clock>) -> Self.
-3. Default in ControlLoop::new(): clock: Arc::new(RuntimeClock).
-4. Replace direct time reads with self.clock.now_ms() (from STEP 0).
+3. Default: clock: Arc::new(RuntimeClock) in ControlLoop::new().
+4. Replace direct time reads (from STEP 0) with self.clock.now_ms().
 5. No unsafe code.
 
-Tests:
+TESTS:
 
-TEST 1 — test_mock_clock_tick_count (no sleep):
-- Create MockClock starting at 0ms.
-- Wire into ControlLoop via with_clock.
-- If tick interval not configurable, add:
-    #[cfg(test)]
-    pub fn with_tick_interval_ms(mut self, ms: u64) -> Self
-- Set interval to 50ms (20Hz).
-- Verify tick fires at 0ms, does not fire at 40ms, fires again at 50ms.
-- Advance 200ms total, assert exactly 4 ticks fired.
-- Zero sleep() calls.
+TEST 1 — test_mock_clock_tick_count (zero sleep):
+  - If tick interval not configurable, add #[cfg(test)] with_tick_interval_ms.
+  - Set interval 50ms. Advance 200ms total.
+  - Assert exactly 4 ticks fired. Zero sleep() calls.
 
 TEST 2 — test_runtime_clock_default_smoke:
-- Create ControlLoop::new() with no with_clock() call.
-- Call clock.now_ms() or tick() once.
-- Assert no panic, result > 0.
+  - ControlLoop::new() with no with_clock().
+  - Call tick() once. Assert no panic, result > 0.
 
-Verification:
-  cargo test -p parko-core
-  Confirm exit 0. Do NOT assume specific test count.
-
+Verify: cargo test -p parko-core — exit 0.
 Commit: feat(parko-core): wire Clock trait into ControlLoop with MockClock support
 ```
 
@@ -675,53 +585,53 @@ name before editing.
 
 ### Claude Code Prompt
 ```
-PREREQUISITES:
-- PARK-013 (longitudinal_safe_distance) must be complete.
-- PARK-007 (crate name audit) must be complete.
-
+PREREQUISITES: PARK-013 and PARK-007 must be complete.
+Governor fix commits 9943aa9/e1ba1a2 must be in place.
 Verify:
   grep -n "longitudinal_safe_distance" parko/parko-core/src/rss.rs
   find parko/ -name "Cargo.toml" | xargs grep "^name ="
   grep -r "impl.*SafetyGovernor\|pub struct.*Governor" parko/ --include="*.rs" -n
+  cargo test -p <governor-crate-name>  # must be green before starting
 
-======================================================================
-AUTHORITY MODEL (corrected per ADL-001, commit 8be497e)
-======================================================================
+AUTHORITY MODEL (canonical, commits 9943aa9/e1ba1a2/21c3a35):
+  LockedOut → 0.0 (hard stop)
+  Degraded  → min(proposed, MRC_VELOCITY_CEILING_MPS)
+  RSS unsafe → Degraded semantics (MRC cap), NOT LockedOut
 
-RSS-unsafe behavior: apply MRC fallback profile (5.0 m/s cap), NOT 0.0.
-LockedOut/Degraded → MRC profile. RSS violation → same semantics.
+STEP 0: FIND EXISTING MRC METHOD
 
-======================================================================
-TASK: Add RSS pre-actuator gate to KirraGovernor
-======================================================================
+  grep -n "mrc\|MRC\|fallback\|Degraded\|LockedOut" parko/<governor>/src/*.rs
 
-Requirements:
-1. Add field to governor struct:
-     rss_state: RssState  // import from parko_core::rss
+Identify whether apply_mrc_profile (or equivalent) exists.
+If not, extract it from the Degraded branch of enforce() before adding the RSS gate.
+This ensures RSS unsafe and Degraded share ONE code path.
+
+STEP 1: VERIFY MRC_VELOCITY_CEILING_MPS CONSTANT
+
+  grep -rn "MRC_VELOCITY_CEILING_MPS" parko/ --include="*.rs"
+
+Must be defined with doc comment stating "NOT applied to LockedOut".
+
+REQUIREMENTS:
+1. Add field: rss_state: RssState (from parko_core::rss)
    Default: RssState { safe: true, longitudinal_margin: f64::MAX, lateral_margin: f64::MAX }
-
 2. Add: pub fn update_rss_state(&mut self, state: RssState)
-
-3. In enforce() BEFORE kinematic envelope checks:
+3. In enforce() BEFORE kinematic checks:
      if !self.rss_state.safe {
-         // RSS unsafe: MRC fallback (5.0 m/s cap) — NOT hard zero
-         // Per ADL-001: RSS violation → Degraded semantics
+         // RSS unsafe → Degraded semantics (MRC cap), NOT hard stop
+         // Per ADL-001: RSS violation is recoverable, NOT LockedOut
          return self.apply_mrc_profile(proposed);
      }
-   Verify apply_mrc_profile or equivalent method name in existing code.
-
-4. Do not change governor constructor signature.
+4. Do not change constructor signature.
 5. No unsafe code.
 
-Tests:
-A: rss_state.safe=false, vel=10.0 → assert output <= 5.0 AND output > 0.0
-B: rss_state.safe=true, vel=3.0 → normal kinematics (not capped at 5.0)
-C: rss_state.safe=false, vel=2.0 → assert output == 2.0 (MRC is a cap, not fixed)
+TESTS (use MRC_VELOCITY_CEILING_MPS constant, never hardcode 5.0):
+A: safe=false, vel=MRC+5.0 → assert output == vel.min(MRC_VELOCITY_CEILING_MPS)
+B: safe=true,  vel=3.0     → assert output == 3.0 (normal kinematics)
+C: safe=false, vel=MRC-1.0 → assert output == vel  (MRC is cap, not fixed)
+D: safe=false vs Degraded  → assert both return same value (shared code path)
 
-Verification:
-  cargo test -p <governor-crate-name>
-  Confirm exit 0. Do NOT assume specific test count.
-
+Verify: cargo test -p <governor-crate-name> — exit 0.
 Commit: feat(governor): add RSS pre-actuator gate — MRC fallback on unsafe state
 ```
 
@@ -739,54 +649,43 @@ LockedOut.
 ### Claude Code Prompt
 ```
 PREREQUISITES: PARK-013 and PARK-016 must be complete.
-Verify:
-  grep -n "longitudinal_safe_distance" parko/parko-core/src/rss.rs
-  grep -r "update_rss_state" parko/ --include="*.rs" -n
+Governor tests must be green before starting:
+  cargo test -p <governor-crate-name>
 
-======================================================================
-AUTHORITY MODEL (corrected per ADL-001, commit 8be497e)
-======================================================================
+AUTHORITY MODEL (canonical, commits 9943aa9/e1ba1a2/21c3a35):
+  LockedOut → 0.0 (hard stop)
+  Degraded  → min(proposed, MRC_VELOCITY_CEILING_MPS)
+  RSS unsafe → Degraded semantics (MRC cap)
+Use MRC_VELOCITY_CEILING_MPS constant everywhere. Never hardcode 5.0.
 
-RSS unsafe → MRC fallback (5.0 m/s cap), NOT hard zero.
-Assertions: if !rss_safe → assert out <= 5.0, NOT out == 0.0.
+FILE: parko-core/tests/rss_property.rs
 
-======================================================================
-TASK: RSS property test suite — 3 posture variants × 10,000 cases
-======================================================================
-
-File: parko-core/tests/rss_property.rs
-
-Three proptest! blocks (one per PostureState variant).
-Input strategy for all blocks:
-  ego_vel in 0.0f64..150.0,
-  lead_vel in 0.0f64..150.0,
-  gap in 0.001f64..500.0,
-  commanded_vel in 0.0f64..150.0
-Do NOT use arbitrary f64.
+THREE proptest! BLOCKS — cases = 10_000 each.
+Input strategy (never arbitrary f64):
+  ego_vel in 0.0f64..150.0, lead_vel in 0.0f64..150.0,
+  gap in 0.001f64..500.0,   commanded in 0.0f64..150.0
 
 For each block:
   safe_dist = longitudinal_safe_distance(ego_vel, lead_vel, 0.5, 3.0, 6.0, 8.0)
   rss_safe = gap >= safe_dist
+  let expected = commanded.min(MRC_VELOCITY_CEILING_MPS);
 
 BLOCK 1 — Nominal:
-  if !rss_safe: prop_assert!(out <= 5.0)  // MRC cap — NOT == 0.0
-  if rss_safe:  prop_assert!(out <= commanded_vel)
+  if !rss_safe: prop_assert_eq!(out, expected)    // MRC cap — exact contract
+  if  rss_safe: prop_assert!(out <= commanded)
 
 BLOCK 2 — Degraded:
-  Posture is already Degraded → MRC applies regardless of RSS:
-  prop_assert!(out <= 5.0)
+  prop_assert_eq!(out, expected)  // MRC applies regardless of RSS
 
 BLOCK 3 — LockedOut:
-  LockedOut maps to MRC profile (same as Degraded):
-  prop_assert!(out <= 5.0)
+  prop_assert_eq!(out, 0.0,       // hard stop — NOT MRC cap
+      "LockedOut must return 0.0, got {} for input {}", out, commanded);
 
-cases = 10_000 per block. No unsafe code.
+No unsafe code.
 
-Verification:
-  cargo test -p parko-core -- rss_property
-  Confirm exit 0.
-
-Commit: test(parko-core): RSS property tests — 3 posture variants × 10,000 cases
+Verify: cargo test -p parko-core -- rss_property — exit 0.
+Any failure is a real contract violation — report, do not suppress.
+Commit: test: RSS property tests — exact MRC contract, 3 posture variants × 10,000 cases
 ```
 
 ---
@@ -830,50 +729,57 @@ green.
 ### Claude Code Prompt
 ```
 PREREQUISITES: PARK-013, PARK-015, PARK-016, PARK-007 must be complete.
+Governor fix commits 9943aa9/e1ba1a2 must be in place.
 Verify:
   grep -n "longitudinal_safe_distance" parko/parko-core/src/rss.rs
   grep -n "RssViolation\|RssState" kirra-runtime-sdk/src/posture_engine*.rs
   grep -n "update_rss_state" parko/ -r --include="*.rs"
-  grep -r "MockClock\|VirtualClock\|struct.*Clock" \
-    kirra-runtime-sdk/src/ --include="*.rs" -n
+  grep -r "MockClock\|VirtualClock\|struct.*Clock" kirra-runtime-sdk/src/ --include="*.rs" -n
+  grep -r "pub struct.*Governor\|impl SafetyGovernor" parko/ --include="*.rs" -n
+  cargo test -p <governor-crate-name>  # must be green
 
-Record actual clock type name and governor struct name from above.
+Record actual clock type name and governor struct name.
 
-======================================================================
-AUTHORITY MODEL (corrected per ADL-001, commit 8be497e)
-======================================================================
+AUTHORITY MODEL (canonical, commits 9943aa9/e1ba1a2/21c3a35):
+  LockedOut → 0.0 (hard stop)
+  Degraded  → min(proposed, MRC_VELOCITY_CEILING_MPS)
+  RSS unsafe → Degraded semantics (MRC cap), NOT LockedOut
 
-RSS violation → MRC fallback (5.0 m/s cap), NOT hard zero.
-Assert: gap < safe_distance → output <= 5.0 (NOT == 0.0).
+FILE: kirra-runtime-sdk/tests/rss_simulation.rs
 
-======================================================================
-TASK: 10,000-scenario adversarial simulation
-======================================================================
-
-File: kirra-runtime-sdk/tests/rss_simulation.rs
-
-Requirements:
+REQUIREMENTS:
 1. Use ScenarioRunner from kirra_runtime_sdk::scenario_runner.
 2. Use actual clock type from prerequisite check. No sleep().
-3. 10,000 scenarios × 10 ticks. Deterministic seed. Mix of
-   gaps below and above safe distance.
+3. 10,000 scenarios × 10 ticks. Deterministic seed.
+   Include scenarios that reach LockedOut posture as well as Degraded.
 4. Per tick:
-   a. Compute RssState from parko_core::rss::longitudinal_safe_distance.
+   a. Compute RssState from longitudinal_safe_distance.
    b. Feed into posture engine via PostureRecalcTrigger::RssViolation.
    c. Feed into governor via update_rss_state (actual struct name).
-   d. Record output velocity.
-5. Assert per violation tick:
-     assert!(output_velocity <= 5.0)  // MRC cap — NOT == 0.0
-6. Assert posture lifecycle:
-   - After RSS violation: posture == Degraded.
-   - After 5 consecutive safe ticks within 10s: posture == Nominal.
+   d. Call governor.enforce(commanded_vel, current_posture).
+   e. Record output velocity and current_posture.
+5. Assertions (use MRC_VELOCITY_CEILING_MPS, never hardcode 5.0):
+
+   If current_posture == LockedOut:
+     assert_eq!(output_velocity, 0.0,
+         "LockedOut: hard stop required, got {}", output_velocity);
+
+   If gap < safe_distance AND posture == Degraded:
+     assert!(output_velocity <= MRC_VELOCITY_CEILING_MPS,
+         "RSS Degraded: output {} exceeded MRC ceiling", output_velocity);
+
+   If gap >= safe_distance AND posture == Nominal:
+     assert!(output_velocity <= commanded_vel);
+
+6. Posture lifecycle:
+   - RSS violation → posture == Degraded.
+   - 5 consecutive safe ticks within 10s → posture == Nominal.
 7. Must complete < 60s on CI.
 8. No unsafe code.
 
-Verification:
-  cargo test -p kirra-runtime-sdk
-  ~333 existing tests must remain green.
-
+Verify:
+  cargo test -p kirra-runtime-sdk -- rss_simulation
+  cargo test -p kirra-runtime-sdk  # ~333 existing must stay green
 Commit: test(kirra-runtime-sdk): 10,000-scenario RSS adversarial simulation
 ```
 
@@ -1304,54 +1210,54 @@ conservative fallback if unreachable.
 ### Claude Code Prompt
 ```
 PREREQUISITES: PARK-001, PARK-002, PARK-007 must be complete.
+Governor fix commits 9943aa9/e1ba1a2 must be in place.
 Hiwonder robot must be available. ROS2 Jazzy must be installed.
 Verify:
   grep -n "with_governor" parko/parko-core/src/control_loop.rs
   grep -r "pub struct.*Governor\|impl SafetyGovernor" parko/ --include="*.rs" -n
+  grep -rn "MRC_VELOCITY_CEILING_MPS" parko/ --include="*.rs"
+  cargo test -p <governor-crate-name>  # must be green before any ROS2 code
   ros2 --version
   find ros2_ws/ -name "cmd_vel_interceptor.py"
 
-Use actual file path found. Use actual governor struct name found.
+If governor tests are NOT green: STOP. Fix the governor first.
+Record: actual governor struct name, MRC_VELOCITY_CEILING_MPS value, file path.
 
-======================================================================
-AUTHORITY MODEL (corrected per ADL-001, commit 8be497e)
-======================================================================
+AUTHORITY MODEL (canonical, commits 9943aa9/e1ba1a2/21c3a35):
+  LockedOut → 0.0 (hard stop) — NO motion permitted
+  Degraded  → min(proposed, MRC_VELOCITY_CEILING_MPS)
+  Nominal   → nominal profile
+  The ROS2 layer must NOT implement its own velocity cap.
+  Delegate entirely to governor.enforce(). Governor is single source of truth.
 
-Degraded/LockedOut → MRC fallback (5.0 m/s cap), NOT hard zero.
-/filtered_cmd_vel is never forced to exactly 0.0 by posture alone.
+FILE: <actual path from prerequisite check>
 
-======================================================================
-TASK: Wire KirraGovernor into ROS2 cmd_vel pipeline
-======================================================================
-
-File: ros2_ws/src/kirra_safety/kirra_safety/cmd_vel_interceptor.py
-(use actual path from prerequisite check)
-
-Requirements:
+REQUIREMENTS:
 1. Subscribe to /cmd_vel (geometry_msgs/Twist).
 2. Per message:
    a. Query FleetPosture from kirra-runtime-sdk (KIRRA_VERIFIER_ADDR).
    b. Map to PostureState: Nominal/Degraded/LockedOut.
-   c. Call KirraGovernor.enforce(commanded_vel, posture).
-   d. Publish to /filtered_cmd_vel.
-3. Degraded or LockedOut: apply MRC cap (5.0 m/s) — NOT zero.
-   Comment: "MRC cap per ADL-001 — not a hard zero veto"
-4. Nominal: apply kinematic clamp from governor.
-5. Unreachable: drop to Degraded locally, apply 5.0 m/s cap,
-   log "governor_unreachable — applying local MRC fallback".
-6. Kirra naming throughout. No new Aegis references.
+   c. Call <actual governor struct>.enforce(commanded_vel, posture).
+   d. Publish result directly to /filtered_cmd_vel. No post-processing.
+      Comment: "Output is governor output — governor is single source of truth"
+3. Unreachable: drop to Degraded, call enforce(vel, Degraded), log
+   "governor_unreachable — applying local Degraded posture".
+   Do NOT implement a separate Python cap.
+4. Kirra naming. No new Aegis references.
 
-Tests:
-A: Degraded posture, cmd=10.0 → assert filtered <= 5.0 AND > 0.0
-B: Nominal posture, cmd=2.0 → assert filtered == 2.0 (within tolerance)
-C: LockedOut posture, cmd=10.0 → assert filtered <= 5.0 AND > 0.0
+TESTS (use MRC_VELOCITY_CEILING_MPS constant, never hardcode 5.0):
+A: LockedOut, cmd=MRC+5.0 → assert filtered == 0.0 (hard stop)
+B: Degraded,  cmd=MRC+5.0 → assert filtered == cmd.min(MRC_VELOCITY_CEILING_MPS)
+C: Nominal,   cmd=2.0     → assert filtered == 2.0 (within tolerance)
+D: Degraded,  cmd=MRC-1.0 → assert filtered == cmd (MRC is cap not fixed)
 
-Verification:
+Test A confirms LockedOut ≠ Degraded at the ROS2 boundary.
+
+Verify:
+  python3 -m pytest ros2_ws/src/kirra_safety/tests/ -v  # before hardware
   colcon build --packages-select kirra_safety
-  ros2 launch kirra_safety kirra_safety.launch.py
-  python3 -m pytest ros2_ws/src/kirra_safety/tests/ -v
-
-Commit: feat(ros2): wire KirraGovernor into cmd_vel — MRC profile on Degraded/LockedOut
+  ros2 launch kirra_safety kirra_safety.launch.py        # on hardware
+Commit: feat(ros2): wire KirraGovernor into cmd_vel — delegates to governor, ADL-001
 ```
 
 ---
