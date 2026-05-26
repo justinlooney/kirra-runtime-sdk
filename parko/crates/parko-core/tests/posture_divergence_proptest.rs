@@ -91,8 +91,8 @@ proptest! {
     ) {
         prop_assume!(proposed.is_finite());
         let output = evaluate_governor(proposed, SafetyPosture::LockedOut);
-        prop_assert_eq!(
-            output, 0.0,
+        prop_assert!(
+            output == 0.0,
             "KirraGovernor LockedOut must be 0.0 (hard stop), got {} for proposed {}",
             output, proposed
         );
