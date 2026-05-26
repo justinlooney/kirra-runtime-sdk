@@ -142,10 +142,36 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
         // Thermal probe.
         let thermal_state_opt = self.probe_platform_thermals();
 
-        // Parse inference outputs.
-        let proposed_cmd = self
-            .parse_inference_to_command(&processed_outputs, loop_start_ms)
-            .map_err(|e| format!("invalid inference outputs: {}", e))?;
+        // Parse inference outputs. Non-finite values (NaN, Inf) are caught by
+        // parse_inference_to_command; treat them as a recoverable degraded
+        // condition and return a safe stopped snapshot rather than propagating
+        // the error and crashing the loop.
+        let proposed_cmd = match self.parse_inference_to_command(&processed_outputs, loop_start_ms) {
+            Ok(cmd) => cmd,
+            Err(_) => {
+                let telemetry = RuntimeTelemetry {
+                    inference_latency_ms,
+                    rolling_jitter_ms,
+                    dropped_frames: self.dropped_frame_counter,
+                    thermal_state: thermal_state_opt.unwrap_or(ThermalState::Normal),
+                    frame_age_ms,
+                    tensor_payload_bytes,
+                    backend_precision: self
+                        .cached_capabilities
+                        .precision_modes
+                        .first()
+                        .copied()
+                        .unwrap_or(PrecisionMode::FP32),
+                    backend_vendor: std::borrow::Cow::Borrowed(self.cached_capabilities.vendor_name),
+                };
+                return Ok(PostureSnapshot {
+                    frame_id: current_frame.frame_id,
+                    active_command: ControlCommand::stopped(loop_start_ms),
+                    telemetry,
+                    active_state_degraded: true,
+                });
+            }
+        };
 
         // If a safety governor is configured, evaluate the proposed command.
         // The governor's decision takes precedence over the built-in
@@ -288,8 +314,10 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Mutex;
     use crate::backend::{BackendCapabilities, BackendError, InferenceBackend, PrecisionMode, TensorStorage};
     use crate::sensor::SensorStream;
+    use proptest::prelude::*;
 
     struct TestBackend;
 
@@ -502,5 +530,144 @@ mod tests {
 
         let flushed = rx.recv().await.unwrap();
         assert!(flushed.linear_velocity <= 1.5);
+    }
+
+    // ── PARK-004 test helpers ────────────────────────────────────────────────
+
+    /// Backend that returns a configurable linear velocity; no sleep.
+    struct ConfigurableBackend {
+        linear: f32,
+    }
+
+    impl InferenceBackend for ConfigurableBackend {
+        fn load_model(&self, _: &str) -> Result<ModelHandle, BackendError> {
+            let mut inputs = HashMap::new();
+            inputs.insert("image_input".to_string(), vec![1, 3, 224, 224]);
+            Ok(ModelHandle {
+                model_id: "configurable".to_string(),
+                input_shapes: inputs,
+                output_shapes: HashMap::new(),
+                expected_precision: PrecisionMode::FP32,
+            })
+        }
+
+        fn run(&self, _: &ModelHandle, _: &TensorBatch) -> Result<TensorBatch<'static>, BackendError> {
+            let mut map = HashMap::new();
+            map.insert("cmd_vel_linear".to_string(), TensorStorage::Owned(vec![self.linear]));
+            map.insert("cmd_vel_angular".to_string(), TensorStorage::Owned(vec![0.0_f32]));
+            Ok(TensorBatch { named_tensors: map, metadata: HashMap::new() })
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                precision_modes: vec![PrecisionMode::FP32],
+                supports_zero_copy_inputs: true,
+                max_batch_size: 1,
+                vendor_name: "ConfigurableBackend",
+            }
+        }
+    }
+
+    /// Governor that records the proposed linear velocity and allows the command through.
+    struct RecordingGovernor {
+        recorded: Arc<Mutex<Option<f64>>>,
+    }
+
+    impl SafetyGovernor for RecordingGovernor {
+        fn evaluate(
+            &self,
+            proposed: &ControlCommand,
+            _previous: Option<&ControlCommand>,
+            _delta_time_s: f64,
+            _posture: SafetyPosture,
+        ) -> EnforcementAction {
+            *self.recorded.lock().unwrap() = Some(proposed.linear_velocity);
+            EnforcementAction::Allow
+        }
+    }
+
+    // ── PARK-004 proptest: NaN/Inf/subnormal model outputs ──────────────────
+
+    proptest! {
+        #[test]
+        fn nan_or_inf_model_output_produces_stopped_command(
+            val in prop_oneof![
+                Just(f32::NAN),
+                Just(f32::INFINITY),
+                Just(f32::NEG_INFINITY),
+            ]
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let (linear_vel, degraded) = rt.block_on(async {
+                let backend = Arc::new(ConfigurableBackend { linear: val });
+                let model = backend.load_model("").unwrap();
+                let (tx, _rx) = mpsc::channel(4);
+                let mut loop_engine = InferenceLoop::new(backend, model, tx);
+                let mut stream = SimpleStream { next_id: 0 };
+                let snapshot = loop_engine
+                    .tick(stream.next_frame().unwrap(), SafetyPosture::Nominal)
+                    .await
+                    .unwrap();
+                (snapshot.active_command.linear_velocity, snapshot.active_state_degraded)
+            });
+            prop_assert_eq!(
+                linear_vel, 0.0,
+                "NaN/Inf model output must produce stopped command (0.0), got {} for input {}",
+                linear_vel, val
+            );
+            prop_assert!(
+                degraded,
+                "NaN/Inf model output must set active_state_degraded=true, input={}",
+                val
+            );
+        }
+
+        #[test]
+        fn subnormal_model_output_does_not_panic(
+            val in prop::num::f32::SUBNORMAL
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let backend = Arc::new(ConfigurableBackend { linear: val });
+                let model = backend.load_model("").unwrap();
+                let (tx, _rx) = mpsc::channel(4);
+                let mut loop_engine = InferenceLoop::new(backend, model, tx);
+                let mut stream = SimpleStream { next_id: 0 };
+                // Must not panic.
+                let _ = loop_engine
+                    .tick(stream.next_frame().unwrap(), SafetyPosture::Nominal)
+                    .await
+                    .unwrap();
+            });
+        }
+    }
+
+    // ── PARK-004 unit test: finite value reaches governor unchanged ──────────
+
+    /// A valid finite model output must pass through to the governor unmodified.
+    #[tokio::test]
+    async fn valid_input_reaches_governor_unchanged() {
+        let recorded = Arc::new(Mutex::new(None::<f64>));
+        let governor = RecordingGovernor { recorded: Arc::clone(&recorded) };
+
+        let backend = Arc::new(ConfigurableBackend { linear: 3.0_f32 });
+        let model = backend.load_model("").unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+
+        let mut loop_engine = InferenceLoop::new(backend, model, tx)
+            .with_governor(governor);
+        let mut stream = SimpleStream { next_id: 0 };
+
+        let _ = loop_engine
+            .tick(stream.next_frame().unwrap(), SafetyPosture::Nominal)
+            .await
+            .unwrap();
+
+        let received = recorded.lock().unwrap().expect("governor must have been called");
+        assert_eq!(
+            received, 3.0_f64,
+            "governor must receive the exact proposed velocity from model output, got {}",
+            received
+        );
     }
 }
