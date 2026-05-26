@@ -37,3 +37,25 @@ Completed tasks will be appended here weekly.
 - Discovered: LockedOut uses MRC fallback profile (same as Degraded), not a hard-veto; nominal profile has stricter rate-of-change limits than fallback.
 - proptest = "1" added to dev-dependencies; `*.proptest-regressions` added to .gitignore.
 - All 29 unit + 4 proptest tests pass (`cargo test -p parko-core`). No unsafe code.
+
+---
+
+## PARK-005 — RuntimeClock / MockClock abstraction in ControlLoop
+Completed: 2026-05-26
+Commit: a50363d
+Labels: control-loop
+
+What landed:
+- clock.rs: Clock trait, WallClock (production), MockClock (test double)
+- ControlLoop<B>: clock field (Arc<dyn Clock>), tick_interval_ms, last_tick_ms
+- with_clock(Arc<dyn Clock>) builder
+- #[cfg(test)] with_tick_interval_ms(u64) builder
+- tick() return type: Result<Option<PostureSnapshot>, String>
+- 2 new tests: test_mock_clock_tick_count, test_runtime_clock_default_smoke
+
+Key naming decision (ADL-006):
+- WallClock = injectable Clock trait impl (clock.rs)
+- RuntimeClock = sleep-based tick driver (runtime.rs) — unchanged
+- MockClock = test double with Arc<AtomicU64> and advance(ms)
+
+Test count after PARK-005: 34 (parko-core)

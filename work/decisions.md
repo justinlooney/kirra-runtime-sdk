@@ -255,3 +255,55 @@ ISO 26262 ASIL-D fail-safe decomposition.
 - Any path that transitions to LockedOut must emit a `LockoutReason` audit chain
   entry before changing state.
 - Recovery streak resets on any new fault during the hysteresis window.
+
+---
+
+## ADL-006 — Clock abstraction naming (WallClock vs RuntimeClock)
+
+**Date:** 2026-05-26
+**Status:** Accepted
+**Deciders:** Justin Looney
+
+### Decision
+
+Two types with "clock" in their name exist in parko-core and serve
+different purposes. `WallClock` (clock.rs) implements the `Clock`
+trait and returns wall-clock milliseconds via `SystemTime` — it is
+the injectable clock used by `ControlLoop` for deterministic testing
+via `MockClock`. `RuntimeClock` (runtime.rs) is a sleep-based
+tick-rate driver — a different concept entirely. The name `WallClock`
+was chosen specifically to avoid collision with the pre-existing
+`RuntimeClock`.
+
+Any future prompt or code that references `RuntimeClock` means the
+sleep-based tick driver in runtime.rs. `WallClock` means the
+injectable `Clock` trait implementation in clock.rs. These must never
+be confused.
+
+`MockClock` (clock.rs) is the test double: `Arc<AtomicU64>`,
+`advance(ms)`, and `Clone`. The pattern is: test keeps one handle,
+`ControlLoop` holds the other via `Arc::new(mock.clone())`. This
+enables deterministic time control with zero `sleep()` calls.
+
+`ControlLoop::tick()` returns `Result<Option<PostureSnapshot>, String>`:
+- `Ok(None)` — tick interval not yet elapsed, no action taken
+- `Ok(Some(snapshot))` — interval elapsed, inference ran, snapshot returned
+- `Err(msg)` — error in the inference or governor path
+
+### Why
+
+`RuntimeClock` was already a public export from parko-core (`runtime.rs`) before
+the Clock trait was introduced. Reusing the name would have created a type
+collision and broken the existing public API. `WallClock` is descriptive and
+unambiguous. The `Option`-wrapped return from `tick()` is the minimal API change
+required to let callers distinguish "not time yet" from "fired" without introducing
+a new error variant or changing the error path semantics.
+
+### Consequences
+
+- Callers of `ControlLoop::tick()` must unwrap two layers: `Result` then `Option`.
+- `test_posture_divergence.rs` call sites updated: `.expect("...").expect("tick should fire")`.
+- Any new control-loop integration test must use `MockClock` (not `RuntimeClock`) for
+  timing control and must never call `std::thread::sleep` or `tokio::time::sleep`.
+- Documentation and prompts must use the correct names: `WallClock` (Clock trait impl),
+  `RuntimeClock` (tick-rate driver), `MockClock` (test double).
