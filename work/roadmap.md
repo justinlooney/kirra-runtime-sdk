@@ -1,227 +1,111 @@
 # Roadmap
 
-> Lean-agile increments. Each increment is small, independently testable, and
-> ships a concrete artifact. No increment blocks the next from delivering value.
+> Lean-agile increments. Each is independently testable and ships a concrete
+> artifact. Framing reflects current state: CPU ONNX backend exists in
+> parko-onnx; multi-silicon backends are first-implementation new work;
+> IEEE 2846, IEC 61508 SIL 3, and ASTM F3269 integrations are planned but
+> not yet implemented.
 
 ---
 
 ## Increment 1 — Deterministic Runtime Core
+**Milestone:** v0.1 | **Epic:** `epic:runtime-core`
+**Artifact:** `parko-core` v0.1.0 — a clock-driven, posture-aware ControlLoop
+consumable as a library by downstream inference and governor crates.
 
-**Goal:** A clock-driven, posture-aware inference loop that compiles, passes all
-tests, and can be consumed as a library by any downstream crate.
-
-### Tasks
-
-**1.1 — Attach `SafetyGovernor` to `ControlLoop`**
-Implement a `with_governor(impl SafetyGovernor)` builder on `ControlLoop` in
-`parko-core`. When a governor is attached the built-in scalar clamp is suppressed
-so the two enforcement paths cannot conflict. Done when `cargo test -p parko-core`
-passes and a new `test_builtin_clamp_suppressed` test confirms the built-in path
-is bypassed.
-
-**1.2 — Add test-only posture state setter**
-Add `set_state_for_test(state: PostureState)` to `parko-core` behind
-`#[cfg(test)]`. This unblocks posture-divergence tests without exposing a
-mutation path in production builds. Done when the method is absent from
-`cargo build --release` (verified with `nm`) and present in `cargo test`.
-
-**1.3 — Posture-divergence property test**
-Write a `proptest` suite in `parko-core` asserting that for all valid
-`(proposed_output, posture_state)` inputs the governor's result is at least as
-conservative as the built-in clamp. Done when ≥ 10 000 proptest cases pass for
-all three posture states.
-
-**1.4 — Harden tick boundary: NaN/Inf rejection**
-Add an input guard at the top of `ControlLoop::tick` that rejects any `NaN` or
-`Inf` float with `EnforcementAction::Halt` before the value reaches the governor.
-Done when a property test generates adversarial floats and confirms zero reach
-the governor.
-
-**1.5 — Tag and publish `parko-core` v0.1.0**
-Verify all `parko-core` tests pass, update `Cargo.toml` to version `0.1.0`, and
-tag the release. Done when `cargo publish --dry-run -p parko-core` exits cleanly
-and the tag exists in the repo.
+| Task | What | Done When |
+|------|------|-----------|
+| PARK-001 | Implement `ControlLoop::with_governor` builder. Stores governor as `Option<Box<dyn SafetyGovernor>>`. Suppresses built-in scalar clamp when a governor is present. | `test_builtin_clamp_suppressed` passes; all existing parko-core tests remain green. |
+| PARK-002 | Add `set_state_for_test(state: PostureState)` behind `#[cfg(test)]`. Provides a test seam for posture-divergence tests without exposing a production mutation path. | Method absent from `cargo build --release` (verified with `nm`); callable in `cargo test`. |
+| PARK-003 | Write proptest suite asserting governor output is at least as conservative as the built-in clamp for all valid `(proposed_output, PostureState)` pairs. | ≥ 10 000 cases pass for Nominal, Degraded, and LockedOut. |
+| PARK-004 | Add NaN/Inf input guard at `ControlLoop::tick` entry. Any non-finite float returns `EnforcementAction::Halt` before reaching the governor or clamp. | Property test confirms zero non-finite values reach the governor. |
+| PARK-005 | Wire `VirtualClock` / `SystemClock` abstraction into `ControlLoop`. Enables deterministic temporal tests without `sleep`. | Test advances `VirtualClock` manually; all timing logic exercisable without wall-clock. |
+| PARK-006 | Tag `parko-core-v0.1.0`. Set version in `Cargo.toml`; verify `cargo publish --dry-run` exits cleanly. | Tag in repo; dry-run passes. |
 
 ---
 
 ## Increment 2 — Hardware Abstraction Layer
+**Milestone:** v0.2 | **Epic:** `epic:hal`
+**Artifact:** `parko-core` v0.2.0 with `InferenceBackend` trait, validated CPU
+backend (parko-onnx), `MockBackend`, and feature-gated stubs for all four
+hardware targets. Multi-silicon real backends are Increment 4.
 
-**Goal:** A zero-copy `InferenceBackend` trait with one real backend (ONNX Runtime)
-and stub backends for Qualcomm QNN, TI TIDL, and Intel OpenVINO that pass CI
-without hardware.
-
-### Tasks
-
-**2.1 — Harden `parko-onnx` ORT backend**
-Refactor `parko-onnx` for session reuse, correct error mapping, and stable output
-slice lifetimes. Done when the ORT backend sustains 1 kHz tick rate in a
-benchmark test without heap allocation on the hot path.
-
-**2.2 — Define `BackendDescriptor` enum**
-Add `BackendDescriptor { Cpu, QualcommQnn, TiTidl, AmdRocm, IntelOpenVino }` to
-`parko-core` as the canonical hardware-target discriminant. Done when all existing
-crates compile against the new type and the enum is re-exported from the workspace
-root.
-
-**2.3 — QNN stub backend**
-Implement `QnnStubBackend` in `parko-core` (or a new `parko-qnn` crate) returning
-deterministic fixed outputs, gated behind `features = ["backend-qnn"]`. Done when
-`cargo test --features backend-qnn` passes on CI without Qualcomm hardware.
-
-**2.4 — TIDL stub backend**
-Implement `TidlStubBackend` with configurable simulated DSP latency (default 2 ms)
-gated behind `features = ["backend-tidl"]`. Done when the stub passes CI and the
-latency simulation is observable in the benchmark output.
-
-**2.5 — OpenVINO stub backend**
-Implement `OpenVinoStubBackend` wrapping the `openvino` crate's no-op path, gated
-behind `features = ["backend-openvino"]`. Done when `cargo test --features
-backend-openvino` passes on ubuntu-latest CI.
-
-**2.6 — Backend latency watchdog**
-Add a watchdog inside `InferenceLoop`: if `InferenceBackend::run` exceeds a
-configurable `deadline_ms`, emit a `LatencyViolation` event and hold the last
-safe output. Done when a test that deliberately exceeds the deadline confirms the
-posture transitions to `Degraded`.
+| Task | What | Done When |
+|------|------|-----------|
+| PARK-007 | Define `InferenceBackend` trait with zero-copy `run(&self, input: &[f32], output: &mut [f32])` and `BackendDescriptor` enum. All scratch memory pre-allocated at init. | Trait compiles; parko-onnx CPU backend implements it; round-trip test passes. |
+| PARK-008 | Validate parko-onnx CPU ONNX Runtime backend against the `InferenceBackend` trait. Confirm the MNIST-style integration test passes. | `cargo test -p parko-onnx` exits 0; MNIST integration test is verified green. |
+| PARK-009 | Add `MockBackend` to parko-core: configurable deterministic output for unit tests. Eliminates the ORT dependency from the parko-core test binary. | parko-core tests use `MockBackend`; no ORT link in `cargo test -p parko-core`. |
+| PARK-010 | Feature-gated stub backends for QNN, TIDL, ROCm/Vitis, OpenVINO. Each returns deterministic zeros; gated behind `features = ["backend-<name>"]`. | `cargo test --features backend-<name>` passes on ubuntu-latest for all four stubs without hardware. |
+| PARK-011 | Backend latency watchdog in `InferenceLoop`: deadline exceeded → `LatencyViolation`, hold last safe output, three consecutive violations → posture `Degraded`. | Test with configurable-latency stub + short deadline triggers watchdog and degrades posture. |
+| PARK-012 | GitHub Actions matrix: build and test all four stub backends in one workflow run on ubuntu-latest. | All four feature flags green in the same CI run. |
 
 ---
 
-## Increment 3 — Behavioral Safety (RSS-Equivalent)
+## Increment 3 — Behavioral Safety (IEEE 2846-equivalent)
+**Milestone:** v0.3 | **Epic:** `epic:behavioral-safety`
+**Artifact:** RSS-gated Kirra governor with tamper-evident violation log, passing
+a 10 000-scenario adversarial simulation. This is the first implementation of
+IEEE 2846-style behavioral safety — no prior code exists.
 
-**Goal:** A pure-Rust RSS-class behavioral safety layer integrated with
-`parko-core` and `kirra-runtime-sdk`. Replaces ad-hoc kinematics with a formal
-safe-distance model.
-
-### Tasks
-
-**3.1 — Implement `RssSafeDistance` model**
-Build `parko-core::rss::RssSafeDistance` with `longitudinal` and `lateral`
-methods per IEEE 2846. Done when unit tests cover minimum following distance,
-zero-speed edge cases, and the model matches reference values from the IEEE 2846
-example annex.
-
-**3.2 — Wire RSS into `KirraKernelGovernor`**
-Integrate `RssSafeDistance` as a pre-actuator gate in `kirra-runtime-sdk`'s
-`KirraKernelGovernor`: an RSS violation clamps velocity to zero immediately. Done
-when an integration test confirms no RSS-violating `cmd_vel` exits the governor
-in any posture state.
-
-**3.3 — RSS property test**
-Write a `proptest` suite asserting no RSS-violating command reaches the actuator
-for any `(ego_vel, lead_vel, gap)` triple in the valid physical range. Done when
-≥ 10 000 cases pass across all posture states.
-
-**3.4 — `RssViolationEvent` in audit chain**
-Add `RssViolationEvent { ego_state, object_state, longitudinal_margin,
-lateral_margin, timestamp_ms }` to the `kirra-runtime-sdk` audit chain. Done when
-the event appears in the hash-chained ledger and `kirra_audit_verify` can decode
-it offline.
-
-**3.5 — RSS posture integration**
-Update the posture engine: an `RssViolationEvent` immediately transitions fleet
-posture to `Degraded`; recovery follows the existing 5-tick hysteresis. Done when
-a scenario test confirms the posture transition and the correct recovery streak.
+| Task | What | Done When |
+|------|------|-----------|
+| PARK-013 | Implement `longitudinal_safe_distance` per IEEE 2846-2022 §5.1. Inputs: ego_vel, lead_vel, reaction_time, accel_max, brake_min, brake_max. | Unit tests cover equal, faster, slower, and zero-speed cases; values match IEEE reference. |
+| PARK-014 | Implement `lateral_safe_distance` per IEEE 2846-2022 §5.2. Inputs: lateral velocities, max lateral accel, reaction time. | Unit tests cover converging, diverging, and stationary cases. |
+| PARK-015 | Wire `RssState { safe, longitudinal_margin, lateral_margin }` into `kirra-runtime-sdk` posture engine. RSS violation → `Degraded`; recovery uses existing 5-tick hysteresis. | Integration test: inject violation → Degraded; inject 5 clean ticks → Nominal. |
+| PARK-016 | RSS pre-actuator gate in the Kirra governor crate: `rss_state.safe == false` clamps velocity to 0.0 before any kinematic envelope check. | Unit test: safe=false + positive velocity → output 0.0; safe=true → normal kinematics. |
+| PARK-017 | RSS property test (proptest): for all valid `(ego_vel, lead_vel, gap, commanded_vel)`, no RSS-violating command exits the governor under any posture state. | ≥ 10 000 cases pass; all three PostureState variants covered. |
+| PARK-018 | `RssViolationEvent { ego_vel, lead_vel, gap, longitudinal_margin, lateral_margin, timestamp_ms }` appended to hash-chained audit ledger in `kirra-runtime-sdk`. | `append_rss_violation` + `verify_chain` test passes; single-byte corruption detected. |
+| PARK-019 | 10 000-scenario adversarial trajectory simulation via `ScenarioRunner` + `VirtualClock`. Assert zero unsafe commands exit the full stack. | Test completes in < 60 s on CI; zero violations escape. |
 
 ---
 
 ## Increment 4 — Silicon Matrix Expansion
+**Milestone:** v0.4 | **Epic:** `epic:silicon-matrix`
+**Artifact:** Real backends for QNN and OpenVINO (CI-testable); TIDL and
+ROCm/Vitis real backends require hardware CI. All four are first-implementation
+work — the architecture is defined but no backend code exists yet.
 
-**Goal:** Real (non-stub) inference on at least two hardware targets (QNN and
-OpenVINO). TIDL and ROCm delivered as feature-gated stubs promoted to real
-backends when hardware is available.
-
-### Tasks
-
-**4.1 — `QnnBackend` (real)**
-Implement `QnnBackend` using Qualcomm AI Engine Direct SDK C bindings behind
-`features = ["backend-qnn"]`. Done when inference runs on a QCS6490 or SA8295
-dev board and output tensors match the ORT CPU reference within tolerance.
-
-**4.2 — `OpenVinoBackend` (real)**
-Implement `OpenVinoBackend` using `openvino-rs` with model loading and output
-shape validation. Done when inference runs on an Intel platform and matches ORT
-reference output within tolerance.
-
-**4.3 — `TidlBackend` (real)**
-Implement `TidlBackend` via TI TIDL runtime C FFI, cross-compiled to
-`aarch64-unknown-linux-gnu`. Done when inference runs on a TDA4VM and output
-matches ORT reference.
-
-**4.4 — `RocmBackend` (real)**
-Implement `RocmBackend` via MIGraphX Rust bindings or ROCm HIP C FFI, gated
-behind `features = ["backend-rocm"]`. Done when inference runs on RX 6000 series
-and matches ORT reference.
-
-**4.5 — CI matrix across all backends**
-Add a GitHub Actions matrix job that builds and tests all four stub backends on
-ubuntu-latest. Done when all four feature flags pass CI in the same workflow run.
+| Task | What | Done When |
+|------|------|-----------|
+| PARK-020 | `QnnBackend` (first implementation) via Qualcomm AI Engine Direct SDK C FFI. int8 quantization from tensor metadata. Hardware test `#[ignore]`'d in CI. | Inference on QCS6490 or SA8295; top-1 class matches ORT CPU reference within tolerance. |
+| PARK-021 | `TidlBackend` (first implementation) via TI TIDL runtime C FFI, cross-compiled to `aarch64-unknown-linux-gnu`. | Inference on TDA4VM; output within 1e-3 of ORT reference. |
+| PARK-022 | `RocmBackend` (first implementation) via ROCm HIP C FFI or MIGraphX bindings. GPU memory allocated once at init, not per inference. | Inference on RX 6000 or MI100; output within tolerance of ORT reference. |
+| PARK-023 | `OpenVinoBackend` (first implementation) using `openvino-rs`. Model loading, input shape validation, zero-copy output slice writing. | Integration test with identity model confirms output matches input within 1e-6. |
+| PARK-024 | `BackendSelector`: runtime backend selection by `BackendDescriptor`. Falls back to stub (`tracing::warn!`) when target unavailable. | `BackendSelector::new(QualcommQnn)` on CI falls back to stub; returns `Ok`. |
+| PARK-025 | Cross-backend determinism: same input on ORT + QnnStub + TidlStub → outputs within 1e-5 element-wise. Comment notes real-hardware tolerance update for PARK-020/021. | Test passes on CI without hardware. |
 
 ---
 
 ## Increment 5 — Safety OS Packaging
+**Milestone:** v1.2 | **Epic:** `epic:packaging`
+**Artifact:** `kirra v1.2.0` GitHub Release with x86_64/aarch64/armv7 tarballs
+per backend variant; systemd-managed service; React dashboard panels.
 
-**Goal:** A single installable tarball containing the full safety runtime
-(posture engine + inference loop + chosen backend) as a systemd-managed service
-with dashboard, installer, and Helm chart.
-
-### Tasks
-
-**5.1 — Unified `kirra_safety_runtime` binary**
-Merge `kirra-runtime-sdk` posture engine with `parko-core` inference loop into a
-single binary. Done when `kirra_safety_runtime --backend ort` starts, serves
-`/health`, and processes inference ticks.
-
-**5.2 — systemd unit with watchdog**
-Write `scripts/kirra-safety-runtime.service` with `WatchdogSec=5`,
-`MemoryMax=512M`, `CPUQuota=80%`. Done when `systemd-analyze verify` reports no
-errors and the service restarts automatically on watchdog timeout.
-
-**5.3 — Backend-aware installer**
-Extend `install.sh` with a `--backend` flag. Done when non-interactive install
-with `--backend qnn` downloads the correct feature-gated binary and configures
-the systemd unit without prompts.
-
-**5.4 — Dashboard inference panels**
-Add inference tick rate, backend P99 latency, RSS margin, and posture history
-sparkline to the React dashboard. Done when the panels render live data against
-a running `kirra_safety_runtime`.
-
-**5.5 — `v1.2.0` release**
-Tag and cut a GitHub Release with x86_64, aarch64, armv7 tarballs for each
-backend variant. Done when the release pipeline completes green and SHA256 sums
-are attached.
+| Task | What | Done When |
+|------|------|-----------|
+| PARK-026 | `kirra_safety_runtime` binary: posture engine + inference loop in one process. `KIRRA_BACKEND` env var selects backend. Serves `/health`. | Binary starts, `/health` returns 200, inference loop ticks at configured rate. |
+| PARK-027 | `scripts/kirra-safety-runtime.service`: `WatchdogSec=5`, `MemoryMax=512M`, `CPUQuota=80%`. Restarts on watchdog timeout. | `systemd-analyze verify` reports no errors; service restarts on simulated timeout. |
+| PARK-028 | `install.sh --backend <ort\|qnn\|tidl\|openvino\|rocm>`: downloads correct binary, configures systemd unit, non-interactive with `--yes`. | Unattended install with each variant completes without prompts. |
+| PARK-029 | Dashboard panels: inference tick rate, backend P99 latency, RSS margin, posture sparkline. Graceful offline handling. | All four panels render against running service; show "—" when offline. |
+| PARK-030 | Release pipeline: CI matrix builds all backend variants for three arches; attaches tarballs + SHA256SUMS to GitHub Release. | `kirra v1.2.0` release page shows all artifacts with checksums. |
 
 ---
 
 ## Increment 6 — Certification-Ready Runtime
+**Milestone:** v2.0 | **Epic:** `epic:certification`
+**Artifact:** Pre-assessment package for TÜV or SGS-TÜV Saar review, including
+first-implementation IEC 61508 SIL 3 and ASTM F3269 mappings (these do not
+yet exist; Increment 6 is where they are written).
 
-**Goal:** Sufficient documentation, traceability, and process evidence to begin a
-formal ASIL-D / SIL 3 pre-assessment.
-
-### Tasks
-
-**6.1 — Complete RTM**
-Expand `KIRRA-RTM-001` to trace every safety requirement to source line, test ID,
-and coverage report entry. Done when a TÜV reviewer can follow every requirement
-to a passing test without ambiguity.
-
-**6.2 — MC/DC coverage report**
-Generate MC/DC coverage for `posture_cache.rs`, `posture_engine_v2.rs`,
-`kirra_core.rs`, and `rss.rs` using `cargo-llvm-cov`. Done when all four modules
-report 100% MC/DC and the report is committed to `docs/coverage/`.
-
-**6.3 — FMEA**
-Write `KIRRA-FMEA-001` covering posture engine stale cache, governor bypass,
-attestation replay, nonce exhaustion, and RSS model numerical overflow. Done when
-every failure mode has a detection method and a mitigation.
-
-**6.4 — DFA**
-Write `KIRRA-DFA-001` analyzing common-cause failures in the HA active/passive
-pair sharing SQLite on NFS. Done when the document identifies all single points
-of failure and proposes independent protection measures.
-
-**6.5 — Offline audit verifier binary**
-Implement `kirra_audit_verify`: reads the audit chain from SQLite, verifies
-Ed25519 signatures, and prints a tamper-evidence report without running the
-service. Done when the binary correctly detects a single-byte corruption injected
-into the chain.
+| Task | What | Done When |
+|------|------|-----------|
+| PARK-031 | Complete RTM (`KIRRA-RTM-001`) v1.0: every ISO 26262 ASIL-D safety requirement traced to source line, test ID, and coverage entry. | Auditor can follow every requirement to a passing test without ambiguity. |
+| PARK-032 | **First implementation:** IEC 61508 SIL 3 requirements mapping. Map existing safety functions to SIL 3 claims; identify gaps and required mitigations. | Every SIL 3 safety function claim has a corresponding implementation entry or explicit gap note. |
+| PARK-033 | **First implementation:** ASTM F3269-21 bounded-operation envelope mapping. Define Nominal, Degraded, and BLLOS operational envelopes per §6. | Each operational mode has a defined envelope; claims traceable to posture engine states. |
+| PARK-034 | MC/DC coverage for `posture_cache.rs`, `posture_engine_v2.rs`, `kirra_core.rs`, `rss.rs` via `cargo-llvm-cov`. CI fails if < 100%. | All four files at 100% MC/DC; report committed to `docs/coverage/`. |
+| PARK-035 | FMEA (`KIRRA-FMEA-001`): posture stale cache, governor bypass, attestation replay, nonce exhaustion, RSS numerical overflow, backend latency. | Every failure mode has severity, detection method, and mitigation entry. |
+| PARK-036 | DFA (`KIRRA-DFA-001`): common-cause failures in HA active/passive pair on NFS-shared SQLite per ISO 26262 Part 9. | All single points of failure identified; independent protections proposed. |
+| PARK-037 | `kirra_audit_verify` binary: read audit chain from SQLite, verify Ed25519 signatures, print tamper-evidence report, exit 1 on corruption. | Correctly detects a single-byte corruption injected mid-chain. |
+| PARK-038 | SOTIF (`KIRRA-SOTIF-001`): intended function boundaries, triggering conditions, evaluation scenarios per ISO 21448. | Document covers inference loop + RSS governor integration scenarios. |
+| PARK-039 | HIL test harness: connects `kirra_safety_runtime` to CARLA or kinematics integrator at 100 Hz; zero RSS escapes on 1 000 trajectories. | Harness runs nightly; failures print timestamped CSV; README covers CARLA setup. |
+| PARK-040 | Update `docs/architecture.md`: Mermaid block diagram, data-flow, security boundaries, ASIL decomposition, multi-silicon backend map. | Diagram matches current codebase; ASIL claims consistent with HARA. |

@@ -1,0 +1,175 @@
+automations:
+
+  # ── Backlog ──────────────────────────────────────────────────────────────────
+
+  - trigger: issue.opened
+    conditions:
+      - label_contains: "backlog"
+    actions:
+      - move_to_column: Backlog
+    notes: >
+      Any newly opened issue tagged backlog lands in Backlog automatically.
+      In GitHub Projects v2 this is achieved via the "Auto-add to project"
+      workflow with a filter on label:backlog.
+
+  - trigger: issue.reopened
+    actions:
+      - move_to_column: Backlog
+      - remove_label: done
+      - add_label: backlog
+    notes: >
+      Re-opened issues always return to Backlog, never to In Progress.
+      Forces explicit re-prioritisation.
+
+  - trigger: issue.labeled
+    conditions:
+      - label_added: "blocked"
+      - current_column_is_not: Blocked
+    actions:
+      - move_to_column: Blocked
+      - add_comment: |
+          ⚠️ This issue has been marked **blocked**.
+          Please add a comment describing the dependency and expected resolution date.
+          If unresolved after 7 days, add label `needs-decision` and open a
+          `work/decisions.md` ADL entry.
+
+  # ── Ready ────────────────────────────────────────────────────────────────────
+
+  - trigger: issue.labeled
+    conditions:
+      - label_added: "ready"
+    actions:
+      - move_to_column: Ready
+      - remove_label: backlog
+    notes: >
+      Manually add the ready label when pulling a card from Backlog.
+      Prerequisite: Claude Code Prompt written in work/backlog.md.
+
+  # ── In Progress ──────────────────────────────────────────────────────────────
+
+  - trigger: pull_request.opened
+    conditions:
+      - branch_matches: "park-[0-9]+/*"
+    actions:
+      - move_linked_issue_to_column: "In Progress"
+      - add_label: "in-progress"
+      - remove_label: "ready"
+    notes: >
+      Pushing a branch named park-NNN/* automatically moves the linked issue
+      to In Progress. In GitHub Projects v2, wire this via the "When a pull
+      request is opened, set status to In Progress" built-in automation.
+
+  - trigger: issue.assigned
+    actions:
+      - move_to_column: "In Progress"
+      - add_label: "in-progress"
+      - remove_label: "ready"
+
+  - trigger: issue.unlabeled
+    conditions:
+      - label_removed: "blocked"
+      - current_column_is: Blocked
+    actions:
+      - move_to_column: "In Progress"
+      - remove_label: "blocked"
+
+  - trigger: scheduled
+    schedule: "0 9 * * *"   # Daily at 09:00 UTC
+    conditions:
+      - current_column_is: "In Progress"
+      - no_commit_activity_for_days: 3
+    actions:
+      - add_label: "stale"
+      - add_comment: |
+          🕒 No commit activity for 3 days. Is this still in progress?
+          If blocked, add label `blocked` and describe the blocker.
+          If done, close the issue. If paused, move back to Ready.
+
+  # ── Blocked ──────────────────────────────────────────────────────────────────
+
+  - trigger: scheduled
+    schedule: "0 9 * * 1"   # Every Monday at 09:00 UTC
+    conditions:
+      - current_column_is: Blocked
+      - blocked_for_days: 7
+    actions:
+      - add_label: "needs-decision"
+      - add_comment: |
+          🚨 Blocked for 7+ days. Action required:
+          1. Add an ADL entry in `work/decisions.md`
+          2. Determine if this task should be deferred, redesigned, or cancelled
+          3. Update this issue with the decision reference (ADL-NNN)
+
+  # ── Done ─────────────────────────────────────────────────────────────────────
+
+  - trigger: pull_request.merged
+    conditions:
+      - base_branch: "main"
+    actions:
+      - move_linked_issue_to_column: Done
+      - close_linked_issue: true
+      - add_label: "done"
+      - remove_label: "in-progress"
+      - remove_label: "stale"
+    notes: >
+      In GitHub Projects v2, use "When a pull request is merged, set status
+      to Done" built-in automation. Also close the linked issue automatically
+      via "Closes #NNN" in the PR description.
+
+  - trigger: issue.closed
+    conditions:
+      - current_column_is_not: Done
+    actions:
+      - move_to_column: Done
+      - add_label: "done"
+
+  # ── Weekly Review Automation ─────────────────────────────────────────────────
+
+  - trigger: scheduled
+    schedule: "0 18 * * 5"   # Every Friday at 18:00 UTC
+    actions:
+      - add_comment_to_column_cards:
+          column: Done
+          comment: |
+            📋 Weekly review prompt:
+            - Append completed tasks to `work/done.md`
+            - Pull next Ready card into `work/active.md`
+            - Archive Done cards older than 30 days
+
+  # ── GitHub Projects v2 Setup Instructions ────────────────────────────────────
+  #
+  # GitHub Projects v2 does not support YAML-driven automation natively.
+  # Apply the above rules using the built-in "Workflows" panel:
+  #
+  # 1. Settings → Workflows → "Item added to project"
+  #    Action: Set Status = Backlog
+  #
+  # 2. Settings → Workflows → "Item closed"
+  #    Action: Set Status = Done
+  #
+  # 3. Settings → Workflows → "Pull request merged"
+  #    Action: Set Status = Done
+  #
+  # 4. For branch-name triggers, add a GitHub Actions workflow:
+  #    .github/workflows/board-automation.yml (see below)
+  #
+  # ── board-automation.yml ─────────────────────────────────────────────────────
+  #
+  # name: Board Automation
+  # on:
+  #   pull_request:
+  #     types: [opened, synchronize]
+  # jobs:
+  #   move-to-in-progress:
+  #     runs-on: ubuntu-latest
+  #     if: startsWith(github.head_ref, 'park-')
+  #     steps:
+  #       - uses: actions/github-script@v7
+  #         with:
+  #           script: |
+  #             const branch = context.payload.pull_request.head.ref;
+  #             const match = branch.match(/^park-(\d+)/);
+  #             if (!match) return;
+  #             const issueNumber = parseInt(match[1]);
+  #             // Move issue to In Progress column via Projects v2 GraphQL API
+  #             // (requires PROJECTS_TOKEN secret with project:write scope)

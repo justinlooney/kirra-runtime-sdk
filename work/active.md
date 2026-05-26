@@ -1,128 +1,188 @@
-# Active
+# Active Work
 
-> Max 3 tasks in flight at once. Pull from `backlog.md`. Move to `done.md` on merge.
-
----
-
-## PARK-001 `control-loop` — Attach governor to ControlLoop
-
-Implement `ControlLoop::with_governor(impl SafetyGovernor + 'static)` in
-`parko-core`. When a governor is attached the built-in scalar clamp must be
-suppressed so the two enforcement paths cannot conflict — the governor is solely
-responsible for enforcement on that tick. Done when `test_builtin_clamp_suppressed`
-passes and all existing `parko-core` tests continue to pass.
-
-### Acceptance Criteria
-- `ControlLoop::with_governor` compiles and chains correctly as a builder
-- Built-in clamp is bypassed when a governor is present (confirmed by test)
-- `ControlLoop::new()` (no governor) still applies the built-in clamp as before
-- No `unsafe` code introduced
-- `cargo test -p parko-core` fully green
-
-### Claude Code Prompt
-```
-In the parko-core crate (parko/parko-core/src/control_loop.rs), implement a
-with_governor builder method on ControlLoop.
-
-Requirements:
-- Signature: pub fn with_governor(mut self, g: impl SafetyGovernor + 'static) -> Self
-- Store the governor as Option<Box<dyn SafetyGovernor>> on the ControlLoop struct
-- When a governor is present, suppress the built-in scalar clamp entirely — both
-  enforcement paths must NOT run on the same tick
-- When no governor is present (default), the built-in clamp runs as before
-- Add a test named test_builtin_clamp_suppressed that:
-    1. Creates a mock governor that returns EnforcementAction::Allow(proposed)
-       unchanged
-    2. Sends a value the built-in clamp WOULD reduce (above the clamp threshold)
-    3. Asserts the output equals the governor's output, not the clamped value
-- Add a test named test_no_governor_uses_builtin_clamp that confirms the clamp
-  still runs without a governor
-- All existing parko-core tests must continue to pass
-- No unsafe code
-- Files: parko/parko-core/src/control_loop.rs, parko/parko-core/src/lib.rs
-```
+> Maximum 3 tasks in flight at once (WIP limit). Matches In Progress column on
+> the project board. Pull from Ready when a slot opens; move to done.md on merge.
+> Note: kirra-runtime-sdk holds ~333 tests; parko-core has its own separate test
+> suite. Do not conflate the two when writing prompts or acceptance criteria.
 
 ---
 
-## PARK-002 `control-loop` — Add test-only posture state setter
+## PARK-001 — Implement `ControlLoop::with_governor` builder
 
-Add `set_state_for_test(state: PostureState)` to `parko-core` behind
-`#[cfg(test)]`. This unblocks posture-divergence and recovery-hysteresis tests
-without exposing a mutation path in production binaries. Done when the method
-is confirmed absent from `cargo build --release` output and present in `cargo test`.
+**Epic:** `epic:runtime-core` | **Milestone:** v0.1 | **Branch:** `park-001/governor-builder`
+**Labels:** `feat`, `control-loop`, `in-progress`
+
+### Summary
+
+Adds a builder method to `ControlLoop` in `parko-core` that accepts a
+`Box<dyn SafetyGovernor>` and stores it as `Option<Box<dyn SafetyGovernor>>`.
+When a governor is present, the built-in scalar clamp in `tick()` is bypassed
+entirely — the governor is the sole output gate. This is the foundation for
+the Kirra governor crate's integration with the parko-core inference loop.
 
 ### Acceptance Criteria
-- Method is callable inside `#[cfg(test)]` modules and integration test files
-- Method sets posture state directly with no transition validation (test seam only)
-- `cargo build --release` produces no `set_state_for_test` symbol (verify with `nm`)
-- All existing `parko-core` tests unaffected
+- [ ] `with_governor(gov: impl SafetyGovernor + 'static) -> Self` added to `ControlLoop`
+- [ ] Governor stored as `Option<Box<dyn SafetyGovernor>>` on the struct
+- [ ] `test_builtin_clamp_suppressed`: a `ZeroGovernor` returning 0.0 wins
+      over a large proposed output that would pass the built-in clamp
+- [ ] `test_no_governor_uses_builtin_clamp`: without a governor the built-in
+      clamp still fires
+- [ ] All pre-existing parko-core tests remain green
+- [ ] No `unsafe` code
+- [ ] `cargo test -p parko-core` exits 0
 
 ### Claude Code Prompt
+
 ```
-In parko/parko-core/src/ (whichever file owns PostureState or ControlLoop's
-internal state), add a test-only state mutation method.
+You are working in the parko-core crate. The project uses Kirra as its safety
+runtime name — there is no "Aegis" in this codebase.
+
+Task: Add a `with_governor` builder to `ControlLoop` in parko-core/src/control_loop.rs
+(or the equivalent entry point for the control loop).
 
 Requirements:
-- Annotate with #[cfg(test)]
-- Signature: pub fn set_state_for_test(&mut self, state: PostureState)
-- The method sets the internal posture state directly, bypassing all transition
-  logic — it is a test seam, not a production API
-- Add a doc comment: "Test-only. Not compiled into release builds. Use only in
-  #[cfg(test)] blocks or integration tests."
-- Add a test that calls set_state_for_test(PostureState::Degraded), then calls
-  tick(), and asserts the governor sees PostureState::Degraded
-- Add a doc-level note explaining that release binary verification (nm) should
-  be done manually or in CI
-- All existing parko-core tests must pass
-- Files: parko/parko-core/src/control_loop.rs or parko/parko-core/src/posture.rs
+1. Add field: governor: Option<Box<dyn SafetyGovernor>> to ControlLoop struct.
+2. Add method: pub fn with_governor(mut self, g: impl SafetyGovernor + 'static) -> Self
+   that sets governor = Some(Box::new(g)) and returns self.
+3. In tick(): if self.governor.is_some() {
+                  let g = self.governor.as_ref().unwrap();
+                  return g.enforce(proposed_output, self.posture_state);
+              } else {
+                  // run existing built-in clamp
+              }
+4. SafetyGovernor trait (if not yet defined) in parko-core/src/governor.rs:
+     pub trait SafetyGovernor: Send + Sync {
+         fn enforce(&self, proposed: f64, posture: PostureState) -> f64;
+     }
+   Re-export from parko_core lib.rs: pub use governor::SafetyGovernor;
+5. Write test `test_builtin_clamp_suppressed` in parko-core/tests/governor.rs:
+   - Define ZeroGovernor: always returns 0.0.
+   - Inject via with_governor.
+   - Call tick with a value above the built-in clamp threshold.
+   - Assert result == 0.0.
+6. Write test `test_no_governor_uses_builtin_clamp`:
+   - Create ControlLoop without governor.
+   - Call tick with a value above the clamp threshold.
+   - Assert result == clamped_value (not the raw proposed output).
+7. All existing parko-core tests must pass (do not assume any specific count;
+   run `cargo test -p parko-core` and confirm exit 0).
+8. No unsafe code.
 ```
 
 ---
 
-## PARK-003 `control-loop` — Posture-divergence property test
+## PARK-002 — Add `set_state_for_test` behind `#[cfg(test)]`
 
-Write a `proptest` suite asserting that for all valid `(proposed_output: f32,
-posture_state: PostureState)` inputs the `KirraKernelGovernor`'s enforcement
-result is at least as conservative as the `parko-core` built-in clamp. This is
-the core correctness invariant proving the governor integration is safe. Done
-when ≥ 10 000 cases pass for all three posture states (`Nominal`, `Degraded`,
-`LockedOut`).
+**Epic:** `epic:runtime-core` | **Milestone:** v0.1 | **Branch:** `park-002/test-state-setter`
+**Labels:** `feat`, `control-loop`, `in-progress`
+
+### Summary
+
+Adds a `set_state_for_test(state: PostureState)` method to `ControlLoop` in
+`parko-core`, guarded by `#[cfg(test)]`. This is a test seam — it mutates
+internal posture state directly without transition validation, unblocking
+posture-divergence property tests. The method must be absent from release
+builds (verified with `nm`) and present only during `cargo test`.
 
 ### Acceptance Criteria
-- ≥ 10 000 proptest cases generated per posture state
-- Assertion: `governor_output <= builtin_clamp_output` for `Nominal` and `Degraded`
-- Assertion: `governor_output == 0.0` (or `Halt`) for `LockedOut`
-- NaN and Inf explicitly filtered from the input strategy
-- Test file: `parko/parko-core/tests/posture_divergence.rs`
-- `proptest` already a dev-dependency in workspace; no new non-dev deps
+- [ ] `set_state_for_test` visible only under `#[cfg(test)]`
+- [ ] `cargo build --release` binary has no symbol matching `set_state_for_test`
+      (confirmed with `nm <binary> | grep set_state_for_test` → empty)
+- [ ] `cargo test -p parko-core` exposes the method to tests
+- [ ] All pre-existing parko-core tests remain green
+- [ ] `cargo test -p parko-core` exits 0
 
 ### Claude Code Prompt
-```
-Create parko/parko-core/tests/posture_divergence.rs and implement a proptest
-suite for the governor/clamp divergence invariant.
 
-Context:
-- parko-core has a ControlLoop with an optional SafetyGovernor
-- kirra-runtime-sdk's KirraKernelGovernor implements SafetyGovernor (via
-  parko-aegis adapter)
-- The invariant: governor output must always be <= built-in clamp output
-  (governor is at least as conservative)
+```
+You are working in parko-core/src/control_loop.rs. The project uses Kirra as
+its safety runtime name.
+
+Task: Add a cfg(test) method `set_state_for_test` to `ControlLoop`.
 
 Requirements:
-- Use proptest::prelude::* to generate (proposed_output: f32, state: PostureState)
-  pairs; filter out NaN and Inf using prop_filter
-- For each pair:
-    1. Run proposed_output through the built-in clamp (call ControlLoop without
-       governor)
-    2. Run proposed_output through KirraKernelGovernor (call ControlLoop with
-       governor, using set_state_for_test to set the posture)
-    3. Assert: for Nominal and Degraded, governor_result <= builtin_clamp_result
-    4. Assert: for LockedOut, governor_result == 0.0 or EnforcementAction::Halt
-- Configure proptest with cases = 10_000
-- All three PostureState variants must be explicitly tested (use three separate
-  proptest! blocks or parameterize)
-- proptest is already a dev-dependency; do not add new dependencies
-- The test must pass with cargo test -p parko-core
-- Files: parko/parko-core/tests/posture_divergence.rs
-         parko/parko-core/Cargo.toml (add [[test]] entry if needed)
+1. Add this block to the ControlLoop impl:
+     #[cfg(test)]
+     pub fn set_state_for_test(&mut self, state: PostureState) {
+         self.posture_state = state;
+     }
+   Do not add a doc comment referencing internal details; a single-line
+   inline comment is acceptable: // Test seam — absent from release builds.
+2. Do not touch any production code paths.
+3. Write a test in parko-core/tests/posture_state.rs that:
+   - Creates a ControlLoop.
+   - Calls set_state_for_test(PostureState::Degraded).
+   - Calls tick with a nominal input.
+   - Asserts the output is consistent with Degraded behaviour
+     (e.g., clamped to a lower ceiling than Nominal).
+4. After building in release mode, run:
+     nm target/release/<binary> | grep set_state_for_test
+   Confirm the output is empty. (The binary name may be kirra_verifier_service
+   or whichever binary links parko-core; check workspace Cargo.toml.)
+5. cargo test -p parko-core exits 0. Do not assume a specific test count.
+6. No unsafe code.
+```
+
+---
+
+## PARK-003 — Posture-divergence proptest suite
+
+**Epic:** `epic:runtime-core` | **Milestone:** v0.1 | **Branch:** `park-003/posture-divergence-proptest`
+**Labels:** `test`, `control-loop`, `in-progress`
+
+### Summary
+
+Uses `proptest` to assert that for every valid `(proposed_output, PostureState)`
+pair the Kirra governor's output is at least as conservative as the built-in
+clamp ceiling. This is the core correctness invariant for the governor
+integration: a governor may only tighten or match the built-in limits, never
+loosen them. Depends on PARK-002 (`set_state_for_test`) to inject posture states.
+
+### Acceptance Criteria
+- [ ] Property test in `parko-core/tests/posture_divergence.rs`
+- [ ] At least 10 000 cases per PostureState variant (Nominal, Degraded, LockedOut)
+- [ ] Asserts `governor_output <= builtin_clamp_ceiling(proposed, state)`
+      for every generated case
+- [ ] `cargo test -p parko-core` exits 0
+
+### Claude Code Prompt
+
+```
+You are working in the parko-core crate. The project uses Kirra as its safety
+runtime name. PARK-002 must be complete (set_state_for_test available) before
+this task can be implemented.
+
+Task: Write a proptest suite asserting the Kirra governor output is always at
+least as conservative as the built-in clamp ceiling.
+
+Requirements:
+1. Add proptest = "1" to parko-core dev-dependencies if not already present.
+2. Create parko-core/tests/posture_divergence.rs.
+3. Expose a pub(crate) helper in parko-core/src/control_loop.rs:
+     pub(crate) fn builtin_clamp_ceiling(proposed: f64, state: PostureState) -> f64
+   This must return the exact ceiling the built-in clamp would apply, so tests
+   verify real production logic rather than a copy of it.
+4. Write three proptest! blocks (one per PostureState variant):
+   proptest! {
+       #[test]
+       fn governor_never_exceeds_builtin_clamp_nominal(
+           proposed in -1000.0f64..1000.0f64
+       ) {
+           prop_assume!(!proposed.is_nan() && !proposed.is_infinite());
+           let ceiling = builtin_clamp_ceiling(proposed, PostureState::Nominal);
+           // instantiate the Kirra governor (from the Kirra governor crate;
+           // verify the crate name in workspace Cargo.toml before importing)
+           let gov_out = governor.enforce(proposed, PostureState::Nominal);
+           prop_assert!(gov_out <= ceiling,
+               "governor {} > ceiling {} for proposed {}", gov_out, ceiling, proposed);
+       }
+   }
+   Repeat for Degraded (assert gov_out <= ceiling) and LockedOut
+   (assert gov_out == 0.0).
+5. Set cases = 10_000 per block via ProptestConfig or the #[proptest] attribute.
+6. Add the Kirra governor crate as a dev-dependency in parko-core/Cargo.toml.
+   Check workspace Cargo.toml for the exact crate name before editing.
+7. Run `cargo test -p parko-core -- --test-threads=1` and confirm all pass.
+8. Do not assume any specific existing test count in parko-core.
+9. No unsafe code.
 ```
