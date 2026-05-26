@@ -40,6 +40,35 @@ Completed tasks will be appended here weekly.
 
 ---
 
+## PARK-009 — Validate parko-onnx CPU backend; fix hanging MNIST test
+Completed: 2026-05-26
+Commit: dff915c
+Labels: parko-onnx, hal
+
+What landed:
+- parko/.cargo/config.toml: sets ORT_DYLIB_PATH to the installed shared library
+  location so cargo test -p parko-onnx works without manual env var exports
+- OrtBackend::new(): adds with_intra_threads(1) and
+  with_optimization_level(GraphOptimizationLevel::Disable) to prevent the ORT
+  session builder from blocking indefinitely during initialization
+- tests/test_onnx_backend.rs: adds test_ort_backend_descriptor_is_cpu —
+  verifies OrtBackend::descriptor() returns BackendDescriptor::Cpu
+
+Root cause of hang: libonnxruntime.so at /root/.local/onnxruntime/lib/ was not
+on the standard library search path. ORT_DYLIB_PATH in .cargo/config.toml
+resolves this for all cargo subcommands in the parko workspace.
+
+Key naming (ADL-007):
+- .cargo/config.toml is per-workspace; new deployment targets (Jetson, QNX)
+  need their own equivalent entry for that platform's ORT installation
+- OrtBackend::descriptor() inherits the default impl from InferenceBackend
+  (added PARK-008) — no override needed
+
+Test count after PARK-009: 2 integration tests pass (cargo test -p parko-onnx)
+Both tests complete in < 1s (previously: hung > 60s)
+
+---
+
 ## PARK-005 — RuntimeClock / MockClock abstraction in ControlLoop
 Completed: 2026-05-26
 Commit: a50363d

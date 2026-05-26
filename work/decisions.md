@@ -310,6 +310,49 @@ a new error variant or changing the error path semantics.
 
 ---
 
+## ADL-007 — ORT session configuration: thread limit and optimization level
+
+**Date:** 2026-05-26
+**Status:** Accepted
+**Deciders:** Justin Looney
+
+### Decision
+
+`OrtBackend::new()` must configure the ORT session with:
+- `with_intra_threads(1)` — limits intra-op parallelism to one thread
+- `with_optimization_level(GraphOptimizationLevel::Disable)` — skips graph
+  optimization passes at session init time
+
+The ORT shared library is not in the system library search path on any target
+platform. `parko/.cargo/config.toml` sets `ORT_DYLIB_PATH` to the installed
+location (`/root/.local/onnxruntime/lib/libonnxruntime.so`). Any new deployment
+environment (Jetson, QNX) needs an equivalent config pointing to that platform's
+ORT installation — there is no universal default path.
+
+`OrtBackend::descriptor()` returns `BackendDescriptor::Cpu` via the default
+impl added to `InferenceBackend` in PARK-008. No override is needed in
+`parko-onnx`.
+
+### Why
+
+Without `with_intra_threads(1)`, the ORT session builder blocks indefinitely
+during test runs: ORT detects the available core count and attempts to spawn a
+full thread pool, which hangs in restricted CI environments. Disabling graph
+optimization eliminates the initialization-time optimization passes that add
+latency and are unnecessary for correctness in test scenarios. Both options are
+reversible for production builds where throughput matters.
+
+### Consequences
+
+- Any backend that wraps an ORT session must apply these two builder options
+  unless benchmarking explicitly requires otherwise.
+- New deployment environments must add an equivalent `ORT_DYLIB_PATH` entry in
+  their `.cargo/config.toml` before `cargo test -p parko-onnx` can succeed.
+- Production builds that need ORT graph optimization must override
+  `with_optimization_level` explicitly — the test-safe default is `Disable`.
+
+---
+
 ## Crate and Struct Name Audit (2026-05-26)
 
 > Read-only audit of the `parko/` workspace. Source: PARK-007.
