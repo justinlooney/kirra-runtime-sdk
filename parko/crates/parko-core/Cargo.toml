@@ -17,8 +17,13 @@ tokio = { version = "1", features = ["sync", "time", "rt-multi-thread", "macros"
 
 [dev-dependencies]
 parko-kirra = { path = "../parko-kirra" }
+proptest = "1"
 
 [[test]]
 name = "test_posture_divergence"
 path = "tests/test_posture_divergence.rs"
 required-features = ["test-helpers"]
+
+[[test]]
+name = "posture_divergence_proptest"
+path = "tests/posture_divergence_proptest.rs"
