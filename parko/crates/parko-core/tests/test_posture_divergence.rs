@@ -91,7 +91,7 @@ fn make_loop() -> (
     };
     let (tx, rx) = mpsc::channel(8);
     let control = ControlLoop::new(backend, model, stream, tx, 20.0)
-        .with_governor(Box::new(KirraGovernor::new()));
+        .with_governor(KirraGovernor::new());
     (control, rx)
 }
 

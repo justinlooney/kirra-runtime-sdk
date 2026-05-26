@@ -36,7 +36,7 @@ impl Default for DegradationThresholds {
 /// Inference loop with one-tick-delayed actuator publication.
 ///
 /// NOTE: This contains a placeholder degraded-mode policy.
-/// Real physical envelope enforcement belongs in the Aegis safety kernel.
+/// Real physical envelope enforcement belongs in the KirraGovernor.
 pub struct InferenceLoop<B: InferenceBackend> {
     backend: Arc<B>,
     model: Arc<ModelHandle>,
@@ -74,9 +74,10 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
     }
 
     /// Attach a safety governor to this loop. The governor's evaluation
-    /// takes precedence over the built-in degraded-mode clamp.
-    pub fn with_governor(mut self, governor: Box<dyn SafetyGovernor>) -> Self {
-        self.governor = Some(governor);
+    /// takes precedence over the built-in degraded-mode clamp when a governor
+    /// is present; the built-in clamp is only active when no governor is set.
+    pub fn with_governor(mut self, governor: impl SafetyGovernor + 'static) -> Self {
+        self.governor = Some(Box::new(governor));
         self
     }
 
@@ -374,6 +375,93 @@ mod tests {
         }
     }
 
+    /// A governor that unconditionally stops the vehicle (linear = 0.0).
+    /// Used to verify that an injected governor takes precedence over the
+    /// built-in degraded-mode clamp — the clamp must not fire when a governor
+    /// is present (ADL-002).
+    struct ZeroGovernor;
+    impl SafetyGovernor for ZeroGovernor {
+        fn evaluate(
+            &self,
+            _proposed: &ControlCommand,
+            _previous: Option<&ControlCommand>,
+            _delta_time_s: f64,
+            _posture: SafetyPosture,
+        ) -> EnforcementAction {
+            EnforcementAction::Deny {
+                reason: "ZeroGovernor: all commands denied".to_string(),
+            }
+        }
+    }
+
+    /// PARK-001 acceptance: when a governor is injected, the built-in clamp
+    /// must not fire. ZeroGovernor produces 0.0; the built-in ceiling (1.5)
+    /// is above 0.0, so if both fired the result would be 1.5, not 0.0.
+    #[tokio::test]
+    async fn test_builtin_clamp_suppressed() {
+        // TestBackend emits 65.0 m/s — above the 1.5 built-in clamp ceiling.
+        let backend = Arc::new(TestBackend);
+        let model = backend.load_model("").unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+
+        let mut loop_engine = InferenceLoop::new(backend, model, tx)
+            .with_governor(ZeroGovernor);
+        let mut stream = SimpleStream { next_id: 0 };
+
+        // Tick 1: fills last_validated_command; nothing flushed to actuator yet.
+        let _ = loop_engine
+            .tick(stream.next_frame().unwrap(), SafetyPosture::Nominal)
+            .await
+            .unwrap();
+        // Tick 2: ZeroGovernor denies the 65.0 m/s command → stopped (0.0).
+        let snapshot = loop_engine
+            .tick(stream.next_frame().unwrap(), SafetyPosture::Nominal)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.active_command.linear_velocity, 0.0,
+            "ZeroGovernor must override the 65.0 m/s command; \
+             built-in clamp must be suppressed when a governor is present"
+        );
+    }
+
+    /// PARK-001 acceptance: without a governor, the built-in degraded-mode
+    /// clamp caps linear velocity at max_linear_velocity_mps (1.5 m/s).
+    /// TestBackend deliberately exceeds the inference-latency threshold (200ms
+    /// sleep vs 150ms limit), forcing degraded mode so the clamp activates.
+    #[tokio::test]
+    async fn test_no_governor_uses_builtin_clamp() {
+        let backend = Arc::new(TestBackend);
+        let model = backend.load_model("").unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+
+        // No governor attached.
+        let mut loop_engine = InferenceLoop::new(backend, model, tx);
+        let mut stream = SimpleStream { next_id: 0 };
+
+        // Tick 1: fills last_validated_command.
+        let _ = loop_engine
+            .tick(stream.next_frame().unwrap(), SafetyPosture::Nominal)
+            .await
+            .unwrap();
+        // Tick 2: 200ms inference latency trips degraded mode; clamp fires.
+        let snapshot = loop_engine
+            .tick(stream.next_frame().unwrap(), SafetyPosture::Nominal)
+            .await
+            .unwrap();
+
+        assert!(
+            snapshot.active_state_degraded,
+            "TestBackend's 200ms latency must trigger degraded mode"
+        );
+        assert_eq!(
+            snapshot.active_command.linear_velocity,
+            DegradationThresholds::default().max_linear_velocity_mps,
+            "Built-in clamp must cap the 65.0 m/s command at max_linear_velocity_mps"
+        );
+    }
+
     #[tokio::test]
     async fn governor_clamps_command_before_degraded_logic() {
         let backend = Arc::new(TestBackend);
@@ -381,7 +469,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
 
         let mut loop_engine = InferenceLoop::new(backend, model, tx)
-            .with_governor(Box::new(ClampToTwoGovernor));
+            .with_governor(ClampToTwoGovernor);
         let mut stream = SimpleStream { next_id: 0 };
 
         let _ = loop_engine.tick(stream.next_frame().unwrap(), SafetyPosture::Nominal).await.unwrap();

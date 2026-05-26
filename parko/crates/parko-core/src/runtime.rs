@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 ///
 /// Variants are flat (no reason codes) for now. When degradation logic
 /// matures, consider attaching a `DegradationReason` to `Degraded` and an
-/// `EmergencyReason` to `EmergencyStop`, mirroring Aegis's reason-coded
+/// `EmergencyReason` to `EmergencyStop`, mirroring Kirra's reason-coded
 /// fleet posture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeState {

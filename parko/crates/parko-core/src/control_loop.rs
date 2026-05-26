@@ -57,10 +57,10 @@ where
         self.state = state;
     }
 
-    pub fn with_governor(
-        mut self,
-        governor: Box<dyn crate::safety::SafetyGovernor>,
-    ) -> Self {
+    /// Attach a KirraGovernor (or any `SafetyGovernor`) to this loop.
+    /// The governor's decision takes precedence over the built-in degraded-mode
+    /// clamp; both paths must not fire on the same tick (ADL-002).
+    pub fn with_governor(mut self, governor: impl crate::safety::SafetyGovernor + 'static) -> Self {
         self.inner = self.inner.with_governor(governor);
         self
     }
