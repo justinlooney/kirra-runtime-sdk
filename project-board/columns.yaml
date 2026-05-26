@@ -1,0 +1,175 @@
+board:
+  name: "Kirra Safety Runtime"
+  description: >
+    Solo lean-agile board for a hardware-neutral, safety-critical autonomy
+    runtime targeting ASIL-D. Tracks parko-core, parko-onnx, parko-aegis,
+    and kirra-runtime-sdk from deterministic tick grid through
+    certification-ready packaging.
+
+columns:
+
+  - id: backlog
+    name: "Backlog"
+    position: 1
+    wip_limit: null
+    description: >
+      All accepted tasks not yet scheduled. A card lives here until all
+      blocking dependencies are resolved and the task has complete acceptance
+      criteria and a Claude Code Prompt written in work/backlog.md.
+    labels_to_add_on_enter:
+      - backlog
+    labels_to_remove_on_enter: []
+
+  - id: ready
+    name: "Ready"
+    position: 2
+    wip_limit: 5
+    description: >
+      Tasks with all dependencies resolved, acceptance criteria written, and
+      Claude Code Prompt ready. Pulling a card here is a commitment that work
+      can begin immediately without waiting on anything external.
+    labels_to_add_on_enter:
+      - ready
+    labels_to_remove_on_enter:
+      - backlog
+
+  - id: in_progress
+    name: "In Progress"
+    position: 3
+    wip_limit: 3
+    description: >
+      Active work. Matches the three tasks in work/active.md exactly. A card
+      moves here when a branch named park-NNN/* is pushed or the issue is
+      assigned. Stale after 3 days with no commit activity.
+    labels_to_add_on_enter:
+      - in-progress
+    labels_to_remove_on_enter:
+      - ready
+      - stale
+
+  - id: blocked
+    name: "Blocked"
+    position: 4
+    wip_limit: null
+    description: >
+      Work that has started but is waiting on an external dependency: hardware
+      availability, third-party SDK, architectural decision, or review. Every
+      card here must have a blocking reason in its comments. Anything blocked
+      more than 7 days gets needs-decision and an ADL entry.
+    labels_to_add_on_enter:
+      - blocked
+    labels_to_remove_on_enter:
+      - in-progress
+
+  - id: done
+    name: "Done"
+    position: 5
+    wip_limit: null
+    description: >
+      Merged, tested, and verified. Linked PR merged to main. Task appended
+      to work/done.md at the weekly review. Archived after 30 days.
+    labels_to_add_on_enter:
+      - done
+    labels_to_remove_on_enter:
+      - in-progress
+      - blocked
+      - stale
+
+milestones:
+  - title: "v0.1 — Deterministic Runtime Core"
+    description: >
+      ControlLoop + SafetyGovernor + posture divergence proptest.
+      Artifact: parko-core v0.1.0 tagged and publishable.
+    tasks: [PARK-001, PARK-002, PARK-003, PARK-004, PARK-005, PARK-006]
+
+  - title: "v0.2 — Hardware Abstraction Layer"
+    description: >
+      BackendDescriptor enum, four stub backends, latency watchdog.
+      Artifact: parko-core v0.2.0 with all stubs passing CI.
+    tasks: [PARK-007, PARK-008, PARK-009, PARK-010, PARK-011, PARK-012, PARK-013, PARK-014]
+
+  - title: "v0.3 — Behavioral Safety"
+    description: >
+      RSS longitudinal + lateral model, posture integration, 10k simulation.
+      Artifact: RSS-gated kirra_verifier_service passing all safety tests.
+    tasks: [PARK-015, PARK-016, PARK-017, PARK-018, PARK-019, PARK-020, PARK-021]
+
+  - title: "v0.4 — Silicon Matrix Expansion"
+    description: >
+      Real QNN and OpenVINO backends, BackendSelector, determinism tests.
+      Artifact: feature-gated binaries for two hardware targets.
+    tasks: [PARK-022, PARK-023, PARK-024, PARK-025, PARK-026]
+
+  - title: "v1.2 — Safety OS Packaging"
+    description: >
+      Unified kirra_safety_runtime binary, systemd, backend-aware installer,
+      dashboard panels. Artifact: kirra v1.2.0 GitHub Release.
+    tasks: [PARK-027, PARK-028, PARK-029, PARK-030, PARK-031]
+
+  - title: "v2.0 — Certification-Ready Runtime"
+    description: >
+      RTM, MC/DC coverage, FMEA, DFA, offline audit verifier, SOTIF, HIL harness.
+      Artifact: pre-assessment package for TÜV or SGS-TÜV Saar.
+    tasks: [PARK-032, PARK-033, PARK-034, PARK-035, PARK-036, PARK-037, PARK-038, PARK-039, PARK-040]
+
+epics:
+  - label: "epic:runtime-core"
+    color: "0075ca"
+    milestone: "v0.1 — Deterministic Runtime Core"
+    tasks: [PARK-001, PARK-002, PARK-003, PARK-004, PARK-005, PARK-006]
+
+  - label: "epic:hal"
+    color: "e4e669"
+    milestone: "v0.2 — Hardware Abstraction Layer"
+    tasks: [PARK-007, PARK-008, PARK-009, PARK-010, PARK-011, PARK-012, PARK-013, PARK-014]
+
+  - label: "epic:behavioral-safety"
+    color: "d93f0b"
+    milestone: "v0.3 — Behavioral Safety"
+    tasks: [PARK-015, PARK-016, PARK-017, PARK-018, PARK-019, PARK-020, PARK-021]
+
+  - label: "epic:silicon-matrix"
+    color: "bfd4f2"
+    milestone: "v0.4 — Silicon Matrix Expansion"
+    tasks: [PARK-022, PARK-023, PARK-024, PARK-025, PARK-026]
+
+  - label: "epic:packaging"
+    color: "c2e0c6"
+    milestone: "v1.2 — Safety OS Packaging"
+    tasks: [PARK-027, PARK-028, PARK-029, PARK-030, PARK-031]
+
+  - label: "epic:certification"
+    color: "0e8a16"
+    milestone: "v2.0 — Certification-Ready Runtime"
+    tasks: [PARK-032, PARK-033, PARK-034, PARK-035, PARK-036, PARK-037, PARK-038, PARK-039, PARK-040]
+
+labels:
+  # Type
+  - name: "feat"        ; color: "0075ca"
+  - name: "fix"         ; color: "e4e669"
+  - name: "test"        ; color: "bfd4f2"
+  - name: "docs"        ; color: "cfd3d7"
+  - name: "chore"       ; color: "fef2c0"
+  - name: "safety"      ; color: "d93f0b"
+  # Domain
+  - name: "control-loop"      ; color: "0075ca"
+  - name: "backend-qnn"       ; color: "e4e669"
+  - name: "backend-tidl"      ; color: "bfd4f2"
+  - name: "backend-openvino"  ; color: "cfd3d7"
+  - name: "backend-rocm"      ; color: "fef2c0"
+  - name: "behavioral-safety" ; color: "d93f0b"
+  - name: "aegis-integration" ; color: "b60205"
+  - name: "posture-engine"    ; color: "e99695"
+  - name: "packaging"         ; color: "c2e0c6"
+  - name: "simulation"        ; color: "fbca04"
+  - name: "certification"     ; color: "0e8a16"
+  # Status
+  - name: "backlog"           ; color: "ededed"
+  - name: "ready"             ; color: "c2e0c6"
+  - name: "in-progress"       ; color: "0075ca"
+  - name: "blocked"           ; color: "b60205"
+  - name: "stale"             ; color: "fef2c0"
+  - name: "done"              ; color: "0e8a16"
+  - name: "needs-decision"    ; color: "fbca04"
+  - name: "needs-hardware"    ; color: "c5def5"
+  - name: "wont-fix"          ; color: "ededed"
