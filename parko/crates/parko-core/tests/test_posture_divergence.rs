@@ -1,6 +1,6 @@
 // crates/parko-core/tests/test_posture_divergence.rs
 //
-// Verifies that ControlLoop with an KirraGovernor selects different
+// Verifies that ControlLoop with a KirraGovernor selects different
 // kinematic contract profiles based on derived SafetyPosture, and that
 // this produces materially different clamping behavior for the same input.
 //
@@ -8,6 +8,9 @@
 // kirra_runtime_sdk::gateway::kinematics_contract):
 // - nominal_reference_profile().max_speed_mps == 35.0
 // - mrc_fallback_profile().max_speed_mps == 5.0
+//
+// This test target requires the `test-helpers` feature:
+//   cargo test -p parko-core --features test-helpers
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -143,5 +146,24 @@ async fn degraded_clamp_is_more_restrictive_than_nominal_clamp() {
     assert!(
         v_nominal < 65.0 && v_degraded < 65.0,
         "Both postures must clamp the 65.0 m/s input"
+    );
+}
+
+#[tokio::test]
+async fn set_state_for_test_forces_degraded_behavior() {
+    let (mut control, _rx) = make_loop();
+    control.set_state_for_test(RuntimeState::Degraded);
+
+    assert_eq!(
+        control.state(),
+        RuntimeState::Degraded,
+        "set_state_for_test must override the initial Warmup state"
+    );
+
+    let snapshot = control.tick().await.expect("tick should succeed");
+
+    assert!(
+        snapshot.active_command.linear_velocity < 35.0,
+        "Degraded state must produce a more restrictive clamp than Nominal (35.0 m/s)"
     );
 }

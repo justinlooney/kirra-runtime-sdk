@@ -50,9 +50,10 @@ where
         self.state
     }
 
-    /// Force the state machine to a specific state. Test-only — bypasses
-    /// the normal transition logic. The "for_test" naming substitutes for
-    /// compile-time gating; do not call this outside of test contexts.
+    /// Force the state machine to a specific state; bypasses transition logic.
+    /// Available under `cfg(test)` (unit tests) or the `test-helpers` feature
+    /// (integration tests). Never compiled into release builds.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_state_for_test(&mut self, state: RuntimeState) {
         self.state = state;
     }
@@ -214,5 +215,53 @@ mod tests {
             next_state(RuntimeState::Initializing, true),
             RuntimeState::Warmup
         );
+    }
+
+    #[test]
+    fn set_state_for_test_overrides_initial_warmup_state() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use crate::backend::{
+            BackendCapabilities, BackendError, InferenceBackend, ModelHandle,
+            PrecisionMode, TensorBatch, TensorStorage,
+        };
+        use crate::sensor::{SensorFrame, SensorStream};
+
+        struct FastBackend;
+        impl InferenceBackend for FastBackend {
+            fn load_model(&self, _: &str) -> Result<ModelHandle, BackendError> {
+                Ok(ModelHandle {
+                    model_id: "fast".into(),
+                    input_shapes: HashMap::new(),
+                    output_shapes: HashMap::new(),
+                    expected_precision: PrecisionMode::FP32,
+                })
+            }
+            fn run(&self, _: &ModelHandle, _: &TensorBatch) -> Result<TensorBatch<'static>, BackendError> {
+                Ok(TensorBatch { named_tensors: HashMap::new(), metadata: HashMap::new() })
+            }
+            fn capabilities(&self) -> BackendCapabilities {
+                BackendCapabilities {
+                    precision_modes: vec![PrecisionMode::FP32],
+                    supports_zero_copy_inputs: false,
+                    max_batch_size: 1,
+                    vendor_name: "fast",
+                }
+            }
+        }
+
+        struct EmptyStream;
+        impl SensorStream for EmptyStream {
+            fn next_frame(&mut self) -> Option<SensorFrame> { None }
+        }
+
+        let backend = Arc::new(FastBackend);
+        let model = backend.load_model("").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut control = ControlLoop::new(backend, model, EmptyStream, tx, 10.0);
+
+        assert_eq!(control.state(), RuntimeState::Warmup, "initial state should be Warmup");
+        control.set_state_for_test(RuntimeState::Degraded);
+        assert_eq!(control.state(), RuntimeState::Degraded, "set_state_for_test must override Warmup");
     }
 }
