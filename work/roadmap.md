@@ -5,6 +5,11 @@
 > work; IEEE 2846, IEC 61508 SIL 3, and ASTM F3269 are planned/target standards
 > not yet implemented; the CPU ONNX backend (parko-onnx) exists but its MNIST
 > integration test must be verified before being called green.
+>
+> **Board sync (2026-05-26):** GitHub Projects v2 GraphQL API not available via
+> current MCP tooling. Status below reflects open/closed issue state + the
+> `/work/active.md` WIP list. `[~]` markers are sourced from active.md.
+> No issues are in Done state — all open issues remain in Backlog or In Progress.
 
 ---
 
@@ -49,11 +54,15 @@
 
 ## Execution Order
 
-- **Now:** CPU ONNX stabilization, Backend trait refinement, TensorRT API spike
-  (when Jetson arrives), QNX deployment spike (TIME-SENSITIVE — 30-day license)
-- **Soon:** QNN coordination with QNX path; posture divergence tests; NaN guard
-- **Later:** TIDL, OpenVINO, AMD (blocked on hardware/customers); IEEE 2846
-  behavioral safety; IEC 61508 / ASTM F3269 certification mappings
+- **Now:** [~] PARK-001 governor builder (#6), [~] PARK-002 test-state setter (#7),
+  [~] PARK-003 posture divergence proptest (#16) — all actively in progress;
+  CPU ONNX stabilization (PARK-008/009); TensorRT API spike when Jetson arrives (PARK-020);
+  QNX deployment spike — TIME-SENSITIVE, 30-day license (PARK-024)
+- **Soon:** NaN guard (PARK-004); Clock abstraction (PARK-005); Backend capability
+  reporting (PARK-011); Stub backends (PARK-012); QNN + QNX coordination (PARK-025–027)
+- **Later:** TIDL, OpenVINO, AMD — blocked on hardware/customers (PARK-028–030);
+  IEEE 2846 behavioral safety (PARK-013–019); IEC 61508 / ASTM F3269 certification
+  mappings (PARK-039–040)
 
 ---
 
@@ -64,12 +73,12 @@ consumable as a library by downstream inference and governor crates.
 
 | Task | What | Done When |
 |------|------|-----------|
-| PARK-001 | Attach `SafetyGovernor` to `ControlLoop`. Stores governor as `Option<Box<dyn SafetyGovernor>>`. Built-in scalar clamp suppressed when governor present. | `test_builtin_clamp_suppressed` passes; all existing parko-core tests green. |
-| PARK-002 | Add `set_state_for_test(state: PostureState)` behind `#[cfg(test)]`. Test seam for posture-divergence tests; no production mutation path. | Method absent from release build (nm); callable under cargo test. |
-| PARK-003 | Posture-divergence proptest: governor output ≤ builtin ceiling for all (proposed, PostureState) pairs. 10,000 cases per variant. | ≥ 10,000 cases pass for Nominal, Degraded, LockedOut. |
-| PARK-004 | NaN/Inf input guard at `tick()` entry: non-finite float → `EnforcementAction::Halt` before governor or clamp. | Property test confirms zero non-finite values reach governor. |
-| PARK-005 | Wire `RuntimeClock` / `MockClock` abstraction into `ControlLoop`. All timing calls use `self.clock.now_ms()`; no wall-clock in timing-sensitive code. | Test advances `MockClock` manually; timing logic exercisable without sleep. |
-| PARK-006 | Tag `parko-core-v0.1.0`. Set version in `Cargo.toml`; verify `cargo publish --dry-run` exits cleanly. | Tag in repo; dry-run passes. |
+| [~] PARK-001 (in progress — GitHub Issue #6) | Attach `SafetyGovernor` to `ControlLoop`. Stores governor as `Option<Box<dyn SafetyGovernor>>`. Built-in scalar clamp suppressed when governor present. | `test_builtin_clamp_suppressed` passes; all existing parko-core tests green. |
+| [~] PARK-002 (in progress — GitHub Issue #7) | Add `set_state_for_test(state: PostureState)` behind `#[cfg(test)]`. Test seam for posture-divergence tests; no production mutation path. | Method absent from release build (nm); callable under cargo test. |
+| [~] PARK-003 (in progress — GitHub Issue #16) | Posture-divergence proptest: governor output ≤ builtin ceiling for all (proposed, PostureState) pairs. 10,000 cases per variant. | ≥ 10,000 cases pass for Nominal, Degraded, LockedOut. |
+| PARK-004 (GitHub Issue #17) | NaN/Inf input guard at `tick()` entry: non-finite float → `EnforcementAction::Halt` before governor or clamp. | Property test confirms zero non-finite values reach governor. |
+| PARK-005 (GitHub Issue #18) | Wire `RuntimeClock` / `MockClock` abstraction into `ControlLoop`. All timing calls use `self.clock.now_ms()`; no wall-clock in timing-sensitive code. | Test advances `MockClock` manually; timing logic exercisable without sleep. |
+| PARK-006 (GitHub Issue #11) | Tag `parko-core-v0.1.0`. Set version in `Cargo.toml`; verify `cargo publish --dry-run` exits cleanly. | Tag in repo; dry-run passes. |
 
 ---
 
@@ -82,12 +91,12 @@ are Increment 4.
 
 | Task | What | Done When |
 |------|------|-----------|
-| PARK-007 | Verify actual crate and struct names in `parko/` workspace before any rename or refactor. Document findings in decisions.md. | decisions.md updated with verified names; no broken imports. |
-| PARK-008 | Finalize `InferenceBackend` trait zero-copy boundary: `run(&self, input: &[f32], output: &mut [f32]) -> Result<(), BackendError>`. All scratch memory pre-allocated at `new()`. | Trait compiles; shape mismatch returns `BackendError::ShapeMismatch`; never panics. |
-| PARK-009 | Validate parko-onnx CPU backend against `InferenceBackend` trait. Verify MNIST integration test is green — do not assume it passes without running it. | `cargo test -p parko-onnx` exits 0; MNIST test verified green. |
-| PARK-010 | Add `MockBackend` to parko-core: configurable deterministic output. Eliminates ORT dependency from parko-core test binary. | parko-core tests use `MockBackend`; no ORT link in `cargo test -p parko-core`. |
-| PARK-011 | Define backend capability reporting: `capabilities()` method + `BackendDescriptor` enum covering all target backends. | All stubs return valid descriptors; capability query compiles on CI. |
-| PARK-012 | Feature-gated zero-output stub backends for TensorRT, QNN, TIDL, OpenVINO, AMD. CI builds and tests all stubs without hardware. | `cargo test --features backend-<name>` passes on ubuntu-latest for all stubs. |
+| PARK-007 (GitHub Issue #19) | Verify actual crate and struct names in `parko/` workspace before any rename or refactor. Document findings in decisions.md. | decisions.md updated with verified names; no broken imports. |
+| PARK-008 (GitHub Issue #20) | Finalize `InferenceBackend` trait zero-copy boundary: `run(&self, input: &[f32], output: &mut [f32]) -> Result<(), BackendError>`. All scratch memory pre-allocated at `new()`. | Trait compiles; shape mismatch returns `BackendError::ShapeMismatch`; never panics. |
+| PARK-009 (GitHub Issue #21) | Validate parko-onnx CPU backend against `InferenceBackend` trait. Verify MNIST integration test is green — do not assume it passes without running it. | `cargo test -p parko-onnx` exits 0; MNIST test verified green. |
+| PARK-010 (GitHub Issue #22) | Add `MockBackend` to parko-core: configurable deterministic output. Eliminates ORT dependency from parko-core test binary. | parko-core tests use `MockBackend`; no ORT link in `cargo test -p parko-core`. |
+| PARK-011 (GitHub Issue #23) | Define backend capability reporting: `capabilities()` method + `BackendDescriptor` enum covering all target backends. | All stubs return valid descriptors; capability query compiles on CI. |
+| PARK-012 (GitHub Issue #24) | Feature-gated zero-output stub backends for TensorRT, QNN, TIDL, OpenVINO, AMD. CI builds and tests all stubs without hardware. | `cargo test --features backend-<name>` passes on ubuntu-latest for all stubs. |
 
 ---
 
@@ -98,13 +107,13 @@ yet. This increment implements the RSS governor integration from scratch.
 
 | Task | What | Done When |
 |------|------|-----------|
-| PARK-013 | Implement `longitudinal_safe_distance` per IEEE 2846-2022 §5.1. First implementation; no prior behavioral-safety code exists. | Unit tests match IEEE reference values; no NaN/overflow on edge cases. |
-| PARK-014 | Implement `lateral_safe_distance` per IEEE 2846-2022 §5.2. | Unit tests cover converging, diverging, and stationary cases. |
-| PARK-015 | Wire `RssState { safe, longitudinal_margin, lateral_margin }` into posture engine. RSS violation → Degraded; 5-tick / 10 s hysteresis recovery. | Integration test: violation → Degraded; 5 clean ticks → Nominal. |
-| PARK-016 | RSS pre-actuator gate in KirraGovernor: `rss_state.safe == false` clamps to 0.0 before any kinematic check. | Unit test: safe=false + positive velocity → 0.0; safe=true → normal kinematics. |
-| PARK-017 | RSS property test: for all (ego_vel, lead_vel, gap, commanded_vel) in plausible range, no RSS-violating command exits governor. 10,000 cases per PostureState variant. | All three PostureState variants covered; all cases pass. |
-| PARK-018 | `RssViolationEvent` appended to SHA-256 hash-chained audit ledger. Single-byte corruption causes `verify_chain()` to fail. | append + verify_chain test passes; tamper detection confirmed. |
-| PARK-019 | 10,000-scenario adversarial trajectory simulation via `ScenarioRunner` + `MockClock`. Zero unsafe commands exit; < 60 s on CI. | Zero violations escape; test completes in < 60 s on CI. |
+| PARK-013 (GitHub Issue #25) | Implement `longitudinal_safe_distance` per IEEE 2846-2022 §5.1. First implementation; no prior behavioral-safety code exists. | Unit tests match IEEE reference values; no NaN/overflow on edge cases. |
+| PARK-014 (GitHub Issue #26) | Implement `lateral_safe_distance` per IEEE 2846-2022 §5.2. | Unit tests cover converging, diverging, and stationary cases. |
+| PARK-015 (GitHub Issue #27) | Wire `RssState { safe, longitudinal_margin, lateral_margin }` into posture engine. RSS violation → Degraded; 5-tick / 10 s hysteresis recovery. | Integration test: violation → Degraded; 5 clean ticks → Nominal. |
+| PARK-016 (GitHub Issue #28) | RSS pre-actuator gate in KirraGovernor: `rss_state.safe == false` clamps to 0.0 before any kinematic check. | Unit test: safe=false + positive velocity → 0.0; safe=true → normal kinematics. |
+| PARK-017 (GitHub Issue #29) | RSS property test: for all (ego_vel, lead_vel, gap, commanded_vel) in plausible range, no RSS-violating command exits governor. 10,000 cases per PostureState variant. | All three PostureState variants covered; all cases pass. |
+| PARK-018 (GitHub Issue #30) | `RssViolationEvent` appended to SHA-256 hash-chained audit ledger. Single-byte corruption causes `verify_chain()` to fail. | append + verify_chain test passes; tamper detection confirmed. |
+| PARK-019 (GitHub Issue #31) | 10,000-scenario adversarial trajectory simulation via `ScenarioRunner` + `MockClock`. Zero unsafe commands exit; < 60 s on CI. | Zero violations escape; test completes in < 60 s on CI. |
 
 ---
 
@@ -118,27 +127,27 @@ TIME-SENSITIVE (30-day license in progress).
 
 | Task | What | Done When |
 |------|------|-----------|
-| PARK-020 | TensorRT API spike: set up FFI bindings; verify trivial model loads and runs on Jetson. | TRT runtime loads; test model executes without segfault on Jetson. |
-| PARK-021 | Implement `TensorRTBackend` struct: `new(engine_path)`, pre-allocated CUDA buffers, zero per-inference allocation. | Inference on Jetson; no per-inference alloc; `run()` matches CPU output within 1e-3. |
-| PARK-022 | Integrate TensorRT into `BackendSelector`: `KIRRA_BACKEND=tensorrt` selects TRT; falls back to stub with `tracing::warn!`. | Backend selection works; fallback to stub on CI without GPU. |
-| PARK-023 | CPU vs TensorRT output comparison: same input, outputs within 1e-3 element-wise. Hardware test `#[ignore]`'d in CI. | Tolerance test passes on Jetson; comment documents hardware-only status. |
+| PARK-020 (GitHub Issue #32) | TensorRT API spike: set up FFI bindings; verify trivial model loads and runs on Jetson. | TRT runtime loads; test model executes without segfault on Jetson. |
+| PARK-021 (GitHub Issue #33) | Implement `TensorRTBackend` struct: `new(engine_path)`, pre-allocated CUDA buffers, zero per-inference allocation. | Inference on Jetson; no per-inference alloc; `run()` matches CPU output within 1e-3. |
+| PARK-022 (GitHub Issue #34) | Integrate TensorRT into `BackendSelector`: `KIRRA_BACKEND=tensorrt` selects TRT; falls back to stub with `tracing::warn!`. | Backend selection works; fallback to stub on CI without GPU. |
+| PARK-023 (GitHub Issue #35) | CPU vs TensorRT output comparison: same input, outputs within 1e-3 element-wise. Hardware test `#[ignore]`'d in CI. | Tolerance test passes on Jetson; comment documents hardware-only status. |
 
 ### QNX + QNN Coordination (TIME-SENSITIVE — 30-day license)
 
 | Task | What | Done When |
 |------|------|-----------|
-| PARK-024 | QNX deployment spike: bring up `kirra_verifier_service` binary on QNX. Identify POSIX subset gaps. | Service starts on QNX; `/health` returns 200. |
-| PARK-025 | QNN + QNX compatibility analysis: document SDK version requirements, FFI linking, memory model differences from Linux. | Analysis in decisions.md; no surprises at link time. |
-| PARK-026 | Define QNX-safe backend selection rules: no dynamic allocation in hot-path; document POSIX subset constraints. | Rules documented; `BackendSelector` respects QNX constraints. |
+| PARK-024 (GitHub Issue #36) | QNX deployment spike: bring up `kirra_verifier_service` binary on QNX. Identify POSIX subset gaps. | Service starts on QNX; `/health` returns 200. |
+| PARK-025 (GitHub Issue #37) | QNN + QNX compatibility analysis: document SDK version requirements, FFI linking, memory model differences from Linux. | Analysis in decisions.md; no surprises at link time. |
+| PARK-026 (GitHub Issue #38) | Define QNX-safe backend selection rules: no dynamic allocation in hot-path; document POSIX subset constraints. | Rules documented; `BackendSelector` respects QNX constraints. |
 
 ### Other Hardware (Deferred — blocked on hardware/customers)
 
 | Task | What | Done When |
 |------|------|-----------|
-| PARK-027 | QNN backend MVP via Qualcomm AI Engine Direct SDK C FFI. First implementation; no prior QNN code exists. Hardware test `#[ignore]`'d. | Inference on QCS6490; top-1 class matches CPU reference within tolerance. |
-| PARK-028 | TI TIDL backend MVP via TIDL C FFI, cross-compiled to `aarch64-unknown-linux-gnu`. First implementation. Hardware test `#[ignore]`'d. | Inference on TDA4VM; output within 1e-3 of CPU reference. |
-| PARK-029 | OpenVINO backend MVP using `openvino-rs`. Testable in CI via CPU plugin. First implementation. | CI test with identity model passes; output within 1e-6 of input. |
-| PARK-030 | AMD backend MVP: decide Vitis AI vs ROCm based on customer; implement chosen path. First implementation. | Decision recorded in decisions.md; MVP runs on target hardware. |
+| PARK-027 (GitHub Issue #39) | QNN backend MVP via Qualcomm AI Engine Direct SDK C FFI. First implementation; no prior QNN code exists. Hardware test `#[ignore]`'d. | Inference on QCS6490; top-1 class matches CPU reference within tolerance. |
+| PARK-028 (GitHub Issue #40) | TI TIDL backend MVP via TIDL C FFI, cross-compiled to `aarch64-unknown-linux-gnu`. First implementation. Hardware test `#[ignore]`'d. | Inference on TDA4VM; output within 1e-3 of CPU reference. |
+| PARK-029 (GitHub Issue #41) | OpenVINO backend MVP using `openvino-rs`. Testable in CI via CPU plugin. First implementation. | CI test with identity model passes; output within 1e-6 of input. |
+| PARK-030 (GitHub Issue #42) | AMD backend MVP: decide Vitis AI vs ROCm based on customer; implement chosen path. First implementation. | Decision recorded in decisions.md; MVP runs on target hardware. |
 
 ---
 
@@ -147,11 +156,11 @@ TIME-SENSITIVE (30-day license in progress).
 
 | Task | What | Done When |
 |------|------|-----------|
-| PARK-031 | Normalize Kirra naming across Docker image, Helm chart, env vars, and service unit files. Remove remaining Aegis references. | `grep -r aegis` returns only intentional references; build and install pass. |
-| PARK-032 | Add Parko runtime into Kirra Docker image. One image: parko-core + kirra-runtime-sdk + KirraGovernor + dashboard. | Single image starts; `/health` and inference loop both respond. |
-| PARK-033 | Backend-aware installer: `install.sh --backend <cpu|tensorrt|qnn|...>`. Non-interactive with `--yes`. | Unattended install for each variant completes without prompts. |
-| PARK-034 | systemd unit with watchdog: `WatchdogSec=5`, `MemoryMax=512M`, `CPUQuota=80%`. | `systemd-analyze verify` passes; service restarts on simulated watchdog timeout. |
-| PARK-035 | QNX packaging stub: define `kirra-qnx.tar.gz` artifact structure and placeholder Makefile. Blocked until PARK-024. | Stub artifact builds; README covers what fills in when QNX work lands. |
+| PARK-031 (GitHub Issue #43) | Normalize Kirra naming across Docker image, Helm chart, env vars, and service unit files. Remove remaining Aegis references. | `grep -r aegis` returns only intentional references; build and install pass. |
+| PARK-032 (GitHub Issue #44) | Add Parko runtime into Kirra Docker image. One image: parko-core + kirra-runtime-sdk + KirraGovernor + dashboard. | Single image starts; `/health` and inference loop both respond. |
+| PARK-033 (GitHub Issue #45) | Backend-aware installer: `install.sh --backend <cpu|tensorrt|qnn|...>`. Non-interactive with `--yes`. | Unattended install for each variant completes without prompts. |
+| PARK-034 (GitHub Issue #46) | systemd unit with watchdog: `WatchdogSec=5`, `MemoryMax=512M`, `CPUQuota=80%`. | `systemd-analyze verify` passes; service restarts on simulated watchdog timeout. |
+| PARK-035 (GitHub Issue #47) | QNX packaging stub: define `kirra-qnx.tar.gz` artifact structure and placeholder Makefile. Blocked until PARK-024. | Stub artifact builds; README covers what fills in when QNX work lands. |
 
 ---
 
@@ -162,13 +171,13 @@ TIME-SENSITIVE (30-day license in progress).
 
 | Task | What | Done When |
 |------|------|-----------|
-| PARK-036 | Bring up ROS2 Jazzy on Ubuntu 24.04. Configure colcon workspace; verify basic pub/sub. | `ros2 topic echo` works; workspace builds cleanly. |
-| PARK-037 | Integrate Parko + KirraGovernor with ROS2 cmd_vel topics. Governor clamps observable on `filtered_cmd_vel`. | Closed-loop behavior on Hiwonder; governor clamps verified on filtered topic. |
-| PARK-038 | Build full reference robot stack: Parko + KirraGovernor + ROS2 + kirra_safety interlock + CARLA alternative. | BLOCKED: depends on Hiwonder hardware + ROS2 Jazzy setup. |
+| PARK-036 (GitHub Issue #48) | Bring up ROS2 Jazzy on Ubuntu 24.04. Configure colcon workspace; verify basic pub/sub. | `ros2 topic echo` works; workspace builds cleanly. |
+| PARK-037 (GitHub Issue #49) | Integrate Parko + KirraGovernor with ROS2 cmd_vel topics. Governor clamps observable on `filtered_cmd_vel`. | Closed-loop behavior on Hiwonder; governor clamps verified on filtered topic. |
+| PARK-038 (GitHub Issue #50) | Build full reference robot stack: Parko + KirraGovernor + ROS2 + kirra_safety interlock + CARLA alternative. | BLOCKED: depends on Hiwonder hardware + ROS2 Jazzy setup. |
 
 ### Safety Case (all NEW WORK)
 
 | Task | What | Done When |
 |------|------|-----------|
-| PARK-039 | Map IEC 61508 SIL 3 requirements: identify SIL 3 claims in existing safety functions; document gaps and required mitigations. | Every SIL 3 claim has an implementation entry or explicit gap note. |
-| PARK-040 | Map ASTM F3269-21 bounded-operation envelope: define Nominal, Degraded, BLLOS envelopes per §6; trace to posture engine states. | Each mode has a defined envelope; claims traceable to posture engine states. |
+| PARK-039 (GitHub Issue #51) | Map IEC 61508 SIL 3 requirements: identify SIL 3 claims in existing safety functions; document gaps and required mitigations. | Every SIL 3 claim has an implementation entry or explicit gap note. |
+| PARK-040 (GitHub Issue #52) | Map ASTM F3269-21 bounded-operation envelope: define Nominal, Degraded, BLLOS envelopes per §6; trace to posture engine states. | Each mode has a defined envelope; claims traceable to posture engine states. |
