@@ -21,10 +21,10 @@ authority over every command on the hot path. The authority model is:
 - **Degraded:** KirraGovernor applies the MRC fallback `VehicleKinematicsContract`
   (ceiling: **5.0 m/s**). This is a velocity cap, not a hard zero veto. The
   vehicle is slowed to a safe reduced speed, not halted.
-- **LockedOut:** KirraGovernor applies the **same** MRC fallback contract as
-  Degraded (ceiling: 5.0 m/s). Both postures share one contract instance and
-  produce identical outputs for the same input. Verified by PARK-003 proptest
-  (`locked_out_and_degraded_produce_identical_outputs`, 10 000 cases).
+- **LockedOut:** KirraGovernor issues a hard stop — `EnforcementAction::Deny` —
+  yielding **0.0 m/s**. No motion is permitted. The vehicle must remain stopped
+  until a supervisor issues a manual reset. LockedOut and Degraded are **separate
+  branches** that must never share a code path or contract instance.
 - **Nominal:** KirraGovernor applies the nominal reference contract (ceiling:
   **35.0 m/s**) with a **tighter acceleration rate-limit** than the fallback
   contract. For proposed velocities between 5–35 m/s with no prior command
@@ -42,13 +42,15 @@ concurrent or asynchronous governor path in the control loop.
 
 Safety policies are domain-specific; a trait object lets each deployment inject
 KirraGovernor without forking `parko-core`. The `Option` preserves backward
-compatibility. The MRC fallback model on Degraded/LockedOut matches fail-reduced
-(not fail-stop) semantics — sudden full stops at speed are themselves hazardous;
+compatibility. The MRC fallback model on Degraded matches fail-reduced (not
+fail-stop) semantics — sudden full stops at speed are themselves hazardous;
 slowing to a controlled 5.0 m/s allows the operator or safety driver to intervene
-safely. The nominal profile's tighter rate-of-change limit prevents jerky
-acceleration that could destabilize the vehicle under normal operation. The
-fallback-to-conservative-envelope rule ensures the loop never runs unguarded even
-if the governor crate is temporarily unavailable.
+safely. LockedOut triggers a hard stop (0.0 m/s) because at this posture the
+system has exceeded the threshold requiring mandatory human review before any
+further motion is authorized. The nominal profile's tighter rate-of-change limit
+prevents jerky acceleration that could destabilize the vehicle under normal
+operation. The fallback-to-conservative-envelope rule ensures the loop never runs
+unguarded even if the governor crate is temporarily unavailable.
 
 ### Alternatives Considered
 
@@ -65,10 +67,12 @@ if the governor crate is temporarily unavailable.
 - The no-governor code path (built-in clamp) must remain correct and tested.
 - Any crate injecting a governor owns the full safety guarantee for that loop.
 - `SafetyGovernor` must be `Send + Sync`.
-- Tests that assert "LockedOut = hard zero veto" are **wrong**; the correct
-  assertion is output ≤ 5.0 m/s (fallback ceiling). See PARK-003 proptest.
-- Tasks or documentation describing LockedOut as a hard-veto must be corrected
-  before they are implemented (see ADL-005 which also carries this error).
+- Tests that assert LockedOut output == 0.0 are **correct**. Assertions of
+  output ≤ 5.0 for LockedOut are insufficient — they conflate LockedOut with
+  Degraded and must be replaced with the exact equality check. See PARK-003
+  proptest (`governor_locked_out_always_returns_zero`, 10 000 cases).
+- `KirraGovernor::evaluate()` must keep LockedOut and Degraded as separate
+  match arms that never share a contract instance or code path.
 
 ---
 
@@ -200,17 +204,19 @@ supervisor reset key; no automatic hysteresis).
 `PostureState` in `parko-core` mirrors this three-variant structure for use in
 governor and control-loop logic.
 
-KirraGovernor authority maps onto this state machine (corrected per ADL-001
-update, 2026-05-26; original entry incorrectly stated a hard-veto for
-Degraded/LockedOut):
+KirraGovernor authority maps onto this state machine (corrected 2026-05-26:
+original entry incorrectly stated a hard-veto for Degraded/LockedOut; second
+correction 2026-05-26: LockedOut is a hard stop (0.0 m/s), not the MRC fallback
+profile — LockedOut and Degraded must never share a code path):
 - `Nominal`   → KirraGovernor applies nominal reference profile (35.0 m/s
                 ceiling + strict rate-of-change limit).
 - `Degraded`  → KirraGovernor applies MRC fallback profile (5.0 m/s ceiling).
                 Velocity cap, not a hard zero veto.
-- `LockedOut` → KirraGovernor applies the **same** MRC fallback profile as
-                Degraded (5.0 m/s ceiling). Manual reset required to exit this
-                state; the governor itself does not distinguish LockedOut from
-                Degraded at the contract level.
+- `LockedOut` → KirraGovernor issues a hard stop (**0.0 m/s**,
+                `EnforcementAction::Deny`). No motion is permitted. Manual
+                supervisor reset required to exit this state. LockedOut and
+                Degraded are distinct postures with distinct enforcement and
+                must never share a code path or contract instance.
 
 IEEE 2846 behavioral safety integration is planned but not yet implemented. When
 implemented (PARK-015), RSS violations must reset the recovery streak to 0 on
