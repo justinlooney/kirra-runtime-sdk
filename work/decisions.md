@@ -13,41 +13,43 @@
 
 ### Decision
 
-`ControlLoop` stores a governor as `Option<Box<dyn SafetyGovernor>>`. The
-built-in scalar clamp is suppressed when a governor is present. Injection
-is via a builder method `with_governor(Box<dyn SafetyGovernor>)`.
+`ControlLoop` in `parko-core` stores a governor as
+`Option<Box<dyn SafetyGovernor>>`. The built-in scalar clamp is suppressed when
+a governor is present. Injection is via a builder method
+`with_governor(impl SafetyGovernor + 'static)`.
 
 ### Why
 
-Safety policies are domain-specific (kinematics envelopes for ground vehicles
-differ from aerial vehicles). A trait object lets each deployment inject its
-own policy without forking `parko-core`. The `Option` preserves backward
-compatibility: loops without an injected governor retain the existing built-in
-clamp behaviour.
+Safety policies are domain-specific: kinematics envelopes for a ground vehicle
+differ from those for an aerial platform. A trait object lets each deployment
+inject the Kirra governor crate's implementation without forking `parko-core`.
+The `Option` preserves backward compatibility — loops without an injected
+governor retain the existing built-in clamp behaviour.
 
 ### Alternatives Considered
 
 1. **Compile-time generics** (`ControlLoop<G: SafetyGovernor>`): Avoids heap
    allocation but forces every caller to specify the type parameter and makes
-   default (no-governor) construction awkward. Rejected: usability cost
-   outweighs the alloc saving on a non-hot init path.
-2. **Function pointer** (`fn(f64, PostureState) -> f64`): Simpler, but
-   stateless — governors that require calibration data (e.g., max lateral
-   acceleration from a loaded config) need to close over state. Rejected.
-3. **Global registry**: Couples crate to a global; breaks `Send + Sync`
-   reasoning. Rejected.
+   default (no-governor) construction awkward. The alloc cost on a non-hot init
+   path is not worth the API complexity. Rejected.
+2. **Function pointer** (`fn(f64, PostureState) -> f64`): Simpler, but stateless.
+   Governors that require calibration data (e.g., envelope limits loaded from a
+   config file) must close over state. Rejected.
+3. **Global registry**: Couples `parko-core` to a global; breaks `Send + Sync`
+   reasoning and makes multi-instance testing impossible. Rejected.
 
 ### Consequences
 
-- All `ControlLoop` tests that check the built-in clamp must remain and continue
-  to pass (the no-governor code path must stay correct).
+- The no-governor code path (built-in clamp) must remain correct and tested;
+  it is the production default for any loop not using the Kirra governor crate.
 - A governor injected via `with_governor` is the sole output gate; any
-  additional clamping must be done inside the governor itself.
-- `SafetyGovernor` must be `Send + Sync` so loops can be sent across threads.
+  additional clamping must be implemented inside the governor itself.
+- `SafetyGovernor` must be `Send + Sync` so `ControlLoop` instances can be
+  sent across threads.
 
 ---
 
-## ADL-002 — Built-in clamp suppression semantics
+## ADL-002 — Built-in clamp interaction with injected governor
 
 **Date:** 2026-05-26
 **Status:** Accepted
@@ -56,35 +58,40 @@ clamp behaviour.
 ### Decision
 
 When a `SafetyGovernor` is injected, the built-in scalar clamp in
-`ControlLoop::tick` is bypassed entirely. The governor receives the raw
+`ControlLoop::tick` is bypassed **entirely**. The governor receives the raw
 proposed output and is solely responsible for producing a safe value.
+The `builtin_clamp_ceiling` helper is exposed as `pub(crate)` so proptest
+suites can verify that the governor's output never exceeds what the built-in
+clamp would have allowed.
 
 ### Why
 
-Partial suppression (governor + clamp both active) creates ambiguity: which
-bound wins, and does the order matter? Full suppression makes the contract
-explicit: if you inject a governor, you own the safety guarantee. This is
-verified by the `test_builtin_clamp_suppressed` acceptance test.
+Partial suppression (both governor and clamp active) creates ambiguity: which
+bound wins, does the order matter, and can a governor intentionally allow a
+higher value for a platform with a wider safe envelope? Full suppression makes
+the contract explicit — if you inject a governor, you own the safety guarantee.
+The `test_builtin_clamp_suppressed` acceptance test enforces this invariant.
 
 ### Alternatives Considered
 
-1. **Governor narrows, clamp catches escapes**: Safer but harder to reason
-   about. A governor that intentionally allows values the default clamp would
-   reject (valid for custom envelopes) would be silently overridden. Rejected.
-2. **Both active, minimum wins**: Compositional but masks misconfiguration —
-   a governor that returns a too-high value would silently be corrected rather
-   than failing loudly in tests. Rejected.
+1. **Governor narrows, clamp catches escapes**: A governor that intentionally
+   allows values the default clamp would reject (valid for custom envelopes)
+   would be silently overridden. This defeats the purpose of injection. Rejected.
+2. **Both active, minimum wins**: Compositional but masks governor
+   misconfiguration — an overly permissive governor would be silently corrected
+   rather than failing loudly in tests. Rejected.
 
 ### Consequences
 
-- Any downstream crate injecting a governor must include its own property tests
-  asserting its output is within the desired safety envelope.
-- The `builtin_clamp_ceiling` helper (pub(crate)) is exposed so governor
-  property tests can assert governor_out <= ceiling without duplicating logic.
+- Any crate injecting a governor must include property tests asserting its
+  output is within the desired safety envelope for all posture states.
+- The `builtin_clamp_ceiling(proposed, state) -> f64` helper must track the
+  production clamp logic exactly; if the clamp is changed, the helper must
+  be updated in the same commit.
 
 ---
 
-## ADL-003 — Backend zero-copy contract: `run(&self, input: &[f32], output: &mut [f32])`
+## ADL-003 — InferenceBackend trait: zero-copy hot-path contract
 
 **Date:** 2026-05-26
 **Status:** Accepted
@@ -92,38 +99,46 @@ verified by the `test_builtin_clamp_suppressed` acceptance test.
 
 ### Decision
 
-The `InferenceBackend` trait's hot-path method is:
+The `InferenceBackend` trait defines the hot-path method as:
 ```rust
 fn run(&self, input: &[f32], output: &mut [f32]) -> Result<(), BackendError>;
 ```
-All scratch memory is pre-allocated at backend `init()`. No heap allocation
-on the hot path.
+All backend implementations must pre-allocate all scratch memory at init
+(`new()`). No heap allocation is permitted on the `run` path.
+
+The multi-silicon backend architecture (`BackendDescriptor`, `BackendSelector`,
+QNN/TIDL/ROCm/OpenVINO backends) is defined and specced but **not yet
+implemented** as of this ADL. Only the CPU ONNX backend (`parko-onnx`) and
+the test-only `MockBackend` currently implement the trait.
 
 ### Why
 
-Inference is called at the control-loop tick rate (typically 50–200 Hz on
-embedded targets). Dynamic allocation on every tick would cause latency spikes
-and potential OOM in bounded-memory safety contexts. Passing output as a
-caller-provided mutable slice avoids a per-call allocation and lets the caller
-reuse the same buffer indefinitely.
+Inference is called at the control-loop tick rate (50–200 Hz on embedded
+targets). Dynamic allocation on every call would cause latency spikes and
+potential OOM in bounded-memory safety contexts. A caller-provided output
+slice allows buffer reuse across ticks. `BackendError::ShapeMismatch` provides
+a typed failure path for length mismatches without panic.
 
 ### Alternatives Considered
 
-1. **Return `Vec<f32>`**: Simple API but allocates on every call. Rejected.
-2. **Interior mutability buffer (`&self` returns a reference)**: Unsafe in the
-   presence of multiple callers; lifetime complexity outweighs the benefit.
+1. **Return `Vec<f32>`**: Simple API but allocates on every call. Incompatible
+   with real-time and ASIL-D constraints. Rejected.
+2. **Interior mutability buffer (`&self` returns a reference to internal buffer)**:
+   Unsafe under concurrent access; lifetime complexity outweighs the benefit.
    Rejected.
-3. **`unsafe` raw pointer pair**: Zero-copy but loses Rust safety guarantees.
-   Rejected without a compelling hardware necessity.
+3. **`unsafe` raw pointer pair**: Zero-copy without Rust safety guarantees.
+   Rejected unless a specific hardware SDK forces it (to be revisited in
+   PARK-020 through PARK-023 if FFI requires it).
 
 ### Consequences
 
-- Every backend implementation must document the required input and output
-  slice lengths in its `BackendDescriptor` or constructor.
-- Callers must pre-allocate output buffers; the `InferenceLoop` struct owns
-  and reuses these buffers for the lifetime of the loop.
-- Shape mismatch (wrong slice length) must return `BackendError::ShapeMismatch`,
-  never panic or write out-of-bounds.
+- Every backend must document required input/output slice lengths in its
+  constructor or `BackendDescriptor`.
+- Callers pre-allocate output buffers; `InferenceLoop` owns and reuses these
+  for its lifetime.
+- Shape mismatch returns `BackendError::ShapeMismatch`; it never panics.
+- When real hardware backends are implemented (PARK-020–PARK-023), this ADL
+  must be revisited if any SDK cannot satisfy the no-alloc constraint.
 
 ---
 
@@ -135,40 +150,45 @@ reuse the same buffer indefinitely.
 
 ### Decision
 
-`ControlLoop` accepts a `Clock` trait object (`Arc<dyn Clock>`). Two
-implementations ship with `parko-core`: `SystemClock` (wraps
-`std::time::Instant`) and `VirtualClock` (manually advanceable counter).
-All timing logic inside `ControlLoop` calls `self.clock.now_ms()`.
+`ControlLoop` and `InferenceLoop` in `parko-core` accept a `Clock` trait object
+(`Arc<dyn Clock>`). Two implementations ship: `SystemClock` (wraps
+`std::time::Instant`) and `VirtualClock` (manually advanceable `AtomicU64`).
+All timing logic calls `self.clock.now_ms()`; no direct use of
+`std::time::Instant::now()` inside timing-sensitive code.
+
+The same `Clock` abstraction is used in `kirra-runtime-sdk` (`src/clock.rs`)
+for `ScenarioRunner` and the telemetry watchdog. The two crates share the
+concept but may not share the same type; use the parko-core definition for
+parko-core tests and the kirra-runtime-sdk definition for integration tests.
 
 ### Why
 
-Tests that verify timing behaviour (watchdog timeouts, rate limiters, hysteresis
-windows) cannot use wall-clock time reliably in CI. Injecting a `VirtualClock`
-lets tests advance time by arbitrary amounts synchronously, making them fast,
-deterministic, and independent of system load.
+Tests that verify timing behaviour (watchdog timeouts, rate limiters, the
+5-tick recovery hysteresis) cannot use wall-clock time reliably in CI.
+`VirtualClock::advance(ms)` lets tests advance time synchronously, making
+them fast, deterministic, and independent of system load. This also eliminates
+`std::thread::sleep` from any test in these crates.
 
 ### Alternatives Considered
 
-1. **`tokio::time::pause()`**: Only works in a Tokio context; `parko-core` must
-   remain `async`-runtime agnostic. Rejected.
-2. **`std::thread::sleep` in tests**: Slow and flaky under load. Rejected.
-3. **Mocking at the `ControlLoop` level** (e.g., `#[cfg(test)]` field): Couples
-   test infrastructure to the production type; harder to test across crates.
-   Rejected.
+1. **`tokio::time::pause()`**: Only works in a Tokio context. `parko-core` must
+   remain async-runtime agnostic. Rejected.
+2. **`std::thread::sleep` in tests**: Slow and flaky under CI load. Rejected.
+3. **`#[cfg(test)]` mock field on the struct**: Couples test infrastructure to
+   the production type; harder to compose across crates. Rejected.
 
 ### Consequences
 
-- `ControlLoop::new()` accepts a `Arc<dyn Clock>` parameter; callers that
-  don't care about time pass `Arc::new(SystemClock)`.
-- `VirtualClock::advance(ms: u64)` is the only public mutation method; tests
-  call it between ticks to simulate elapsed time.
-- All constants that represent durations (watchdog timeout, hysteresis window)
-  are compared against `clock.now_ms()` — never against
-  `std::time::Instant::now()` directly.
+- All duration constants (watchdog timeout, hysteresis window, tick period) are
+  compared against `clock.now_ms()`, never against `Instant::now()` directly.
+- `ControlLoop::new()` accepts `Arc<dyn Clock>`; callers that don't care about
+  time pass `Arc::new(SystemClock)`.
+- IEEE 2846 behavioral safety integration (PARK-013–PARK-019) will use
+  `VirtualClock` for the adversarial simulation in PARK-019.
 
 ---
 
-## ADL-005 — Safety posture state machine: asymmetric transitions and 5-tick hysteresis
+## ADL-005 — Safety posture state machine: asymmetric transitions and hysteresis
 
 **Date:** 2026-05-26
 **Status:** Accepted
@@ -176,39 +196,53 @@ deterministic, and independent of system load.
 
 ### Decision
 
-`PostureState` has three variants: `Nominal`, `Degraded`, `LockedOut`.
-Fault transitions are instantaneous (one bad tick → Degraded; configured
-consecutive violations → LockedOut). Recovery requires
-`AV_RECOVERY_STREAK_THRESHOLD = 5` consecutive clean ticks within
-`AV_RECOVERY_WINDOW_MS = 10_000` ms. Recovery from LockedOut is manual
-(requires supervisor reset key, not automatic hysteresis).
+`FleetPosture` (in `kirra-runtime-sdk`) has three variants: `Nominal`,
+`Degraded`, `LockedOut`. Fault transitions are instantaneous (one bad event →
+Degraded; configured consecutive violations → LockedOut). Recovery from
+Degraded requires `AV_RECOVERY_STREAK_THRESHOLD = 5` consecutive clean reports
+within `AV_RECOVERY_WINDOW_MS = 10 000` ms. Recovery from LockedOut is manual
+(requires supervisor reset key; no automatic hysteresis).
+
+PostureState in `parko-core` mirrors this three-variant structure for use in
+governor and control-loop logic.
+
+This state machine governs behavioral safety (IEEE 2846 RSS integration,
+PARK-013–PARK-019) and all other fault sources. IEEE 2846 is planned but not
+yet implemented; the hysteresis constants are already in production for other
+fault types (attestation, telemetry watchdog).
+
+The safety case mappings for IEC 61508 SIL 3 and ASTM F3269 (PARK-032,
+PARK-033) will trace to this state machine when written.
 
 ### Why
 
-Symmetric transitions (same threshold for fault and recovery) lead to
-"posture flapping" under noisy sensor streams — the system oscillates between
-Nominal and Degraded rather than committing to either. Asymmetric hysteresis
-ensures the system stays degraded long enough for an operator to diagnose the
-cause. The distinction between Degraded (recoverable) and LockedOut
-(manual-only) mirrors ASIL-D fail-safe architecture requirements.
+Symmetric transitions (same threshold for fault and recovery) cause posture
+flapping under noisy sensor streams — the system oscillates between Nominal and
+Degraded rather than committing to either. Asymmetric hysteresis keeps the
+system degraded long enough for an operator to diagnose the root cause. The
+Nominal/Degraded/LockedOut distinction maps to ISO 26262 ASIL-D fail-safe
+decomposition: Degraded is reduced-capability operation; LockedOut is
+fail-closed with no automatic recovery.
 
 ### Alternatives Considered
 
-1. **Two-state machine (Safe / Unsafe)**: Simpler but loses the distinction
-   between "degraded but operable at reduced capability" and "fully locked out."
-   Required for ISO 26262 ASIL decomposition. Rejected.
-2. **Continuous health score**: More expressive but non-binary posture makes
-   command routing policy complex; a score of 0.49 vs 0.51 has unclear
-   semantics at the actuator gate. Rejected.
-3. **Symmetric hysteresis (5 clean to recover, 5 bad to degrade)**: Too slow
-   to detect faults in real-time. Rejected.
+1. **Two-state machine (Safe / Unsafe)**: Loses the distinction between
+   "degraded but operable at reduced capability" and "fully locked out."
+   ISO 26262 ASIL decomposition requires this separation. Rejected.
+2. **Continuous health score**: Expressive but non-binary posture makes command
+   routing policy ambiguous (a score of 0.49 vs 0.51 has no clear semantics at
+   the actuator gate). Rejected.
+3. **Symmetric hysteresis**: Too slow to detect faults in real-time; a 5-bad
+   streak before Degraded would allow 5 unsafe ticks to pass. Rejected.
 
 ### Consequences
 
-- `should_route_command` is the single authoritative gate for all commands;
-  posture state must be read from the cache, not recomputed inline.
-- Any path that transitions to LockedOut must emit a `LockoutReason` entry
-  to the audit chain before changing state.
-- Recovery streak resets on any new fault during the hysteresis window, not
-  just at window expiry. This is the stricter interpretation; it must be
-  preserved in all future changes to `recovery_hysteresis.rs`.
+- `should_route_command` is the single authoritative gate; posture must be read
+  from the cache, never recomputed inline in a handler.
+- Any path that transitions to LockedOut must emit a `LockoutReason` audit chain
+  entry before changing state.
+- Recovery streak resets on any new fault during the hysteresis window — this is
+  the stricter interpretation and must be preserved in all future changes to
+  `recovery_hysteresis.rs`.
+- When IEEE 2846 integration is implemented (PARK-015), RssViolation events
+  must reset the streak to 0 on every violation tick.
