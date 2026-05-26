@@ -103,7 +103,7 @@ async fn nominal_posture_clamps_to_nominal_profile_max_speed() {
     let (mut control, _rx) = make_loop();
     control.set_state_for_test(RuntimeState::Nominal);
 
-    let snapshot = control.tick().await.expect("tick should succeed");
+    let snapshot = control.tick().await.expect("tick should succeed").expect("tick should fire");
 
     assert_eq!(
         snapshot.active_command.linear_velocity, 35.0,
@@ -116,7 +116,7 @@ async fn degraded_posture_clamps_to_mrc_fallback_profile_max_speed() {
     let (mut control, _rx) = make_loop();
     control.set_state_for_test(RuntimeState::Degraded);
 
-    let snapshot = control.tick().await.expect("tick should succeed");
+    let snapshot = control.tick().await.expect("tick should succeed").expect("tick should fire");
 
     assert_eq!(
         snapshot.active_command.linear_velocity, 5.0,
@@ -128,11 +128,11 @@ async fn degraded_posture_clamps_to_mrc_fallback_profile_max_speed() {
 async fn degraded_clamp_is_more_restrictive_than_nominal_clamp() {
     let (mut control_nominal, _rx_n) = make_loop();
     control_nominal.set_state_for_test(RuntimeState::Nominal);
-    let snap_nominal = control_nominal.tick().await.unwrap();
+    let snap_nominal = control_nominal.tick().await.unwrap().unwrap();
 
     let (mut control_degraded, _rx_d) = make_loop();
     control_degraded.set_state_for_test(RuntimeState::Degraded);
-    let snap_degraded = control_degraded.tick().await.unwrap();
+    let snap_degraded = control_degraded.tick().await.unwrap().unwrap();
 
     let v_nominal = snap_nominal.active_command.linear_velocity;
     let v_degraded = snap_degraded.active_command.linear_velocity;
@@ -160,7 +160,7 @@ async fn set_state_for_test_forces_degraded_behavior() {
         "set_state_for_test must override the initial Warmup state"
     );
 
-    let snapshot = control.tick().await.expect("tick should succeed");
+    let snapshot = control.tick().await.expect("tick should succeed").expect("tick should fire");
 
     assert!(
         snapshot.active_command.linear_velocity < 35.0,
