@@ -1,5 +1,7 @@
 # Kirra Runtime SDK
 
+![Version](https://img.shields.io/badge/version-v1.1.1-blue)
+
 A distributed runtime legitimacy engine and safety governor for AI-driven robotic and edge systems. Kirra enforces **fail-closed trust semantics** across a heterogeneous fleet — preventing unsafe or unauthorized commands from reaching actuators regardless of what an AI model, LLM output, or upstream orchestration layer instructs.
 
 ---
@@ -197,7 +199,7 @@ The service listens on `0.0.0.0:8090` by default.
 ### Install (Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/justinlooney/kirra/master/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/justinlooney/kirra-runtime-sdk/main/install.sh | sudo bash
 ```
 
 See [INSTALL.md](INSTALL.md) for full installation documentation including non-interactive mode, HA setup, and upgrade/uninstall instructions.
@@ -303,7 +305,7 @@ KIRRA_VERIFIER_MODE=passive_standby KIRRA_INSTANCE_ID=kirra-standby ./kirra_veri
 ## Dependencies
 
 | Crate | Version | Purpose |
-|-------|---------|---------|
+|-------|---------|----------|
 | `axum` | 0.8 | HTTP framework |
 | `tokio` | 1 | Async runtime |
 | `tower` | 0.5 | Middleware (`KirraPolicyLayer`) |
@@ -316,6 +318,25 @@ KIRRA_VERIFIER_MODE=passive_standby KIRRA_INSTANCE_ID=kirra-standby ./kirra_veri
 | `reqwest` | 0.12 | CARLA client HTTP |
 | `tracing` | 0.1 | Structured logging |
 | `proptest` | 1 | Kinematics property-based tests |
+
+---
+
+## Releases
+
+### v1.1.1
+- Complete Aegis → Kirra rename across all source files, binaries, systemd units, ROS2 packages, Docker images, Helm charts, and documentation
+- 13 bug fixes including post-rename import cleanup, binary path corrections, and CI pipeline fixes
+
+### v1.1.0
+- Multi-Asset Safety Fabric
+- ASIL-D and SOTIF safety case foundation documents
+- Ed25519 log signing with export and key rotation
+- Action Filter with LLM integration guide
+- EtherNet/IP, CANOpen, DNP3 protocol adapters
+- ROS2 safety interlock package
+- Docker multi-platform images and Helm chart
+- CARLA integration client
+- 333 tests passing, 0 failures
 
 ---
 
