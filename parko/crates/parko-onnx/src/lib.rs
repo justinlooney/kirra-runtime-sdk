@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ort::{
-    session::Session,
+    session::{builder::GraphOptimizationLevel, Session},
     value::{Tensor, ValueType},
 };
 
@@ -21,6 +21,10 @@ impl OrtBackend {
     pub fn new(model_path: &str) -> Result<Self, BackendError> {
         let session = Session::builder()
             .map_err(|e| BackendError::InitializationError(format!("ort builder error: {:?}", e)))?
+            .with_intra_threads(1)
+            .map_err(|e| BackendError::InitializationError(format!("ort intra_threads error: {:?}", e)))?
+            .with_optimization_level(GraphOptimizationLevel::Disable)
+            .map_err(|e| BackendError::InitializationError(format!("ort opt_level error: {:?}", e)))?
             .commit_from_file(model_path)
             .map_err(|e| BackendError::InitializationError(format!("ort session init error: {:?}", e)))?;
 

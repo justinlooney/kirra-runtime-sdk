@@ -1,0 +1,6 @@
+# ORT dynamic library path for parko-onnx tests.
+# The load-dynamic feature requires the ORT shared library to be findable
+# at runtime. This config points to the installed location so that
+# `cargo test -p parko-onnx` works without manual env var exports.
+[env]
+ORT_DYLIB_PATH = "/root/.local/onnxruntime/lib/libonnxruntime.so"

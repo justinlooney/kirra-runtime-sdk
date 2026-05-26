@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use parko_core::backend::{InferenceBackend, TensorBatch, TensorStorage};
+use parko_core::backend::{BackendDescriptor, InferenceBackend, TensorBatch, TensorStorage};
 use parko_onnx::OrtBackend;
 
 #[test]
@@ -60,4 +60,11 @@ fn mnist_end_to_end_inference() {
     }
 
     println!("MNIST inference successful. Output: {:?}", scores);
+}
+
+#[test]
+fn test_ort_backend_descriptor_is_cpu() {
+    let model_path = "tests/data/mnist-12.onnx";
+    let backend = OrtBackend::new(model_path).expect("failed to construct OrtBackend");
+    assert_eq!(backend.descriptor(), BackendDescriptor::Cpu);
 }
