@@ -144,6 +144,22 @@ Both tests complete in < 1s (previously: hung > 60s)
 
 ---
 
+## PARK-015 — Wire RssState into posture engine
+
+**Completed:** 2026-05-27 | **Commit:** `31b8979` | **Branch:** `claude/claude-md-reference-AtTWy`
+
+- `parko-core` added to root Cargo.toml; `RssState` derives `Debug + Clone`.
+- `AppState`: `rss_active_violation: Arc<AtomicBool>` + `rss_recovery_streak: Arc<Mutex<RssRecoveryStreak>>`.
+- `PostureRecalcTrigger::RssViolation(RssState)` added; `Display` updated.
+- `apply_rss_state()`: violation activates flag and resets streak; safe ticks advance streak; recovery confirmed at `AV_RECOVERY_STREAK_THRESHOLD` (5) within `AV_RECOVERY_WINDOW_MS` (10 s).
+- Posture engine worker processes `RssViolation` before calling `recalculate_and_broadcast`.
+- `recalculate_and_broadcast`: active violation escalates `Nominal` → `Degraded`; `LockedOut` from DAG is never downgraded.
+- `ScenarioEvent::RssReport(RssState)` added to `ScenarioRunner`.
+- `tests/rss_posture_tests.rs`: `test_rss_violation_degrades_nominal_posture`, `test_rss_recovery_requires_full_streak`.
+- 319 unit + 16 integration tests pass (335 total). No unsafe code.
+
+---
+
 ## PARK-005 — RuntimeClock / MockClock abstraction in ControlLoop
 Completed: 2026-05-26
 Commit: a50363d
