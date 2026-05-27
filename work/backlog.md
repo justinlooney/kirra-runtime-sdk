@@ -1292,3 +1292,741 @@ ASTM F3269 has been identified as a target standard but no mapping exists. Defin
 the Nominal, Degraded, and BLLOS (Beyond Line of Sight) operational envelopes per
 §6; trace each to the posture engine states and KirraGovernor limits in the codebase.
 Do not claim any ASTM F3269 compliance until this mapping is complete and reviewed.
+
+---
+
+## Certification Readiness Track
+
+These tasks are required before engaging TÜV SÜD for ISO 26262 ASIL-D
+assessment. All can be completed without hardware. Prioritize in order
+listed.
+
+---
+
+## CERT-001 `safety-case` `docs` `certification`
+
+**MC/DC Code Coverage in CI**
+
+MC/DC (Modified Condition/Decision Coverage) is mandatory at ASIL-D
+per ISO 26262 Part 6. It requires demonstrating that each individual
+condition in a decision independently affects the outcome. TÜV will
+ask for MC/DC coverage reports in the first assessment conversation.
+Currently Kirra has no MC/DC measurement — only statement and branch
+coverage from proptest and unit tests.
+
+#### Claude Code Prompt
+```
+You are working in the kirra-runtime-sdk repository (root at /home/user/aegis).
+
+Task: Set up MC/DC code coverage measurement using llvm-cov and add it to CI.
+
+STEP 0: Verify the Rust toolchain supports MC/DC:
+  rustup show
+  rustc --version
+  llvm-profdata --version 2>/dev/null || echo "llvm-profdata not found"
+
+STEP 1: Add a coverage script at scripts/coverage-mcdc.sh:
+
+  #!/bin/bash
+  set -e
+  echo "Running MC/DC coverage measurement..."
+
+  # Clean previous coverage data
+  find . -name "*.profraw" -delete
+  find . -name "*.profdata" -delete
+
+  # Build and run tests with coverage instrumentation
+  RUSTFLAGS="-C instrument-coverage" \
+  LLVM_PROFILE_FILE="kirra-%p-%m.profraw" \
+    cargo test --workspace 2>&1
+
+  # Merge profile data
+  llvm-profdata merge -sparse *.profraw -o coverage.profdata
+
+  # Generate MC/DC report
+  llvm-cov report \
+    --use-color \
+    --ignore-filename-regex='/.cargo/registry' \
+    --ignore-filename-regex='/rustup/toolchains' \
+    --instr-profile=coverage.profdata \
+    $(cargo test --workspace --no-run --message-format=json 2>/dev/null \
+      | jq -r 'select(.profile.test == true) | .filenames[]' \
+      | grep -v dSYM \
+      | sed 's/^/--object /') \
+    2>/dev/null
+
+  # Generate HTML report
+  llvm-cov show \
+    --use-color \
+    --ignore-filename-regex='/.cargo/registry' \
+    --ignore-filename-regex='/rustup/toolchains' \
+    --instr-profile=coverage.profdata \
+    --format=html \
+    --output-dir=coverage-report \
+    $(cargo test --workspace --no-run --message-format=json 2>/dev/null \
+      | jq -r 'select(.profile.test == true) | .filenames[]' \
+      | grep -v dSYM \
+      | sed 's/^/--object /') \
+    2>/dev/null
+
+  echo "Coverage report generated at coverage-report/index.html"
+
+Make the script executable:
+  chmod +x scripts/coverage-mcdc.sh
+
+STEP 2: Run the script and capture output:
+  ./scripts/coverage-mcdc.sh 2>&1 | head -60
+
+STEP 3: Add coverage to .github/workflows/ci.yml (or create it if absent):
+
+  coverage:
+    name: MC/DC Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Install llvm-cov
+        run: cargo install cargo-llvm-cov
+      - name: Run MC/DC coverage
+        run: |
+          cargo llvm-cov --workspace --mcdc \
+            --ignore-filename-regex='/.cargo/registry' \
+            --lcov --output-path lcov.info
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+
+STEP 4: Add coverage-report/ to .gitignore if not already present.
+
+STEP 5: Run cargo test to confirm baseline still passes:
+  cargo test --workspace 2>&1 | tail -5
+
+STEP 6: Document the baseline MC/DC coverage percentage in
+/work/decisions.md under a new entry:
+
+  ### ADL-009 — MC/DC Coverage Baseline
+  Date: [today]
+  Status: Established
+  Baseline MC/DC coverage: [percentage from report]
+  Target for ASIL-D assessment: ≥ 90% MC/DC on safety-critical paths
+  Safety-critical paths: posture engine, KirraGovernor enforce/evaluate,
+  audit chain, RSS safe-distance calculations, NaN/Inf guard.
+
+Commit message:
+  feat(ci): add MC/DC code coverage measurement — ISO 26262 ASIL-D prerequisite
+
+Do NOT modify any Rust source files.
+Do NOT change any test logic.
+Only add the script, CI config, .gitignore entry, and decisions.md entry.
+```
+
+---
+
+## CERT-002 `safety-case` `certification`
+
+**Static Analysis in CI (cargo clippy + cargo audit)**
+
+ISO 26262 Part 6 requires documented static analysis as part of the
+software safety lifecycle. TÜV expects to see static analysis running
+automatically on every change, with results documented. Currently
+Kirra runs clippy manually; it is not enforced in CI with automotive-
+grade lint rules, and cargo audit (dependency vulnerability scan) is
+not running at all.
+
+#### Claude Code Prompt
+```
+You are working in the kirra-runtime-sdk repository (root at /home/user/aegis).
+
+Task: Add automotive-grade static analysis to CI and document results.
+
+STEP 0: Run baseline static analysis and capture results:
+  cargo clippy --workspace -- -D warnings 2>&1 | tee /tmp/clippy_baseline.txt
+  cargo audit 2>&1 | tee /tmp/audit_baseline.txt
+  echo "Clippy issues: $(grep "^error" /tmp/clippy_baseline.txt | wc -l)"
+  echo "Audit advisories: $(grep "^error" /tmp/audit_baseline.txt | wc -l)"
+
+Report what you find before changing anything.
+
+STEP 1: Add static analysis job to .github/workflows/ci.yml:
+
+  static-analysis:
+    name: Static Analysis (ISO 26262)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: Clippy (automotive-grade)
+        run: |
+          cargo clippy --workspace -- \
+            -D warnings \
+            -W clippy::all \
+            -W clippy::pedantic \
+            -W clippy::nursery \
+            -A clippy::module_name_repetitions \
+            -A clippy::must_use_candidate \
+            2>&1 | tee clippy-report.txt
+      - name: Dependency audit
+        run: cargo audit 2>&1 | tee audit-report.txt
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: static-analysis-reports
+          path: |
+            clippy-report.txt
+            audit-report.txt
+
+STEP 2: If clippy baseline from STEP 0 has errors, fix them before
+adding the CI job. Document each fix with a comment explaining why
+the change was made for safety reasons.
+
+STEP 3: Add a scripts/static-analysis.sh for running analysis locally:
+
+  #!/bin/bash
+  set -e
+  echo "=== Clippy (automotive-grade) ==="
+  cargo clippy --workspace -- -D warnings -W clippy::all -W clippy::pedantic
+  echo "=== Dependency audit ==="
+  cargo audit
+  echo "Static analysis passed."
+
+STEP 4: Document in /work/decisions.md:
+
+  ### ADL-010 — Static Analysis Standard
+  Date: [today]
+  Status: Active
+  Tool: cargo clippy + cargo audit
+  Lint level: -D warnings -W clippy::all -W clippy::pedantic
+  Frequency: Every PR via CI
+  Baseline: [number of existing warnings fixed in this task]
+  Rationale: ISO 26262 Part 6 §8 requires documented static analysis
+  for ASIL-D software. Rust's compiler + clippy collectively address
+  most MISRA C rule categories. cargo audit prevents known-vulnerable
+  dependencies from entering the codebase.
+
+Commit message:
+  feat(ci): add automotive-grade static analysis — ISO 26262 Part 6 prerequisite
+
+Do NOT modify any safety-critical logic.
+Fix only lint warnings that are style/correctness issues.
+If any clippy suggestion changes safety logic behavior, skip it and
+add a #[allow(clippy::...)] with a comment explaining why.
+```
+
+---
+
+## CERT-003 `safety-case` `docs` `certification`
+
+**Complete Requirements Traceability Matrix**
+
+ISO 26262 requires every safety requirement to trace to a specific
+test that verifies it. The current RTM in docs/safety/ is incomplete —
+not every safety goal has a corresponding named test. TÜV will verify
+this traceability in the first document review.
+
+#### Claude Code Prompt
+```
+You are working in the kirra-runtime-sdk repository (root at /home/user/aegis).
+
+Task: Audit the Requirements Traceability Matrix and identify gaps.
+
+STEP 0: Read the current safety goals and RTM:
+  cat docs/safety/SAFETY_GOALS.md
+  cat docs/safety/REQUIREMENTS_TRACEABILITY.md
+
+STEP 1: Find all safety goal IDs referenced in the codebase:
+  grep -rn "KIRRA-SG-\|KIRRA-SR-\|KIRRA-HARA-" \
+    src/ tests/ parko/ --include="*.rs" | sort
+
+STEP 2: Find all safety goal IDs in the safety documents:
+  grep -rn "KIRRA-SG-\|KIRRA-SR-" \
+    docs/safety/ --include="*.md" | sort
+
+STEP 3: Compare the two lists. Identify:
+  a. Safety goals that have NO corresponding test reference
+  b. Tests that reference safety goals not in the RTM
+  c. Safety goals with only one test (single point of failure in verification)
+
+STEP 4: For each gap found in STEP 3a, add a placeholder test stub
+in the appropriate test file with a TODO comment:
+
+  #[test]
+  #[ignore = "TODO(CERT-003): implement test for KIRRA-SG-XXX"]
+  fn test_safety_goal_kirra_sg_xxx() {
+      // Safety Goal: KIRRA-SG-XXX — [description from safety goals doc]
+      // Requirement: [requirement from RTM]
+      // This test must verify: [what needs to be tested]
+      // Currently unimplemented — tracked in CERT-003
+      todo!("implement KIRRA-SG-XXX verification")
+  }
+
+STEP 5: Update docs/safety/REQUIREMENTS_TRACEABILITY.md to add a
+"Test Coverage" column showing which test(s) verify each requirement.
+
+STEP 6: Generate a gap report at docs/safety/RTM_GAP_REPORT.md:
+  # RTM Gap Report
+  Generated: [date]
+  Total safety goals: N
+  Goals with test coverage: N
+  Goals without test coverage: N (list them)
+  Coverage percentage: N%
+
+STEP 7: Document in /work/decisions.md:
+  ### ADL-011 — RTM Coverage Baseline
+  [baseline coverage percentage and gap count]
+
+Commit message:
+  docs(safety): audit RTM coverage, add test stubs for gaps — CERT-003
+
+Do NOT implement the test logic — only add #[ignore] stubs with TODO.
+Do NOT modify safety goal definitions.
+```
+
+---
+
+## CERT-004 `safety-case` `simulation` `certification`
+
+**Fault Injection Test Suite**
+
+ISO 26262 ASIL-D requires demonstrating that the system enters a safe
+state under fault conditions. Currently Kirra has adversarial input
+testing (proptest) but no structured fault injection — deliberately
+triggering specific failure modes and verifying the documented safe
+state response. TÜV will ask for fault injection evidence.
+
+#### Claude Code Prompt
+```
+You are working in the kirra-runtime-sdk repository (root at /home/user/aegis).
+
+Task: Create a fault injection test suite that verifies safe-state
+responses for each documented failure mode.
+
+AUTHORITY MODEL (canonical):
+  LockedOut → hard stop (0.0) — requires human intervention
+  Degraded  → MRC cap (MRC_VELOCITY_CEILING_MPS)
+  Governor unreachable → Degraded semantics + governor_unreachable log
+
+STEP 0: Read the existing safe state documentation:
+  cat docs/safety/SAFETY_GOALS.md | grep -A3 "safe state\|SafeState\|fail"
+  grep -rn "governor_unreachable\|SafeState\|LockedOut\|Degraded" \
+    src/ --include="*.rs" | head -20
+
+STEP 1: Create tests/fault_injection.rs with the following structure.
+For each fault, verify the system enters the correct safe state.
+
+  // CERT-004: Fault Injection Test Suite
+  // Verifies safe-state responses per ISO 26262 ASIL-D requirements
+  // Each test maps to a documented failure mode in SAFETY_GOALS.md
+
+  // FAULT 1: NaN/Inf at model output boundary
+  // Expected: tick() returns safe floor (Halt or 0.0), does not panic
+  #[tokio::test]
+  async fn fault_nan_inf_at_model_output_boundary() { ... }
+
+  // FAULT 2: Governor unreachable (timeout)
+  // Expected: posture drops to Degraded, MRC cap applied, event logged
+  #[tokio::test]
+  async fn fault_governor_unreachable() { ... }
+
+  // FAULT 3: Sensor telemetry timeout
+  // Expected: posture transitions to Degraded after watchdog fires
+  #[tokio::test]
+  async fn fault_sensor_telemetry_timeout() { ... }
+
+  // FAULT 4: DAG cycle detected (dependency graph corruption)
+  // Expected: LockedOut posture, hard stop
+  #[tokio::test]
+  async fn fault_dag_cycle_detected() { ... }
+
+  // FAULT 5: RSS violation (gap < safe distance)
+  // Expected: Degraded posture, MRC cap applied
+  #[tokio::test]
+  async fn fault_rss_violation() { ... }
+
+  // FAULT 6: Multiple simultaneous faults
+  // Expected: most severe posture wins (LockedOut > Degraded > Nominal)
+  #[tokio::test]
+  async fn fault_multiple_simultaneous() { ... }
+
+  // FAULT 7: Admin token absent on mutation route
+  // Expected: 503 returned, no state change
+  #[tokio::test]
+  async fn fault_admin_token_absent() { ... }
+
+  // FAULT 8: Recovery from Degraded (streak threshold met)
+  // Expected: posture returns to Nominal after N consecutive clean ticks
+  #[tokio::test]
+  async fn fault_recovery_from_degraded() { ... }
+
+For each test:
+- Read the actual safety goal ID from SAFETY_GOALS.md and use it
+- Follow the existing test patterns in tests/rss_posture_tests.rs
+- Use ScenarioRunner for posture tests
+- Use actual tokio::test for async tests
+- Assert the specific safe state, not just "no panic"
+
+STEP 2: Run the test suite:
+  cargo test --test fault_injection 2>&1
+
+STEP 3: Add fault injection to CI in .github/workflows/ci.yml:
+  - name: Fault injection tests
+    run: cargo test --test fault_injection
+
+STEP 4: Document in /work/decisions.md:
+  ### ADL-012 — Fault Injection Coverage
+  [list of fault modes tested and their safe state responses]
+
+Commit message:
+  test(safety): add fault injection suite — ISO 26262 ASIL-D safe state verification
+
+Do NOT add #[ignore] to fault injection tests.
+All fault injection tests must pass before committing.
+If a test reveals an actual safety bug, stop and report before proceeding.
+```
+
+---
+
+## CERT-005 `safety-case` `docs` `certification`
+
+**Rust Safety Coding Standard (MISRA-equivalent)**
+
+ISO 26262 Part 6 requires documented coding guidelines enforced
+throughout the safety-critical codebase. MISRA C/C++ is the standard
+for C/C++. For Rust, an equivalent must be defined and documented.
+TÜV will ask for the coding standard and evidence of its enforcement.
+
+#### Claude Code Prompt
+```
+You are working in the kirra-runtime-sdk repository (root at /home/user/aegis).
+
+Task: Create a Rust Safety Coding Standard document for Kirra and
+audit the codebase for compliance.
+
+STEP 0: Read the existing coding guidelines if present:
+  cat docs/safety/CODING_GUIDELINES.md 2>/dev/null || echo "Not found"
+
+STEP 1: Create docs/safety/RUST_SAFETY_CODING_STANDARD.md with the
+following content. This is the authoritative coding standard for all
+safety-critical Rust code in the Kirra codebase.
+
+  # Kirra Rust Safety Coding Standard
+  Version: 1.0
+  Applicable to: All code in src/, parko/parko-core/src/,
+                 parko/parko-kirra/src/
+  Standard: Kirra-RSS-001 (Rust Safety Standard)
+  Rationale: ISO 26262 Part 6 requires documented coding guidelines
+             for ASIL-D software. This standard is the Rust equivalent
+             of MISRA C, adapted for Rust's ownership model.
+
+  ## RSR-001: No unsafe in safety-critical paths
+  Rationale: unsafe bypasses Rust's memory safety guarantees.
+  Rule: unsafe blocks are forbidden in src/posture_engine*.rs,
+        src/verifier.rs, src/audit_chain.rs, parko/parko-kirra/src/,
+        parko/parko-core/src/control_loop.rs, parko/parko-core/src/rss.rs
+  Verification: grep -rn "unsafe" <path> must return zero results.
+
+  ## RSR-002: No unwrap() in safety-critical paths
+  Rationale: unwrap() panics on None/Err, violating fail-closed semantics.
+  Rule: unwrap() forbidden in safety-critical paths listed above.
+        Use ?, match, or unwrap_or_else with a safe default.
+  Verification: grep -rn "\.unwrap()" <path> must return zero results
+                in safety-critical files.
+
+  ## RSR-003: No unbounded recursion
+  Rationale: Unbounded recursion causes stack overflow, undefined behavior.
+  Rule: All recursive functions must have a documented depth bound
+        enforced by a counter parameter or const limit.
+        (Kirra's DAG traversal uses MAX_DEPENDENCY_DEPTH = 10)
+  Verification: Code review + static analysis.
+
+  ## RSR-004: All error paths explicitly handled
+  Rationale: Silently ignored errors violate ASIL-D fault detection.
+  Rule: Result and Option types must be explicitly handled.
+        let _ = ... is forbidden for safety-critical return values.
+  Verification: cargo clippy -W clippy::must_use_candidate
+
+  ## RSR-005: No dynamic allocation in hot safety path
+  Rationale: Heap allocation can fail or introduce non-deterministic latency.
+  Rule: The evaluate()/tick() hot path must not allocate.
+        Pre-allocate buffers at initialization.
+  Verification: Profiling + code review.
+
+  ## RSR-006: Constants for all safety thresholds
+  Rationale: Magic numbers in safety logic are a maintenance hazard.
+  Rule: All safety thresholds must be named constants with doc comments.
+        (e.g. MRC_VELOCITY_CEILING_MPS, MAX_DEPENDENCY_DEPTH,
+        CHALLENGE_TTL_MS, AV_RECOVERY_STREAK_THRESHOLD)
+  Verification: grep -rn "[0-9]\+\.[0-9]" src/ for bare float literals
+                in safety logic.
+
+  ## RSR-007: Deterministic behavior under all inputs
+  Rationale: Non-determinism in safety logic is unacceptable at ASIL-D.
+  Rule: Safety-critical functions must produce identical output for
+        identical input. No randomness, no time-dependent behavior
+        in enforce()/evaluate()/tick() hot paths.
+  Verification: Proptest property-based tests (PARK-003, PARK-017).
+
+STEP 2: Audit the codebase for RSR-001 through RSR-006 compliance:
+  echo "=== RSR-001: unsafe in safety paths ==="
+  grep -rn "unsafe" src/posture_engine*.rs src/verifier.rs \
+    src/audit_chain.rs parko/parko-kirra/src/ \
+    parko/parko-core/src/control_loop.rs \
+    parko/parko-core/src/rss.rs 2>/dev/null
+
+  echo "=== RSR-002: unwrap() in safety paths ==="
+  grep -rn "\.unwrap()" src/posture_engine*.rs src/verifier.rs \
+    parko/parko-kirra/src/ parko/parko-core/src/control_loop.rs \
+    parko/parko-core/src/rss.rs 2>/dev/null
+
+  echo "=== RSR-006: bare float literals in safety logic ==="
+  grep -rn "[0-9]\+\.[0-9]" src/posture_engine*.rs \
+    parko/parko-kirra/src/ parko/parko-core/src/rss.rs 2>/dev/null
+
+Report all findings before making any changes.
+
+STEP 3: For any RSR-002 violations (unwrap() in safety paths), replace
+with explicit error handling. Document each change in a commit message.
+
+STEP 4: Document audit results in /work/decisions.md:
+
+  ### ADL-013 — Rust Safety Coding Standard Compliance Baseline
+  Date: [today]
+  Standard: RUST_SAFETY_CODING_STANDARD.md v1.0
+  RSR-001 (no unsafe): PASS / N violations found
+  RSR-002 (no unwrap): PASS / N violations fixed
+  RSR-003 (no unbounded recursion): PASS (MAX_DEPENDENCY_DEPTH enforced)
+  RSR-004 (error handling): [result]
+  RSR-005 (no hot-path alloc): PASS (pre-allocated in constructors)
+  RSR-006 (named constants): PASS / N bare literals found
+  RSR-007 (deterministic): PASS (verified by proptests PARK-003, PARK-017)
+
+STEP 5: Verify cargo test still passes after any fixes:
+  cargo test --workspace 2>&1 | tail -5
+
+Commit message:
+  docs(safety): add Rust Safety Coding Standard, audit compliance — CERT-005
+
+Do NOT change safety logic behavior when fixing RSR-002 violations.
+If an unwrap() in a safety path cannot be safely replaced without
+changing behavior, add a comment explaining why it is safe and file
+a follow-up issue.
+```
+
+---
+
+## CERT-006 `kirra-governor` `safety-case` `certification`
+
+**Primary + Shadow Governor Comparator**
+
+NVIDIA DRIVE AGX uses hardware lockstep — two cores run the same
+computation and outputs are compared. Kirra implements the software
+equivalent: two independent KirraGovernor instances receive the same
+inputs, their outputs are compared, and divergence triggers LockedOut.
+This is the architectural answer to hardware redundancy for the safety
+governance layer and is required for the ASIL-D decomposition argument.
+
+#### Claude Code Prompt
+```
+You are working in the parko-kirra crate.
+
+PREREQUISITE: PARK-016 (RSS gate in KirraGovernor) must be complete.
+Verify: grep -n "update_rss_state\|MRC_VELOCITY_CEILING_MPS" \
+  parko/parko-kirra/src/lib.rs
+
+AUTHORITY MODEL (canonical, commits 9943aa9/e1ba1a2/21c3a35):
+  LockedOut  → 0.0 (hard stop)
+  Degraded   → min(proposed, MRC_VELOCITY_CEILING_MPS)
+  Divergence between primary and shadow → LockedOut
+
+Task: Implement GovernorComparator — software lockstep for KirraGovernor.
+
+STEP 0: Read the current KirraGovernor evaluate() signature:
+  grep -n "fn evaluate\|pub fn\|ControlCommand\|EnforcementAction" \
+    parko/parko-kirra/src/lib.rs | head -20
+
+STEP 1: Create parko/parko-kirra/src/comparator.rs:
+
+  use crate::{KirraGovernor, MRC_VELOCITY_CEILING_MPS};
+  use parko_core::PostureState;
+
+  /// Tolerance for floating-point comparison between primary and shadow.
+  /// Set to 1e-9 — effectively exact equality for f64 safety computations.
+  const COMPARATOR_TOLERANCE: f64 = 1e-9;
+
+  /// Software lockstep safety comparator.
+  ///
+  /// Runs two independent KirraGovernor instances with identical inputs.
+  /// If their outputs diverge beyond COMPARATOR_TOLERANCE, returns
+  /// EnforcementAction::Halt (LockedOut semantics).
+  ///
+  /// This is the software equivalent of hardware lockstep dual-core
+  /// execution used in NVIDIA DRIVE AGX and NXP S32 safety MCUs.
+  /// Per CERT-006 — ISO 26262 ASIL-D decomposition argument.
+  pub struct GovernorComparator {
+      primary: KirraGovernor,
+      shadow: KirraGovernor,
+  }
+
+  impl GovernorComparator {
+      pub fn new(primary: KirraGovernor, shadow: KirraGovernor) -> Self {
+          Self { primary, shadow }
+      }
+
+      /// Evaluate a command through both governors.
+      /// Returns the primary output if both agree within tolerance.
+      /// Returns Halt (LockedOut) if outputs diverge.
+      pub fn evaluate(
+          &self,
+          cmd: &<ControlCommand type from STEP 0>,
+          posture: PostureState,
+      ) -> <EnforcementAction type from STEP 0> {
+          let primary_out = self.primary.evaluate(cmd, posture);
+          let shadow_out  = self.shadow.evaluate(cmd, posture);
+
+          let primary_vel = <extract velocity from primary_out>;
+          let shadow_vel  = <extract velocity from shadow_out>;
+
+          if (primary_vel - shadow_vel).abs() > COMPARATOR_TOLERANCE {
+              tracing::error!(
+                  primary = primary_vel,
+                  shadow = shadow_vel,
+                  delta = (primary_vel - shadow_vel).abs(),
+                  "GovernorComparator: primary/shadow divergence — LockedOut"
+              );
+              <EnforcementAction::Halt or zero equivalent>
+          } else {
+              primary_out
+          }
+      }
+
+      /// Update RSS state on both governors.
+      pub fn update_rss_state(&mut self, state: parko_core::rss::RssState) {
+          self.primary.update_rss_state(state.clone());
+          self.shadow.update_rss_state(state);
+      }
+  }
+
+STEP 2: Export from parko-kirra/src/lib.rs:
+  pub mod comparator;
+  pub use comparator::GovernorComparator;
+
+STEP 3: Write tests in comparator.rs:
+  Test A: Identical inputs → primary returned
+  Test B: Injected divergence → Halt returned
+  Test C: update_rss_state propagates to both governors
+  Test D: LockedOut posture → both return 0.0 → no divergence
+
+STEP 4: Run tests:
+  cargo test -p parko-kirra 2>&1 | tail -10
+
+Commit message:
+  feat(parko-kirra): add GovernorComparator software lockstep — CERT-006
+
+No unsafe code.
+```
+
+---
+
+## CERT-007 `safety-case` `docs` `certification`
+
+**Safe State Definition Document**
+
+ISO 26262 requires an explicit safe state definition — the state the
+system enters when a fault is detected. Kirra has this behavior
+implicitly (LockedOut → hard stop, Degraded → MRC cap) but it is not
+documented as a standalone safe state specification. TÜV requires
+this document before the first assessment conversation.
+
+#### Claude Code Prompt
+```
+You are working in the kirra-runtime-sdk repository (root at /home/user/aegis).
+
+Task: Create the Safe State Specification document.
+This is documentation only. Do NOT modify any source files.
+
+Create docs/safety/SAFE_STATE_SPECIFICATION.md:
+
+  # Kirra Safe State Specification
+  Document ID: KIRRA-SSS-001
+  Version: 1.0
+  Status: Active
+  Standard: ISO 26262 ASIL-D
+
+  ## Overview
+  A safe state is a system state in which no unreasonable risk exists.
+  When Kirra detects a fault condition, it transitions to the appropriate
+  safe state based on fault severity. This document specifies each safe
+  state, its trigger conditions, its behavior, and its recovery path.
+
+  ## Safe States
+
+  ### SS-001: Normal Operation (PostureState::Nominal)
+  Behavior: Full kinematic envelope, 35.0 m/s ceiling, stricter accel
+            rate-limit applied by KirraGovernor nominal profile.
+  Entry: All nodes trusted, no RSS violation, governor reachable.
+  Exit: Any fault trigger below.
+
+  ### SS-002: Minimum Risk Condition (PostureState::Degraded)
+  Behavior: MRC_VELOCITY_CEILING_MPS (5.0 m/s) cap applied by
+            KirraGovernor MRC fallback profile. System continues
+            operating in reduced-capability mode.
+  Entry (any of):
+    - Sensor telemetry timeout (AV_TELEMETRY_TIMEOUT_MS exceeded)
+    - RSS violation (gap < longitudinal_safe_distance)
+    - Governor unreachable (timeout or network partition)
+    - Node trust state Untrusted with non-critical dependency impact
+  Recovery: AV_RECOVERY_STREAK_THRESHOLD (5) consecutive clean ticks
+            within AV_RECOVERY_WINDOW_MS (10,000ms) → Nominal
+  Implements: ISO 26262 safe state for recoverable faults
+
+  ### SS-003: Lockout / Hard Stop (PostureState::LockedOut)
+  Behavior: 0.0 m/s — hard stop. No commands forwarded to actuators.
+            Human intervention required to clear.
+  Entry (any of):
+    - DAG cycle detected in dependency graph
+    - Multiple critical nodes Untrusted (DAG propagation)
+    - GovernorComparator divergence detected (CERT-006)
+    - MAX_DEPENDENCY_DEPTH exceeded in DAG traversal
+  Recovery: Requires explicit human-initiated reset via
+            KIRRA_SUPERVISOR_RESET_KEY endpoint.
+            Automatic recovery from LockedOut is NOT permitted.
+  Implements: ISO 26262 safe state for non-recoverable faults
+
+  ## Fault to Safe State Mapping
+
+  | Fault Mode | Safe State | Recovery |
+  |------------|-----------|---------|
+  | NaN/Inf model output | SS-002 Degraded (safe floor) | Automatic |
+  | Sensor telemetry timeout | SS-002 Degraded | Automatic (streak) |
+  | RSS violation | SS-002 Degraded | Automatic (streak) |
+  | Governor unreachable | SS-002 Degraded | Automatic |
+  | DAG cycle detected | SS-003 LockedOut | Human reset required |
+  | DAG depth exceeded | SS-003 LockedOut | Human reset required |
+  | GovernorComparator divergence | SS-003 LockedOut | Human reset required |
+  | Multiple simultaneous faults | Most severe wins | Per worst fault |
+
+  ## Safe State Transition Invariants
+  1. LockedOut can only be cleared by human reset — never automatic
+  2. Degraded recovery requires N consecutive clean ticks — not immediate
+  3. If governor is unreachable, local MRC floor applies — not pass-through
+  4. NaN/Inf model output → safe floor before governor runs
+  5. DAG LockedOut propagates upward — never downgraded by RSS recovery
+  6. LockedOut dominates Degraded — if both conditions present, LockedOut wins
+
+  ## Implementation References
+  - PostureState enum: src/posture_engine.rs
+  - KirraGovernor authority model: parko/parko-kirra/src/lib.rs
+  - ADL-001: /work/decisions.md
+  - Safety goals: docs/safety/SAFETY_GOALS.md
+
+Commit message:
+  docs(safety): add Safe State Specification — KIRRA-SSS-001 — CERT-007
+```
