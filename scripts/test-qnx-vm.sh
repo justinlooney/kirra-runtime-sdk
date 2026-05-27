@@ -24,9 +24,9 @@ if [ ! -f "$BINARY" ]; then
     exit 1
 fi
 
-echo "QNX binary size: $(ls -lh \"$BINARY\" | awk '{print $5}')"
-echo "QNX binary arch: $(file \"$BINARY\")"
-echo "QNX binary linked: $(qnx-readelf -d \"$BINARY\" | grep NEEDED | head -5)"
+echo "QNX binary size: $(ls -lh "$BINARY" | awk '{print $5}')"
+echo "QNX binary arch: $(file "$BINARY")"
+echo "QNX binary linked: $(qnx-readelf -d "$BINARY" | grep NEEDED | head -5)"
 echo ""
 echo "Binary confirmed: QNX x86_64 target builds successfully"
 echo "Next step: boot in QEMU with QNX image from SDP"
