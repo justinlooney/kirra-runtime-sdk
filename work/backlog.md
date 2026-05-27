@@ -1819,3 +1819,214 @@ If an unwrap() in a safety path cannot be safely replaced without
 changing behavior, add a comment explaining why it is safe and file
 a follow-up issue.
 ```
+
+---
+
+## CERT-006 `kirra-governor` `safety-case` `certification`
+
+**Primary + Shadow Governor Comparator**
+
+NVIDIA DRIVE AGX uses hardware lockstep — two cores run the same
+computation and outputs are compared. Kirra implements the software
+equivalent: two independent KirraGovernor instances receive the same
+inputs, their outputs are compared, and divergence triggers LockedOut.
+This is the architectural answer to hardware redundancy for the safety
+governance layer and is required for the ASIL-D decomposition argument.
+
+#### Claude Code Prompt
+```
+You are working in the parko-kirra crate.
+
+PREREQUISITE: PARK-016 (RSS gate in KirraGovernor) must be complete.
+Verify: grep -n "update_rss_state\|MRC_VELOCITY_CEILING_MPS" \
+  parko/parko-kirra/src/lib.rs
+
+AUTHORITY MODEL (canonical, commits 9943aa9/e1ba1a2/21c3a35):
+  LockedOut  → 0.0 (hard stop)
+  Degraded   → min(proposed, MRC_VELOCITY_CEILING_MPS)
+  Divergence between primary and shadow → LockedOut
+
+Task: Implement GovernorComparator — software lockstep for KirraGovernor.
+
+STEP 0: Read the current KirraGovernor evaluate() signature:
+  grep -n "fn evaluate\|pub fn\|ControlCommand\|EnforcementAction" \
+    parko/parko-kirra/src/lib.rs | head -20
+
+STEP 1: Create parko/parko-kirra/src/comparator.rs:
+
+  use crate::{KirraGovernor, MRC_VELOCITY_CEILING_MPS};
+  use parko_core::PostureState;
+
+  /// Tolerance for floating-point comparison between primary and shadow.
+  /// Set to 1e-9 — effectively exact equality for f64 safety computations.
+  const COMPARATOR_TOLERANCE: f64 = 1e-9;
+
+  /// Software lockstep safety comparator.
+  ///
+  /// Runs two independent KirraGovernor instances with identical inputs.
+  /// If their outputs diverge beyond COMPARATOR_TOLERANCE, returns
+  /// EnforcementAction::Halt (LockedOut semantics).
+  ///
+  /// This is the software equivalent of hardware lockstep dual-core
+  /// execution used in NVIDIA DRIVE AGX and NXP S32 safety MCUs.
+  /// Per CERT-006 — ISO 26262 ASIL-D decomposition argument.
+  pub struct GovernorComparator {
+      primary: KirraGovernor,
+      shadow: KirraGovernor,
+  }
+
+  impl GovernorComparator {
+      pub fn new(primary: KirraGovernor, shadow: KirraGovernor) -> Self {
+          Self { primary, shadow }
+      }
+
+      /// Evaluate a command through both governors.
+      /// Returns the primary output if both agree within tolerance.
+      /// Returns Halt (LockedOut) if outputs diverge.
+      pub fn evaluate(
+          &self,
+          cmd: &<ControlCommand type from STEP 0>,
+          posture: PostureState,
+      ) -> <EnforcementAction type from STEP 0> {
+          let primary_out = self.primary.evaluate(cmd, posture);
+          let shadow_out  = self.shadow.evaluate(cmd, posture);
+
+          let primary_vel = <extract velocity from primary_out>;
+          let shadow_vel  = <extract velocity from shadow_out>;
+
+          if (primary_vel - shadow_vel).abs() > COMPARATOR_TOLERANCE {
+              tracing::error!(
+                  primary = primary_vel,
+                  shadow = shadow_vel,
+                  delta = (primary_vel - shadow_vel).abs(),
+                  "GovernorComparator: primary/shadow divergence — LockedOut"
+              );
+              <EnforcementAction::Halt or zero equivalent>
+          } else {
+              primary_out
+          }
+      }
+
+      /// Update RSS state on both governors.
+      pub fn update_rss_state(&mut self, state: parko_core::rss::RssState) {
+          self.primary.update_rss_state(state.clone());
+          self.shadow.update_rss_state(state);
+      }
+  }
+
+STEP 2: Export from parko-kirra/src/lib.rs:
+  pub mod comparator;
+  pub use comparator::GovernorComparator;
+
+STEP 3: Write tests in comparator.rs:
+  Test A: Identical inputs → primary returned
+  Test B: Injected divergence → Halt returned
+  Test C: update_rss_state propagates to both governors
+  Test D: LockedOut posture → both return 0.0 → no divergence
+
+STEP 4: Run tests:
+  cargo test -p parko-kirra 2>&1 | tail -10
+
+Commit message:
+  feat(parko-kirra): add GovernorComparator software lockstep — CERT-006
+
+No unsafe code.
+```
+
+---
+
+## CERT-007 `safety-case` `docs` `certification`
+
+**Safe State Definition Document**
+
+ISO 26262 requires an explicit safe state definition — the state the
+system enters when a fault is detected. Kirra has this behavior
+implicitly (LockedOut → hard stop, Degraded → MRC cap) but it is not
+documented as a standalone safe state specification. TÜV requires
+this document before the first assessment conversation.
+
+#### Claude Code Prompt
+```
+You are working in the kirra-runtime-sdk repository (root at /home/user/aegis).
+
+Task: Create the Safe State Specification document.
+This is documentation only. Do NOT modify any source files.
+
+Create docs/safety/SAFE_STATE_SPECIFICATION.md:
+
+  # Kirra Safe State Specification
+  Document ID: KIRRA-SSS-001
+  Version: 1.0
+  Status: Active
+  Standard: ISO 26262 ASIL-D
+
+  ## Overview
+  A safe state is a system state in which no unreasonable risk exists.
+  When Kirra detects a fault condition, it transitions to the appropriate
+  safe state based on fault severity. This document specifies each safe
+  state, its trigger conditions, its behavior, and its recovery path.
+
+  ## Safe States
+
+  ### SS-001: Normal Operation (PostureState::Nominal)
+  Behavior: Full kinematic envelope, 35.0 m/s ceiling, stricter accel
+            rate-limit applied by KirraGovernor nominal profile.
+  Entry: All nodes trusted, no RSS violation, governor reachable.
+  Exit: Any fault trigger below.
+
+  ### SS-002: Minimum Risk Condition (PostureState::Degraded)
+  Behavior: MRC_VELOCITY_CEILING_MPS (5.0 m/s) cap applied by
+            KirraGovernor MRC fallback profile. System continues
+            operating in reduced-capability mode.
+  Entry (any of):
+    - Sensor telemetry timeout (AV_TELEMETRY_TIMEOUT_MS exceeded)
+    - RSS violation (gap < longitudinal_safe_distance)
+    - Governor unreachable (timeout or network partition)
+    - Node trust state Untrusted with non-critical dependency impact
+  Recovery: AV_RECOVERY_STREAK_THRESHOLD (5) consecutive clean ticks
+            within AV_RECOVERY_WINDOW_MS (10,000ms) → Nominal
+  Implements: ISO 26262 safe state for recoverable faults
+
+  ### SS-003: Lockout / Hard Stop (PostureState::LockedOut)
+  Behavior: 0.0 m/s — hard stop. No commands forwarded to actuators.
+            Human intervention required to clear.
+  Entry (any of):
+    - DAG cycle detected in dependency graph
+    - Multiple critical nodes Untrusted (DAG propagation)
+    - GovernorComparator divergence detected (CERT-006)
+    - MAX_DEPENDENCY_DEPTH exceeded in DAG traversal
+  Recovery: Requires explicit human-initiated reset via
+            KIRRA_SUPERVISOR_RESET_KEY endpoint.
+            Automatic recovery from LockedOut is NOT permitted.
+  Implements: ISO 26262 safe state for non-recoverable faults
+
+  ## Fault to Safe State Mapping
+
+  | Fault Mode | Safe State | Recovery |
+  |------------|-----------|---------|
+  | NaN/Inf model output | SS-002 Degraded (safe floor) | Automatic |
+  | Sensor telemetry timeout | SS-002 Degraded | Automatic (streak) |
+  | RSS violation | SS-002 Degraded | Automatic (streak) |
+  | Governor unreachable | SS-002 Degraded | Automatic |
+  | DAG cycle detected | SS-003 LockedOut | Human reset required |
+  | DAG depth exceeded | SS-003 LockedOut | Human reset required |
+  | GovernorComparator divergence | SS-003 LockedOut | Human reset required |
+  | Multiple simultaneous faults | Most severe wins | Per worst fault |
+
+  ## Safe State Transition Invariants
+  1. LockedOut can only be cleared by human reset — never automatic
+  2. Degraded recovery requires N consecutive clean ticks — not immediate
+  3. If governor is unreachable, local MRC floor applies — not pass-through
+  4. NaN/Inf model output → safe floor before governor runs
+  5. DAG LockedOut propagates upward — never downgraded by RSS recovery
+  6. LockedOut dominates Degraded — if both conditions present, LockedOut wins
+
+  ## Implementation References
+  - PostureState enum: src/posture_engine.rs
+  - KirraGovernor authority model: parko/parko-kirra/src/lib.rs
+  - ADL-001: /work/decisions.md
+  - Safety goals: docs/safety/SAFETY_GOALS.md
+
+Commit message:
+  docs(safety): add Safe State Specification — KIRRA-SSS-001 — CERT-007
+```
