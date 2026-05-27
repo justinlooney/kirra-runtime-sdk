@@ -30,8 +30,11 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
       - name: Run MC/DC coverage
+        # TODO: restore `--mcdc` once cargo-llvm-cov and rustc nightly realign on
+        # the coverage-options value. Current nightly accepts only block|branch|
+        # condition; --branch is the closest substitute that compiles today.
         run: |
-          cargo llvm-cov --workspace --mcdc \
+          cargo llvm-cov --workspace --branch \
             --ignore-filename-regex='/.cargo/registry' \
             --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
