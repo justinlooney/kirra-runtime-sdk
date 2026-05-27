@@ -34,7 +34,7 @@ Linker config: `.cargo/config.toml` sets `aarch64-linux-gnu-gcc` for the
 
 ## aarch64 Cross-compilation
 
-Confirmed working on this host:
+Confirmed working — commit `70e7c77`:
 
 ```
 cargo build --target aarch64-unknown-linux-gnu --bin kirra_verifier_service
