@@ -144,6 +144,21 @@ Both tests complete in < 1s (previously: hung > 60s)
 
 ---
 
+## PARK-017 — RSS property test
+Completed: 2026-05-27
+Commit: 4a8b773
+Labels: behavioral-safety, kirra-governor
+Notes: parko/crates/parko-core/tests/rss_governor_proptest.rs — 3 blocks
+× 10,000 cases = 30,000 total. Block 1 Nominal: exact MRC contract when
+RSS unsafe, kinematic envelope when safe. Block 2 Degraded: exact MRC
+regardless of RSS — verifies single apply_mrc_profile() code path under
+adversarial inputs. Block 3 LockedOut: always 0.0 — confirms hard stop
+dominates RSS gate. No bare 5.0 anywhere. rss_safe derived from
+longitudinal_safe_distance() per IEEE 2846-2022 §5.1.
+parko-core: 61 tests (54 unit + 7 proptests / 70,000 total cases).
+
+---
+
 ## PARK-016 — RSS pre-actuator gate in KirraGovernor
 Completed: 2026-05-27
 Commit: 470027b
