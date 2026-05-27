@@ -144,6 +144,20 @@ Both tests complete in < 1s (previously: hung > 60s)
 
 ---
 
+## PARK-018 — RssViolationEvent in kirra-runtime-sdk audit chain
+Completed: 2026-05-27
+Commit: db97f39
+Labels: behavioral-safety
+Notes: AuditChainLinker is a unit struct — append_rss_violation follows
+static pattern (tx: &Transaction, no &mut self). AuditEntry enum and
+AuditError created fresh (none pre-existed). Chain hash input is
+event_json_string consistent with all other entries — RSS event JSON
+flows through compute_record_hash unchanged. Test A: 5-entry mixed chain
+walks clean. Test B: one flipped bit in event_json fails hash check.
+kirra-runtime-sdk: 337 tests (321 unit + 16 integration).
+
+---
+
 ## PARK-017 — RSS property test
 Completed: 2026-05-27
 Commit: 4a8b773

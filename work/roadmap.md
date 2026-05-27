@@ -112,7 +112,7 @@ yet. This increment implements the RSS governor integration from scratch.
 | [x] PARK-015 (GitHub Issue #27) | Wire `RssState { safe, longitudinal_margin, lateral_margin }` into posture engine. RSS violation → Degraded; 5-tick / 10 s hysteresis recovery. | Integration test: violation → Degraded; 5 clean ticks → Nominal. (completed — commit 31b8979) |
 | [x] PARK-016 (GitHub Issue #28) | RSS pre-actuator gate in KirraGovernor: `rss_state.safe == false` clamps to 0.0 before any kinematic check. | Unit test: safe=false + positive velocity → 0.0; safe=true → normal kinematics. (completed — commit 470027b) |
 | [x] PARK-017 (GitHub Issue #29) | RSS property test: for all (ego_vel, lead_vel, gap, commanded_vel) in plausible range, no RSS-violating command exits governor. 10,000 cases per PostureState variant. | All three PostureState variants covered; all cases pass. (completed — commit 4a8b773) |
-| PARK-018 (GitHub Issue #30) | `RssViolationEvent` appended to SHA-256 hash-chained audit ledger. Single-byte corruption causes `verify_chain()` to fail. | append + verify_chain test passes; tamper detection confirmed. |
+| [x] PARK-018 (GitHub Issue #30) | `RssViolationEvent` appended to SHA-256 hash-chained audit ledger. Single-byte corruption causes `verify_chain()` to fail. | append + verify_chain test passes; tamper detection confirmed. (completed — commit db97f39) |
 | PARK-019 (GitHub Issue #31) | 10,000-scenario adversarial trajectory simulation via `ScenarioRunner` + `MockClock`. Zero unsafe commands exit; < 60 s on CI. | Zero violations escape; test completes in < 60 s on CI. |
 
 ---
