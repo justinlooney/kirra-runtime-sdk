@@ -4,6 +4,46 @@ Completed tasks will be appended here weekly.
 
 ---
 
+## PARK-004 — NaN/Inf input guard at tick() entry
+Completed: 2026-05-27
+Commit: b4bcb2d
+Labels: control-loop, safety
+Notes: NaN/Inf guard added at `InferenceLoop::tick()` boundary. Non-finite
+input (NaN/Inf) returns `Ok(PostureSnapshot { active_command: stopped(0.0),
+active_state_degraded: true })` before any governor or clamp logic runs.
+Proptest in scheduler.rs:587 confirms zero non-finite values reach governor
+across the full f32 NaN/Inf/subnormal space.
+
+---
+
+## PARK-007 — Crate and struct name audit
+Completed: 2026-05-27
+Commit: 5ed412e
+Labels: audit, documentation
+Notes: parko-core, parko-onnx, parko-kirra confirmed as workspace members.
+KirraGovernor at parko-kirra/src/lib.rs:43; SafetyGovernor trait imported
+from parko_core::safety. WallClock vs RuntimeClock distinction recorded in
+decisions.md as ADL-006 — WallClock (clock.rs) is the injectable Clock impl
+swapped for MockClock; RuntimeClock (runtime.rs) is the sleep-based tick
+driver. No rename or refactor required.
+
+---
+
+## PARK-008 — Finalize InferenceBackend trait zero-copy boundary
+Completed: 2026-05-27
+Commit: 973763e
+Labels: backend-architecture
+Notes: InferenceBackend trait at backend.rs:113 with load_model/run signature
+returning Result<_, BackendError>. BackendDescriptor enum (6 variants: Cpu,
+TensorRT, Qnn, Tidl, OpenVino, Amd) at backend.rs:90. BackendError enum
+(ShapeMismatch, Io, Unsupported, …) at backend.rs:10 with Display impl.
+BackendCapabilities struct (Default) at backend.rs:43; trait provides
+default `capabilities()` returning `BackendCapabilities::default()` so each
+backend overrides only what differs. OrtBackend inherits Cpu descriptor
+from default impl.
+
+---
+
 ## aarch64 cross-compilation environment
 Completed: 2026-05-27
 Commit: 70e7c77
