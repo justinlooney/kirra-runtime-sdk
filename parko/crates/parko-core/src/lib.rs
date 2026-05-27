@@ -11,6 +11,7 @@
 //! depend on this crate and implement the `InferenceBackend` trait.
 
 pub mod backend;
+pub mod backends;
 pub mod clock;
 pub mod commands;
 pub mod control_loop;
@@ -31,6 +32,7 @@ pub use backend::{
     TensorStorage,
 };
 
+pub use backends::mock::MockBackend;
 pub use clock::{Clock, MockClock, WallClock};
 pub use commands::ControlCommand;
 pub use control_loop::ControlLoop;
