@@ -5,25 +5,20 @@ Completed tasks will be appended here weekly.
 ---
 
 ## PARK-019 — 10,000-scenario adversarial trajectory simulation
-Completed: 2026-05-27
+Completed: 2026-05-26
 Commit: 9172191
-Labels: behavioral-safety
-
-Notes: tests/rss_simulation.rs — three tests, all sync except lifecycle test
-(tokio::test). test_rss_adversarial_10k_scenarios: StdRng seed
-0xDEAD_BEEF_CAFE; 10,000 scenarios × 10 governor evaluations = 100,000
-total; longitudinal_safe_distance derives RSS safe/unsafe per scenario;
-recalculate_and_broadcast called once per scenario to avoid 100,000 SQLite
-writes; asserts zero escapes of out_vel > MRC_VELOCITY_CEILING_MPS when
-rss_safe=false and exact 0.0 for LockedOut. Note: Nominal contract's
-over-deceleration clamp can return v > commanded (prevents abrupt stops) —
-this is correct behavior, not a violation; assertion scoped to RSS/LockedOut
-invariants only. test_rss_posture_lifecycle_violation_to_recovery: ScenarioRunner
-violation→Degraded, sub-threshold streak stays Degraded, threshold-th tick→Nominal.
-test_locked_out_hard_stop_dominates_rss_gate: untrusted node drives DAG to
-LockedOut; RSS-safe state does not override. parko-kirra added to
-kirra-runtime-sdk dev-dependencies. Completed in 1.21s on dev hardware.
-kirra-runtime-sdk: 340 tests (321 unit + 19 integration). No unsafe code.
+Labels: behavioral-safety, simulation
+Notes: 3 integration tests in tests/rss_simulation.rs.
+test_rss_adversarial_10k_scenarios: 10,000 scenarios × 10 ticks,
+StdRng(0xDEAD_BEEF_CAFE), completes in 1.2s. Zero violations escaped.
+test_rss_posture_lifecycle_violation_to_recovery: streak below threshold
+stays Degraded; threshold tick → Nominal.
+test_locked_out_hard_stop_dominates_rss_gate: untrusted DAG → LockedOut;
+RSS-safe state does not override hard stop — confirms PARK-003 fix holds
+under integration conditions. Design note: Nominal kinematics contract
+may return velocity > commanded to prevent abrupt stops — correct behavior,
+scoped assertions accordingly. parko-kirra added to dev-dependencies.
+kirra-runtime-sdk: 340 tests (321 unit + 19 integration).
 
 ---
 
