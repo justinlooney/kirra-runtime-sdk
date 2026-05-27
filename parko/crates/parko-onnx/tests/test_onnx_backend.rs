@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use parko_core::backend::{BackendDescriptor, InferenceBackend, TensorBatch, TensorStorage};
+use parko_core::backend::{BackendCapabilities, BackendDescriptor, InferenceBackend, TensorBatch, TensorStorage};
 use parko_onnx::OrtBackend;
 
 #[test]
@@ -67,4 +67,19 @@ fn test_ort_backend_descriptor_is_cpu() {
     let model_path = "tests/data/mnist-12.onnx";
     let backend = OrtBackend::new(model_path).expect("failed to construct OrtBackend");
     assert_eq!(backend.descriptor(), BackendDescriptor::Cpu);
+}
+
+#[test]
+fn test_ort_backend_capabilities() {
+    let model_path = "tests/data/mnist-12.onnx";
+    let backend = OrtBackend::new(model_path).expect("failed to construct OrtBackend");
+    let caps = backend.capabilities();
+    assert!(!caps.supports_int8, "CPU ONNX baseline does not support INT8");
+    assert!(!caps.supports_fp16, "CPU ONNX baseline does not support FP16");
+    assert_eq!(caps.max_batch_size, None, "CPU ONNX baseline has no batch-size limit");
+    assert_eq!(
+        caps,
+        BackendCapabilities { supports_int8: false, supports_fp16: false, max_batch_size: None },
+        "capabilities must match documented CPU ONNX baseline"
+    );
 }

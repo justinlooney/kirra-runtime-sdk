@@ -267,7 +267,7 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::Arc;
         use crate::backend::{
-            BackendCapabilities, BackendError, InferenceBackend, ModelHandle,
+            BackendError, InferenceBackend, ModelHandle,
             PrecisionMode, TensorBatch,
         };
         use crate::sensor::{SensorFrame, SensorStream};
@@ -284,14 +284,6 @@ mod tests {
             }
             fn run(&self, _: &ModelHandle, _: &TensorBatch) -> Result<TensorBatch<'static>, BackendError> {
                 Ok(TensorBatch { named_tensors: HashMap::new(), metadata: HashMap::new() })
-            }
-            fn capabilities(&self) -> BackendCapabilities {
-                BackendCapabilities {
-                    precision_modes: vec![PrecisionMode::FP32],
-                    supports_zero_copy_inputs: false,
-                    max_batch_size: 1,
-                    vendor_name: "fast",
-                }
             }
         }
 
@@ -323,7 +315,7 @@ mod tests {
     async fn test_mock_clock_tick_count() {
         use std::collections::HashMap;
         use crate::backend::{
-            BackendCapabilities, BackendError, InferenceBackend, ModelHandle,
+            BackendError, InferenceBackend, ModelHandle,
             PrecisionMode, TensorBatch,
         };
         use crate::clock::MockClock;
@@ -341,14 +333,6 @@ mod tests {
             }
             fn run(&self, _: &ModelHandle, _: &TensorBatch) -> Result<TensorBatch<'static>, BackendError> {
                 Ok(TensorBatch { named_tensors: HashMap::new(), metadata: HashMap::new() })
-            }
-            fn capabilities(&self) -> BackendCapabilities {
-                BackendCapabilities {
-                    precision_modes: vec![PrecisionMode::FP32],
-                    supports_zero_copy_inputs: false,
-                    max_batch_size: 1,
-                    vendor_name: "fast2",
-                }
             }
         }
 
@@ -404,7 +388,7 @@ mod tests {
     async fn test_runtime_clock_default_smoke() {
         use std::collections::HashMap;
         use crate::backend::{
-            BackendCapabilities, BackendError, InferenceBackend, ModelHandle,
+            BackendError, InferenceBackend, ModelHandle,
             PrecisionMode, TensorBatch,
         };
         use crate::sensor::{SensorFrame, SensorStream};
@@ -421,14 +405,6 @@ mod tests {
             }
             fn run(&self, _: &ModelHandle, _: &TensorBatch) -> Result<TensorBatch<'static>, BackendError> {
                 Ok(TensorBatch { named_tensors: HashMap::new(), metadata: HashMap::new() })
-            }
-            fn capabilities(&self) -> BackendCapabilities {
-                BackendCapabilities {
-                    precision_modes: vec![PrecisionMode::FP32],
-                    supports_zero_copy_inputs: false,
-                    max_batch_size: 1,
-                    vendor_name: "fast3",
-                }
             }
         }
 

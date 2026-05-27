@@ -39,12 +39,11 @@ pub enum PrecisionMode {
     INT8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct BackendCapabilities {
-    pub precision_modes: Vec<PrecisionMode>,
-    pub supports_zero_copy_inputs: bool,
-    pub max_batch_size: usize,
-    pub vendor_name: &'static str,
+    pub supports_int8: bool,
+    pub supports_fp16: bool,
+    pub max_batch_size: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +110,6 @@ pub enum BackendDescriptor {
 /// The zero-copy hot-path contract (`run(&[f32], &mut [f32])`) specified in
 /// ADL-003 is a target interface for future refactor. The current
 /// `TensorBatch`-based `run()` is the live API used by all backends.
-/// TODO(PARK-011): fn capabilities(&self) -> BackendCapabilities;
 pub trait InferenceBackend: Send + Sync {
     fn load_model(&self, path: &str) -> Result<ModelHandle, BackendError>;
 
@@ -121,7 +119,14 @@ pub trait InferenceBackend: Send + Sync {
         inputs: &TensorBatch,
     ) -> Result<TensorBatch<'static>, BackendError>;
 
-    fn capabilities(&self) -> BackendCapabilities;
+    /// Returns the capability profile for this backend.
+    ///
+    /// Defaults to all-false, `max_batch_size: None`. Override in concrete
+    /// backends to reflect actual hardware support. PARK-012 stub backends
+    /// rely on `BackendCapabilities::default()`.
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
 
     /// Identifies which silicon target this backend runs on.
     ///
@@ -164,6 +169,14 @@ mod tests {
             let s = format!("{:?}", variant);
             assert!(!s.is_empty(), "Debug output must be non-empty for {:?}", variant);
         }
+    }
+
+    #[test]
+    fn test_backend_capabilities_default() {
+        let caps = BackendCapabilities::default();
+        assert!(!caps.supports_int8);
+        assert!(!caps.supports_fp16);
+        assert_eq!(caps.max_batch_size, None);
     }
 
     #[test]

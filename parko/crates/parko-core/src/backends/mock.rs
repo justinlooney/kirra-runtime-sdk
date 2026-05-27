@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::backend::{
-    BackendCapabilities, BackendDescriptor, BackendError, InferenceBackend,
+    BackendDescriptor, BackendError, InferenceBackend,
     ModelHandle, PrecisionMode, TensorBatch, TensorStorage,
 };
 
@@ -69,15 +69,6 @@ impl InferenceBackend for MockBackend {
         })
     }
 
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            precision_modes: vec![PrecisionMode::FP32],
-            supports_zero_copy_inputs: false,
-            max_batch_size: 1,
-            vendor_name: "mock",
-        }
-    }
-
     fn descriptor(&self) -> BackendDescriptor {
         self.descriptor.clone()
     }
@@ -86,6 +77,7 @@ impl InferenceBackend for MockBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::BackendCapabilities;
 
     fn make_backend() -> MockBackend {
         let mut output_data = HashMap::new();
@@ -150,12 +142,9 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_backend_capabilities() {
+    fn test_mock_backend_capabilities_is_default() {
         let backend = make_backend();
-        let caps = backend.capabilities();
-        assert_eq!(caps.vendor_name, "mock");
-        assert_eq!(caps.precision_modes, vec![PrecisionMode::FP32]);
-        assert!(!caps.supports_zero_copy_inputs);
+        assert_eq!(backend.capabilities(), BackendCapabilities::default());
     }
 
     #[test]

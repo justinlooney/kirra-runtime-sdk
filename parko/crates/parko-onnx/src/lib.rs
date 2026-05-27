@@ -131,11 +131,11 @@ impl InferenceBackend for OrtBackend {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
+        // CPU ONNX Runtime baseline — update when quantized models are tested (PARK-009, ADL-007)
         BackendCapabilities {
-            precision_modes: vec![PrecisionMode::FP32],
-            supports_zero_copy_inputs: false,
-            max_batch_size: 1,
-            vendor_name: "ort-cpu",
+            supports_int8: false,
+            supports_fp16: false,
+            max_batch_size: None,
         }
     }
 }

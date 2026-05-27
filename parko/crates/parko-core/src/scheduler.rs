@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task;
 
-use crate::backend::{BackendCapabilities, InferenceBackend, ModelHandle, PrecisionMode, TensorBatch};
+use crate::backend::{BackendCapabilities, BackendDescriptor, InferenceBackend, ModelHandle, PrecisionMode, TensorBatch};
 use crate::commands::ControlCommand;
 use crate::sensor::SensorFrame;
 use crate::telemetry::{CumulativeJitterEvaluator, PostureSnapshot, RuntimeTelemetry, ThermalState};
@@ -47,8 +47,30 @@ pub struct InferenceLoop<B: InferenceBackend> {
     jitter_tracker: CumulativeJitterEvaluator,
     thresholds: DegradationThresholds,
     cached_capabilities: BackendCapabilities,
+    cached_descriptor: BackendDescriptor,
     governor: Option<Box<dyn SafetyGovernor>>,
     tick_period_s: f64,
+}
+
+fn capabilities_precision(caps: &BackendCapabilities) -> PrecisionMode {
+    if caps.supports_int8 {
+        PrecisionMode::INT8
+    } else if caps.supports_fp16 {
+        PrecisionMode::FP16
+    } else {
+        PrecisionMode::FP32
+    }
+}
+
+fn descriptor_vendor(d: &BackendDescriptor) -> &'static str {
+    match d {
+        BackendDescriptor::Cpu => "ort-cpu",
+        BackendDescriptor::TensorRT => "tensorrt",
+        BackendDescriptor::QualcommQnn => "qnn",
+        BackendDescriptor::TiTidl => "ti-tidl",
+        BackendDescriptor::IntelOpenVino => "openvino",
+        BackendDescriptor::AmdVitis => "amd-vitis",
+    }
 }
 
 impl<B: InferenceBackend + 'static> InferenceLoop<B> {
@@ -58,6 +80,7 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
         actuator_tx: mpsc::Sender<ControlCommand>,
     ) -> Self {
         let cached_capabilities = backend.capabilities();
+        let cached_descriptor = backend.descriptor();
         Self {
             backend,
             model: Arc::new(model),
@@ -68,6 +91,7 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
             jitter_tracker: CumulativeJitterEvaluator::new(),
             thresholds: DegradationThresholds::default(),
             cached_capabilities,
+            cached_descriptor,
             governor: None,
             tick_period_s: 0.05,
         }
@@ -156,13 +180,8 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
                     thermal_state: thermal_state_opt.unwrap_or(ThermalState::Normal),
                     frame_age_ms,
                     tensor_payload_bytes,
-                    backend_precision: self
-                        .cached_capabilities
-                        .precision_modes
-                        .first()
-                        .copied()
-                        .unwrap_or(PrecisionMode::FP32),
-                    backend_vendor: std::borrow::Cow::Borrowed(self.cached_capabilities.vendor_name),
+                    backend_precision: capabilities_precision(&self.cached_capabilities),
+                    backend_vendor: std::borrow::Cow::Borrowed(descriptor_vendor(&self.cached_descriptor)),
                 };
                 return Ok(PostureSnapshot {
                     frame_id: current_frame.frame_id,
@@ -245,13 +264,8 @@ impl<B: InferenceBackend + 'static> InferenceLoop<B> {
             thermal_state: thermal_state_opt.unwrap_or(ThermalState::Normal),
             frame_age_ms,
             tensor_payload_bytes,
-            backend_precision: self
-                .cached_capabilities
-                .precision_modes
-                .first()
-                .copied()
-                .unwrap_or(PrecisionMode::FP32),
-            backend_vendor: std::borrow::Cow::Borrowed(self.cached_capabilities.vendor_name),
+            backend_precision: capabilities_precision(&self.cached_capabilities),
+            backend_vendor: std::borrow::Cow::Borrowed(descriptor_vendor(&self.cached_descriptor)),
         };
 
         Ok(PostureSnapshot {
@@ -315,7 +329,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use crate::backend::{BackendCapabilities, BackendError, InferenceBackend, PrecisionMode, TensorStorage};
+    use crate::backend::{BackendError, InferenceBackend, PrecisionMode, TensorStorage};
     use crate::sensor::SensorStream;
     use proptest::prelude::*;
 
@@ -356,14 +370,6 @@ mod tests {
             })
         }
 
-        fn capabilities(&self) -> BackendCapabilities {
-            BackendCapabilities {
-                precision_modes: vec![PrecisionMode::FP32],
-                supports_zero_copy_inputs: true,
-                max_batch_size: 1,
-                vendor_name: "TestBackend",
-            }
-        }
     }
 
     struct SimpleStream {
@@ -558,14 +564,6 @@ mod tests {
             Ok(TensorBatch { named_tensors: map, metadata: HashMap::new() })
         }
 
-        fn capabilities(&self) -> BackendCapabilities {
-            BackendCapabilities {
-                precision_modes: vec![PrecisionMode::FP32],
-                supports_zero_copy_inputs: true,
-                max_batch_size: 1,
-                vendor_name: "ConfigurableBackend",
-            }
-        }
     }
 
     /// Governor that records the proposed linear velocity and allows the command through.
