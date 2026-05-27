@@ -5,6 +5,21 @@ edition = "2021"
 description = "Core types and traits for vendor-neutral ML inference runtime"
 license = "Apache-2.0"
 
+[features]
+# Exposes test-only seams (e.g. set_state_for_test) to integration tests.
+# Never enable in production builds. Release builds omit these symbols.
+test-helpers = []
+
+# Feature-gated zero-output stub backends for CI.
+# Enable without hardware to verify the InferenceBackend contract compiles.
+# Real implementations: PARK-021 (TensorRT), PARK-027 (QNN), PARK-028 (TIDL),
+# PARK-029 (OpenVINO), PARK-030 (AMD).
+backend-tensorrt = []
+backend-qnn      = []
+backend-tidl     = []
+backend-openvino = []
+backend-amd      = []
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
@@ -12,3 +27,13 @@ tokio = { version = "1", features = ["sync", "time", "rt-multi-thread", "macros"
 
 [dev-dependencies]
 parko-kirra = { path = "../parko-kirra" }
+proptest = "1"
+
+[[test]]
+name = "test_posture_divergence"
+path = "tests/test_posture_divergence.rs"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "posture_divergence_proptest"
+path = "tests/posture_divergence_proptest.rs"

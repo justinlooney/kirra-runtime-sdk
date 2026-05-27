@@ -18,13 +18,27 @@
 `with_governor(impl SafetyGovernor + 'static)`. KirraGovernor holds final
 authority over every command on the hot path. The authority model is:
 
-- **LockedOut / Degraded:** hard veto — KirraGovernor returns 0.0 (or
-  `EnforcementAction::Halt`) unconditionally.
-- **Nominal:** KirraGovernor may clamp but not fully veto unless a safety
-  constraint (RSS gate, kinematic envelope) is violated.
-- **Governor unreachable (timeout / partition):** `ControlLoop` drops posture to
-  Degraded, applies the built-in conservative fallback envelope, and logs a
-  `governor_unreachable` safety event before the next tick.
+- **Degraded:** KirraGovernor applies the MRC fallback `VehicleKinematicsContract`
+  (ceiling: **5.0 m/s**). This is a velocity cap, not a hard zero veto. The
+  vehicle is slowed to a safe reduced speed, not halted.
+- **LockedOut:** KirraGovernor issues a hard stop — `EnforcementAction::Deny` —
+  yielding **0.0 m/s**. No motion is permitted. The vehicle must remain stopped
+  until a supervisor issues a manual reset. LockedOut and Degraded are **separate
+  branches** that must never share a code path or contract instance.
+- **Nominal:** KirraGovernor applies the nominal reference contract (ceiling:
+  **35.0 m/s**) with a **tighter acceleration rate-limit** than the fallback
+  contract. For proposed velocities between 5–35 m/s with no prior command
+  (`previous = None`), the nominal rate constraint produces a more conservative
+  output than the fallback's looser rate limit. The governor's output is bounded
+  by both the speed cap and the single-tick rate budget.
+- **Governor unreachable (timeout / partition):** Treat as Degraded. Apply the
+  MRC cap locally. Log a `governor_unreachable` safety event. Do NOT treat as
+  LockedOut — unreachability is a recoverable transient fault, not a structural
+  safety failure.
+- **RSS unsafe (sensor gap, safety distance violation):** Treat as Degraded.
+  Apply the MRC cap. Log an RSS violation event. Do NOT treat as LockedOut — an
+  RSS gap violation is recoverable once the sensor stream and clearance are
+  restored.
 
 The synchronous call path is: `planned_cmd → governor → final_cmd`. There is no
 concurrent or asynchronous governor path in the control loop.
@@ -33,10 +47,15 @@ concurrent or asynchronous governor path in the control loop.
 
 Safety policies are domain-specific; a trait object lets each deployment inject
 KirraGovernor without forking `parko-core`. The `Option` preserves backward
-compatibility. The hard-veto model on Degraded/LockedOut matches ISO 26262 ASIL-D
-fail-closed semantics — a degraded system must never issue an unrestricted command.
-The fallback-to-conservative-envelope rule ensures the loop never runs unguarded
-even if the governor crate is temporarily unavailable.
+compatibility. The MRC fallback model on Degraded matches fail-reduced (not
+fail-stop) semantics — sudden full stops at speed are themselves hazardous;
+slowing to a controlled 5.0 m/s allows the operator or safety driver to intervene
+safely. LockedOut triggers a hard stop (0.0 m/s) because at this posture the
+system has exceeded the threshold requiring mandatory human review before any
+further motion is authorized. The nominal profile's tighter rate-of-change limit
+prevents jerky acceleration that could destabilize the vehicle under normal
+operation. The fallback-to-conservative-envelope rule ensures the loop never runs
+unguarded even if the governor crate is temporarily unavailable.
 
 ### Alternatives Considered
 
@@ -53,8 +72,21 @@ even if the governor crate is temporarily unavailable.
 - The no-governor code path (built-in clamp) must remain correct and tested.
 - Any crate injecting a governor owns the full safety guarantee for that loop.
 - `SafetyGovernor` must be `Send + Sync`.
-- The governor crate name must be verified in the repo before any rename task
-  is written (it may still be `AegisGovernor` or similar).
+- Tests that assert LockedOut output == 0.0 are **correct**. Assertions of
+  output ≤ 5.0 for LockedOut are insufficient — they conflate LockedOut with
+  Degraded and must be replaced with the exact equality check. See PARK-003
+  proptest (`governor_locked_out_always_returns_zero`, 10 000 cases).
+- `KirraGovernor::evaluate()` must keep LockedOut and Degraded as separate
+  match arms that never share a contract instance or code path.
+
+### Note: PARK-003 bug history
+
+PARK-003 (commit `47550ce`) wrote proptest assertions for the governor and found
+that LockedOut and Degraded produced identical outputs. At that time ADL-001 was
+incorrectly updated to accept this as correct behavior ("both postures share one
+contract instance"). This was a documentation error, not a design insight.
+Commits `9943aa9` and `e1ba1a2` corrected the governor and proptest respectively.
+LockedOut is and always was a hard stop. The PARK-003 finding was a bug report.
 
 ---
 
@@ -186,10 +218,23 @@ supervisor reset key; no automatic hysteresis).
 `PostureState` in `parko-core` mirrors this three-variant structure for use in
 governor and control-loop logic.
 
-KirraGovernor authority maps onto this state machine:
-- `Nominal` → KirraGovernor clamps; does not fully veto.
-- `Degraded` → KirraGovernor hard-vetoes all commands.
-- `LockedOut` → KirraGovernor hard-vetoes; manual reset required.
+KirraGovernor authority maps onto this state machine (twice corrected 2026-05-26:
+first correction removed the incorrect hard-veto description; second correction
+established the definitive model: LockedOut is a hard stop at 0.0 m/s and must
+never share a code path with Degraded):
+- `Nominal`   → KirraGovernor applies nominal reference profile (35.0 m/s
+                ceiling + strict rate-of-change limit).
+- `Degraded`  → KirraGovernor applies MRC fallback profile (5.0 m/s ceiling).
+                Velocity cap, not a hard zero veto.
+- `LockedOut` → KirraGovernor issues a hard stop (**0.0 m/s**,
+                `EnforcementAction::Deny`). No motion is permitted. Manual
+                supervisor reset required to exit this state. LockedOut and
+                Degraded are distinct postures with distinct enforcement and
+                must never share a code path or contract instance.
+- **Governor unreachable** → Degraded semantics. MRC cap applied locally.
+  Not LockedOut — recoverable transient.
+- **RSS unsafe** → Degraded semantics. MRC cap applied. Not LockedOut —
+  recoverable once sensor stream and clearance are restored.
 
 IEEE 2846 behavioral safety integration is planned but not yet implemented. When
 implemented (PARK-015), RSS violations must reset the recovery streak to 0 on
@@ -210,3 +255,190 @@ ISO 26262 ASIL-D fail-safe decomposition.
 - Any path that transitions to LockedOut must emit a `LockoutReason` audit chain
   entry before changing state.
 - Recovery streak resets on any new fault during the hysteresis window.
+
+---
+
+## ADL-006 — Clock abstraction naming (WallClock vs RuntimeClock)
+
+**Date:** 2026-05-26
+**Status:** Accepted
+**Deciders:** Justin Looney
+
+### Decision
+
+Two types with "clock" in their name exist in parko-core and serve
+different purposes. `WallClock` (clock.rs) implements the `Clock`
+trait and returns wall-clock milliseconds via `SystemTime` — it is
+the injectable clock used by `ControlLoop` for deterministic testing
+via `MockClock`. `RuntimeClock` (runtime.rs) is a sleep-based
+tick-rate driver — a different concept entirely. The name `WallClock`
+was chosen specifically to avoid collision with the pre-existing
+`RuntimeClock`.
+
+Any future prompt or code that references `RuntimeClock` means the
+sleep-based tick driver in runtime.rs. `WallClock` means the
+injectable `Clock` trait implementation in clock.rs. These must never
+be confused.
+
+`MockClock` (clock.rs) is the test double: `Arc<AtomicU64>`,
+`advance(ms)`, and `Clone`. The pattern is: test keeps one handle,
+`ControlLoop` holds the other via `Arc::new(mock.clone())`. This
+enables deterministic time control with zero `sleep()` calls.
+
+`ControlLoop::tick()` returns `Result<Option<PostureSnapshot>, String>`:
+- `Ok(None)` — tick interval not yet elapsed, no action taken
+- `Ok(Some(snapshot))` — interval elapsed, inference ran, snapshot returned
+- `Err(msg)` — error in the inference or governor path
+
+### Why
+
+`RuntimeClock` was already a public export from parko-core (`runtime.rs`) before
+the Clock trait was introduced. Reusing the name would have created a type
+collision and broken the existing public API. `WallClock` is descriptive and
+unambiguous. The `Option`-wrapped return from `tick()` is the minimal API change
+required to let callers distinguish "not time yet" from "fired" without introducing
+a new error variant or changing the error path semantics.
+
+### Consequences
+
+- Callers of `ControlLoop::tick()` must unwrap two layers: `Result` then `Option`.
+- `test_posture_divergence.rs` call sites updated: `.expect("...").expect("tick should fire")`.
+- Any new control-loop integration test must use `MockClock` (not `RuntimeClock`) for
+  timing control and must never call `std::thread::sleep` or `tokio::time::sleep`.
+- Documentation and prompts must use the correct names: `WallClock` (Clock trait impl),
+  `RuntimeClock` (tick-rate driver), `MockClock` (test double).
+
+---
+
+## ADL-007 — ORT session configuration: thread limit and optimization level
+
+**Date:** 2026-05-26
+**Status:** Accepted
+**Deciders:** Justin Looney
+
+### Decision
+
+`OrtBackend::new()` must configure the ORT session with:
+- `with_intra_threads(1)` — limits intra-op parallelism to one thread
+- `with_optimization_level(GraphOptimizationLevel::Disable)` — skips graph
+  optimization passes at session init time
+
+The ORT shared library is not in the system library search path on any target
+platform. `parko/.cargo/config.toml` sets `ORT_DYLIB_PATH` to the installed
+location (`/root/.local/onnxruntime/lib/libonnxruntime.so`). Any new deployment
+environment (Jetson, QNX) needs an equivalent config pointing to that platform's
+ORT installation — there is no universal default path.
+
+`OrtBackend::descriptor()` returns `BackendDescriptor::Cpu` via the default
+impl added to `InferenceBackend` in PARK-008. No override is needed in
+`parko-onnx`.
+
+### Why
+
+Without `with_intra_threads(1)`, the ORT session builder blocks indefinitely
+during test runs: ORT detects the available core count and attempts to spawn a
+full thread pool, which hangs in restricted CI environments. Disabling graph
+optimization eliminates the initialization-time optimization passes that add
+latency and are unnecessary for correctness in test scenarios. Both options are
+reversible for production builds where throughput matters.
+
+### Consequences
+
+- Any backend that wraps an ORT session must apply these two builder options
+  unless benchmarking explicitly requires otherwise.
+- New deployment environments must add an equivalent `ORT_DYLIB_PATH` entry in
+  their `.cargo/config.toml` before `cargo test -p parko-onnx` can succeed.
+- Production builds that need ORT graph optimization must override
+  `with_optimization_level` explicitly — the test-safe default is `Disable`.
+
+---
+
+## Crate and Struct Name Audit (2026-05-26)
+
+> Read-only audit of the `parko/` workspace. Source: PARK-007.
+> No files were modified. Commands run verbatim against the live tree.
+
+### Workspace members (`parko/Cargo.toml`)
+
+```
+members = ["crates/parko-core", "crates/parko-onnx", "crates/parko-kirra"]
+```
+
+Three crates:
+
+| Crate name    | Path                          | Role |
+|---------------|-------------------------------|------|
+| `parko-core`  | `crates/parko-core/`          | Core traits, ControlLoop, InferenceLoop, Clock types |
+| `parko-onnx`  | `crates/parko-onnx/`          | CPU ONNX backend (InferenceBackend impl) |
+| `parko-kirra` | `crates/parko-kirra/`         | KirraGovernor — SafetyGovernor impl for parko-core |
+
+### Governor struct
+
+The production governor is **`KirraGovernor`** (already Kirra-named; no rename needed):
+
+- **Defined in:** `parko/crates/parko-kirra/src/lib.rs` — line 42 (`pub struct KirraGovernor`)
+- **SafetyGovernor impl:** same file, line 96 (`impl SafetyGovernor for KirraGovernor`)
+- **Constructors:** `KirraGovernor::new()`, `KirraGovernor::nominal()`, `KirraGovernor::mrc_fallback()`
+- **Exported constant:** `MRC_VELOCITY_CEILING_MPS: f64 = 5.0` (pub const in `parko-kirra/src/lib.rs`)
+- **No `AegisGovernor` anywhere in the workspace.**
+
+### `SafetyGovernor` trait
+
+- **Defined in:** `parko/crates/parko-core/src/safety.rs` line 43
+  ```rust
+  pub trait SafetyGovernor: Send + Sync { ... }
+  ```
+- **Re-exported from:** `parko-core/src/lib.rs` line 37
+  ```rust
+  pub use safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
+  ```
+- **Production impl:** `KirraGovernor` in `parko-kirra/src/lib.rs`
+- **Test doubles (not production):**
+  - `AllowAllGovernor`, `ClampToOneGovernor` — `parko-core/src/safety.rs`
+  - `ClampToTwoGovernor`, `ZeroGovernor`, `RecordingGovernor` — `parko-core/src/scheduler.rs`
+
+### Clock types (PARK-005 additions)
+
+| Type | File | Purpose |
+|------|------|---------|
+| `Clock` (trait) | `parko-core/src/clock.rs:8` | `fn now_ms(&self) -> u64; Send + Sync` |
+| `WallClock` | `parko-core/src/clock.rs:13` | Production impl — `SystemTime` / UNIX epoch |
+| `MockClock` | `parko-core/src/clock.rs:30` | Test double — `Arc<AtomicU64>` + `advance(ms)`, `Clone` |
+| `RuntimeClock` | `parko-core/src/runtime.rs:39` | Sleep-based tick-rate driver — **not** a `Clock` trait impl |
+
+`WallClock` and `MockClock` are re-exported from `parko-core/src/lib.rs`:
+```rust
+pub use clock::{Clock, MockClock, WallClock};
+```
+`RuntimeClock` is also re-exported but from `runtime`:
+```rust
+pub use runtime::{RuntimeClock, RuntimeState, TickStatus};
+```
+
+### `ControlLoop::tick()` actual signature
+
+```rust
+// parko-core/src/control_loop.rs line 108
+pub async fn tick(&mut self) -> Result<Option<PostureSnapshot>, String>
+```
+
+- `Ok(None)` — tick interval not yet elapsed
+- `Ok(Some(snapshot))` — interval elapsed, inference ran
+- `Err(msg)` — sensor stream exhausted or inference/governor error
+
+### Files referencing `KirraGovernor` by name
+
+The governor struct is already named `KirraGovernor`. For reference, every file
+that would require editing if `KirraGovernor` were ever renamed:
+
+| File | Nature of reference |
+|------|---------------------|
+| `parko-kirra/src/lib.rs` | Struct definition + all constructors + SafetyGovernor impl |
+| `parko-kirra/tests/test_kirra_governor.rs` | Integration tests (instantiates governor) |
+| `parko-core/tests/test_posture_divergence.rs` | Uses `KirraGovernor::new()` via `parko_kirra::KirraGovernor` |
+| `parko-core/tests/posture_divergence_proptest.rs` | Uses `KirraGovernor` + `MRC_VELOCITY_CEILING_MPS` |
+| `parko-core/src/scheduler.rs` | Doc comment reference only (line 39) |
+| `parko-core/src/control_loop.rs` | Doc comment reference only (line 91) |
+
+No rename is required. The struct, crate, and all call sites are already
+using Kirra naming (`KirraGovernor`, `parko-kirra`).

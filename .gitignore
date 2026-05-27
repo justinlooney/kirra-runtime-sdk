@@ -5,3 +5,4 @@ node_modules/
 dashboard/dist/
 __pycache__/
 *.pyc
+*.proptest-regressions

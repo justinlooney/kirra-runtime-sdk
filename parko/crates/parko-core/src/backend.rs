@@ -19,6 +19,16 @@ pub enum BackendError {
         expected: Vec<usize>,
         actual: Vec<usize>,
     },
+
+    /// Slice-level shape mismatch on the zero-copy hot path (ADL-003).
+    #[error("Shape mismatch: expected {expected}, got {got}")]
+    ShapeMismatch { expected: usize, got: usize },
+
+    #[error("I/O error: {0}")]
+    Io(String),
+
+    #[error("Operation not supported by this backend")]
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,12 +39,11 @@ pub enum PrecisionMode {
     INT8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct BackendCapabilities {
-    pub precision_modes: Vec<PrecisionMode>,
-    pub supports_zero_copy_inputs: bool,
-    pub max_batch_size: usize,
-    pub vendor_name: &'static str,
+    pub supports_int8: bool,
+    pub supports_fp16: bool,
+    pub max_batch_size: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +80,22 @@ pub struct TensorBatch<'a> {
     pub metadata: HashMap<String, String>,
 }
 
+/// Which silicon target a backend runs on.
+///
+/// `#[non_exhaustive]` — new targets will be added as hardware backends land
+/// (PARK-020 TensorRT, PARK-027 QNN, PARK-028 TIDL, PARK-029 OpenVINO,
+/// PARK-030 AMD). Matchers must use a wildcard arm.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackendDescriptor {
+    Cpu,
+    TensorRT,
+    QualcommQnn,
+    TiTidl,
+    IntelOpenVino,
+    AmdVitis,
+}
+
 /// A backend capable of running inference on loaded models.
 ///
 /// Implementations must be `Send + Sync`; backends with non-`Sync` internals
@@ -81,6 +106,10 @@ pub struct TensorBatch<'a> {
 /// the caller — backends copy from their internal buffers into the returned
 /// tensors. Input zero-copy via `Borrowed` is supported; output zero-copy is
 /// not, and is a future API change if needed.
+///
+/// The zero-copy hot-path contract (`run(&[f32], &mut [f32])`) specified in
+/// ADL-003 is a target interface for future refactor. The current
+/// `TensorBatch`-based `run()` is the live API used by all backends.
 pub trait InferenceBackend: Send + Sync {
     fn load_model(&self, path: &str) -> Result<ModelHandle, BackendError>;
 
@@ -90,7 +119,22 @@ pub trait InferenceBackend: Send + Sync {
         inputs: &TensorBatch,
     ) -> Result<TensorBatch<'static>, BackendError>;
 
-    fn capabilities(&self) -> BackendCapabilities;
+    /// Returns the capability profile for this backend.
+    ///
+    /// Defaults to all-false, `max_batch_size: None`. Override in concrete
+    /// backends to reflect actual hardware support. PARK-012 stub backends
+    /// rely on `BackendCapabilities::default()`.
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
+
+    /// Identifies which silicon target this backend runs on.
+    ///
+    /// Defaults to `BackendDescriptor::Cpu` so existing impls compile without
+    /// changes. Override in hardware backends when they land.
+    fn descriptor(&self) -> BackendDescriptor {
+        BackendDescriptor::Cpu
+    }
 }
 
 #[cfg(test)]
@@ -109,5 +153,49 @@ mod tests {
     fn owned_storage_returns_slice_view_of_owned_data() {
         let storage = TensorStorage::Owned(vec![1.0, 2.0, 3.0]);
         assert_eq!(storage.as_slice(), &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_backend_descriptor_debug_roundtrip() {
+        let variants = [
+            BackendDescriptor::Cpu,
+            BackendDescriptor::TensorRT,
+            BackendDescriptor::QualcommQnn,
+            BackendDescriptor::TiTidl,
+            BackendDescriptor::IntelOpenVino,
+            BackendDescriptor::AmdVitis,
+        ];
+        for variant in &variants {
+            let s = format!("{:?}", variant);
+            assert!(!s.is_empty(), "Debug output must be non-empty for {:?}", variant);
+        }
+    }
+
+    #[test]
+    fn test_backend_capabilities_default() {
+        let caps = BackendCapabilities::default();
+        assert!(!caps.supports_int8);
+        assert!(!caps.supports_fp16);
+        assert_eq!(caps.max_batch_size, None);
+    }
+
+    #[test]
+    fn test_backend_error_display() {
+        let shape_err = BackendError::ShapeMismatch { expected: 4, got: 2 };
+        let msg = shape_err.to_string();
+        assert!(msg.contains('4'), "Display must mention expected=4, got: {}", msg);
+        assert!(msg.contains('2'), "Display must mention got=2, got: {}", msg);
+
+        let io_err = BackendError::Io("disk full".into());
+        assert!(
+            io_err.to_string().contains("disk full"),
+            "Io display must contain the message"
+        );
+
+        let unsupported = BackendError::Unsupported;
+        assert!(
+            !unsupported.to_string().is_empty(),
+            "Unsupported display must be non-empty"
+        );
     }
 }

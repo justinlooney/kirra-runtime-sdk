@@ -4,6 +4,25 @@ use rusqlite::{params, Transaction, Result};
 use sha2::{Sha256, Digest};
 use base64::{engine::general_purpose::STANDARD as b64e, Engine as _};
 
+/// Event payload written to the audit chain when an RSS safe-distance
+/// violation is detected. All fields are included in the SHA-256 hash.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RssViolationEvent {
+    pub ego_vel: f64,
+    pub lead_vel: f64,
+    pub gap: f64,
+    pub longitudinal_margin: f64,
+    pub lateral_margin: f64,
+    pub timestamp_ms: u64,
+}
+
+/// Typed audit entries for the hash-chained ledger.
+/// Each variant is serialised to JSON and becomes the `event_json` column value.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum AuditEntry {
+    RssViolation(RssViolationEvent),
+}
+
 /// Returns the canonical signing payload string.
 /// Format: "{prev_hash}:{entry_hash}:{event_type}:{timestamp_ms}"
 pub fn canonical_signing_payload(
@@ -28,6 +47,22 @@ impl AuditChainLinker {
         hasher.update(canonical_json.as_bytes());
         hasher.update(created_at_ms.to_string().as_bytes());
         hex::encode(hasher.finalize())
+    }
+
+    /// Appends an RSS violation event to the hash-chained audit ledger.
+    ///
+    /// The event is serialised to JSON; the JSON bytes are included in the
+    /// SHA-256 chain hash via `compute_record_hash`, following the same
+    /// pattern as all other `append_*` methods. Single-byte corruption of
+    /// `event_json` in the database causes `verify_chain` to fail.
+    pub fn append_rss_violation(
+        tx: &Transaction,
+        event: &RssViolationEvent,
+        signing_key: Option<&ed25519_dalek::SigningKey>,
+    ) -> Result<()> {
+        let json = serde_json::to_string(event)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        Self::append_audit_event_tx(tx, "RSS_VIOLATION", &json, event.timestamp_ms as i64, signing_key)
     }
 
     pub fn append_audit_event_tx(
@@ -319,6 +354,110 @@ mod audit_signing_tests {
 
         assert_eq!(event_type, "KEY_ROTATION");
         assert!(sig_b64.is_some(), "KEY_ROTATION entry should be signed");
+    }
+
+    fn sample_rss_event(ts: u64) -> RssViolationEvent {
+        RssViolationEvent {
+            ego_vel: 15.0,
+            lead_vel: 8.0,
+            gap: 3.5,
+            longitudinal_margin: 0.0,
+            lateral_margin: 0.2,
+            timestamp_ms: ts,
+        }
+    }
+
+    // Test A — 5-entry chain including one RssViolation: chain integrity holds.
+    #[test]
+    fn test_rss_violation_chain_integrity_with_mixed_entries() {
+        let conn = setup_db();
+
+        // 4 generic entries + 1 RssViolation entry
+        for ts in &[1000i64, 2000, 3000, 4000] {
+            let tx = conn.unchecked_transaction().unwrap();
+            AuditChainLinker::append_audit_event_tx(
+                &tx, "POSTURE_EVENT", &format!(r#"{{"ts":{}}}"#, ts), *ts, None,
+            ).unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            AuditChainLinker::append_rss_violation(
+                &tx, &sample_rss_event(5000), None,
+            ).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Walk chain and verify every hash links correctly.
+        let mut stmt = conn.prepare(
+            "SELECT event_json, previous_hash_hex, record_hash_hex, created_at_ms \
+             FROM audit_log_chain ORDER BY id ASC"
+        ).unwrap();
+
+        let mut expected_prev = "0".repeat(64);
+        let mut rows = stmt.query([]).unwrap();
+        let mut count = 0;
+
+        while let Some(row) = rows.next().unwrap() {
+            let event_json: String = row.get(0).unwrap();
+            let prev:       String = row.get(1).unwrap();
+            let record:     String = row.get(2).unwrap();
+            let ts:         i64    = row.get(3).unwrap();
+
+            assert_eq!(prev, expected_prev,
+                "hash chain broken at entry {count}: prev_hash mismatch");
+            let recomputed = AuditChainLinker::compute_record_hash(&prev, &event_json, ts);
+            assert_eq!(recomputed, record,
+                "hash chain broken at entry {count}: record_hash mismatch");
+            expected_prev = record;
+            count += 1;
+        }
+
+        assert_eq!(count, 5, "chain must contain exactly 5 entries");
+    }
+
+    // Test B — corrupt one byte of RssViolation event_json: chain integrity fails.
+    #[test]
+    fn test_rss_violation_corruption_detected_by_chain() {
+        let conn = setup_db();
+
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            AuditChainLinker::append_rss_violation(
+                &tx, &sample_rss_event(1000), None,
+            ).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Retrieve and corrupt the event_json (flip one character).
+        let original_json: String = conn.query_row(
+            "SELECT event_json FROM audit_log_chain LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+
+        let mut corrupted = original_json.clone().into_bytes();
+        // Flip a byte somewhere in the middle of the JSON payload.
+        let mid = corrupted.len() / 2;
+        corrupted[mid] ^= 0x01;
+        let corrupted_json = String::from_utf8_lossy(&corrupted).into_owned();
+
+        conn.execute(
+            "UPDATE audit_log_chain SET event_json = ?1",
+            params![corrupted_json],
+        ).unwrap();
+
+        // Walk chain — recomputed hash must NOT match stored hash.
+        let (event_json, prev, record, ts): (String, String, String, i64) = conn.query_row(
+            "SELECT event_json, previous_hash_hex, record_hash_hex, created_at_ms \
+             FROM audit_log_chain LIMIT 1",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+
+        let recomputed = AuditChainLinker::compute_record_hash(&prev, &event_json, ts);
+        assert_ne!(
+            recomputed, record,
+            "corrupted event_json must produce a different hash — tamper detection failed"
+        );
     }
 
     #[test]

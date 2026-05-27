@@ -75,9 +75,9 @@ consumable as a library by downstream inference and governor crates.
 |------|------|-----------|
 | [~] PARK-001 (in progress — GitHub Issue #6) | Attach `SafetyGovernor` to `ControlLoop`. Stores governor as `Option<Box<dyn SafetyGovernor>>`. Built-in scalar clamp suppressed when governor present. | `test_builtin_clamp_suppressed` passes; all existing parko-core tests green. |
 | [~] PARK-002 (in progress — GitHub Issue #7) | Add `set_state_for_test(state: PostureState)` behind `#[cfg(test)]`. Test seam for posture-divergence tests; no production mutation path. | Method absent from release build (nm); callable under cargo test. |
-| [~] PARK-003 (in progress — GitHub Issue #16) | Posture-divergence proptest: governor output ≤ builtin ceiling for all (proposed, PostureState) pairs. 10,000 cases per variant. | ≥ 10,000 cases pass for Nominal, Degraded, LockedOut. |
+| [x] PARK-003 (done — GitHub Issue #16) | Posture-divergence proptest: exact contract assertions — Nominal ≤ 35.0 m/s, Degraded == proposed.min(5.0 m/s), LockedOut == 0.0 (hard stop, exact). 10,000 cases per variant. Bug found and fixed: original code collapsed two postures into one profile; corrected in commits 9943aa9 and e1ba1a2. | 4 proptest properties pass (10,000 cases each). Hard-stop assertion is exact equality, not a ceiling check. |
 | PARK-004 (GitHub Issue #17) | NaN/Inf input guard at `tick()` entry: non-finite float → `EnforcementAction::Halt` before governor or clamp. | Property test confirms zero non-finite values reach governor. |
-| PARK-005 (GitHub Issue #18) | Wire `RuntimeClock` / `MockClock` abstraction into `ControlLoop`. All timing calls use `self.clock.now_ms()`; no wall-clock in timing-sensitive code. | Test advances `MockClock` manually; timing logic exercisable without sleep. |
+| [x] PARK-005 (GitHub Issue #18) | Wire `RuntimeClock` / `MockClock` abstraction into `ControlLoop`. All timing calls use `self.clock.now_ms()`; no wall-clock in timing-sensitive code. | Test advances `MockClock` manually; timing logic exercisable without sleep. (completed — commit a50363d) |
 | PARK-006 (GitHub Issue #11) | Tag `parko-core-v0.1.0`. Set version in `Cargo.toml`; verify `cargo publish --dry-run` exits cleanly. | Tag in repo; dry-run passes. |
 
 ---
@@ -93,10 +93,10 @@ are Increment 4.
 |------|------|-----------|
 | PARK-007 (GitHub Issue #19) | Verify actual crate and struct names in `parko/` workspace before any rename or refactor. Document findings in decisions.md. | decisions.md updated with verified names; no broken imports. |
 | PARK-008 (GitHub Issue #20) | Finalize `InferenceBackend` trait zero-copy boundary: `run(&self, input: &[f32], output: &mut [f32]) -> Result<(), BackendError>`. All scratch memory pre-allocated at `new()`. | Trait compiles; shape mismatch returns `BackendError::ShapeMismatch`; never panics. |
-| PARK-009 (GitHub Issue #21) | Validate parko-onnx CPU backend against `InferenceBackend` trait. Verify MNIST integration test is green — do not assume it passes without running it. | `cargo test -p parko-onnx` exits 0; MNIST test verified green. |
-| PARK-010 (GitHub Issue #22) | Add `MockBackend` to parko-core: configurable deterministic output. Eliminates ORT dependency from parko-core test binary. | parko-core tests use `MockBackend`; no ORT link in `cargo test -p parko-core`. |
-| PARK-011 (GitHub Issue #23) | Define backend capability reporting: `capabilities()` method + `BackendDescriptor` enum covering all target backends. | All stubs return valid descriptors; capability query compiles on CI. |
-| PARK-012 (GitHub Issue #24) | Feature-gated zero-output stub backends for TensorRT, QNN, TIDL, OpenVINO, AMD. CI builds and tests all stubs without hardware. | `cargo test --features backend-<name>` passes on ubuntu-latest for all stubs. |
+| [x] PARK-009 (GitHub Issue #21) | Validate parko-onnx CPU backend against `InferenceBackend` trait. Verify MNIST integration test is green — do not assume it passes without running it. | `cargo test -p parko-onnx` exits 0; MNIST test verified green. (completed — commit dff915c) |
+| [x] PARK-010 (GitHub Issue #22) | Add `MockBackend` to parko-core: configurable deterministic output. Eliminates ORT dependency from parko-core test binary. | parko-core tests use `MockBackend`; no ORT link in `cargo test -p parko-core`. (completed — commit 58c197b) |
+| [x] PARK-011 (GitHub Issue #23) | Define backend capability reporting: `capabilities()` method + `BackendDescriptor` enum covering all target backends. | All stubs return valid descriptors; capability query compiles on CI. (completed — commit 0a50a0d) |
+| [x] PARK-012 (GitHub Issue #24) | Feature-gated zero-output stub backends for TensorRT, QNN, TIDL, OpenVINO, AMD. CI builds and tests all stubs without hardware. | `cargo test --features backend-<name>` passes on ubuntu-latest for all stubs. (completed — commit f4d1803) |
 
 ---
 
@@ -107,13 +107,13 @@ yet. This increment implements the RSS governor integration from scratch.
 
 | Task | What | Done When |
 |------|------|-----------|
-| PARK-013 (GitHub Issue #25) | Implement `longitudinal_safe_distance` per IEEE 2846-2022 §5.1. First implementation; no prior behavioral-safety code exists. | Unit tests match IEEE reference values; no NaN/overflow on edge cases. |
-| PARK-014 (GitHub Issue #26) | Implement `lateral_safe_distance` per IEEE 2846-2022 §5.2. | Unit tests cover converging, diverging, and stationary cases. |
-| PARK-015 (GitHub Issue #27) | Wire `RssState { safe, longitudinal_margin, lateral_margin }` into posture engine. RSS violation → Degraded; 5-tick / 10 s hysteresis recovery. | Integration test: violation → Degraded; 5 clean ticks → Nominal. |
-| PARK-016 (GitHub Issue #28) | RSS pre-actuator gate in KirraGovernor: `rss_state.safe == false` clamps to 0.0 before any kinematic check. | Unit test: safe=false + positive velocity → 0.0; safe=true → normal kinematics. |
-| PARK-017 (GitHub Issue #29) | RSS property test: for all (ego_vel, lead_vel, gap, commanded_vel) in plausible range, no RSS-violating command exits governor. 10,000 cases per PostureState variant. | All three PostureState variants covered; all cases pass. |
-| PARK-018 (GitHub Issue #30) | `RssViolationEvent` appended to SHA-256 hash-chained audit ledger. Single-byte corruption causes `verify_chain()` to fail. | append + verify_chain test passes; tamper detection confirmed. |
-| PARK-019 (GitHub Issue #31) | 10,000-scenario adversarial trajectory simulation via `ScenarioRunner` + `MockClock`. Zero unsafe commands exit; < 60 s on CI. | Zero violations escape; test completes in < 60 s on CI. |
+| [x] PARK-013 (GitHub Issue #25) | Implement `longitudinal_safe_distance` per IEEE 2846-2022 §5.1. First implementation; no prior behavioral-safety code exists. | Unit tests match IEEE reference values; no NaN/overflow on edge cases. (completed — commit a40948e) |
+| [x] PARK-014 (GitHub Issue #26) | Implement `lateral_safe_distance` per IEEE 2846-2022 §5.2. | Unit tests cover converging, diverging, and stationary cases. (completed — commit 111e7d0) |
+| [x] PARK-015 (GitHub Issue #27) | Wire `RssState { safe, longitudinal_margin, lateral_margin }` into posture engine. RSS violation → Degraded; 5-tick / 10 s hysteresis recovery. | Integration test: violation → Degraded; 5 clean ticks → Nominal. (completed — commit 31b8979) |
+| [x] PARK-016 (GitHub Issue #28) | RSS pre-actuator gate in KirraGovernor: `rss_state.safe == false` clamps to 0.0 before any kinematic check. | Unit test: safe=false + positive velocity → 0.0; safe=true → normal kinematics. (completed — commit 470027b) |
+| [x] PARK-017 (GitHub Issue #29) | RSS property test: for all (ego_vel, lead_vel, gap, commanded_vel) in plausible range, no RSS-violating command exits governor. 10,000 cases per PostureState variant. | All three PostureState variants covered; all cases pass. (completed — commit 4a8b773) |
+| [x] PARK-018 (GitHub Issue #30) | `RssViolationEvent` appended to SHA-256 hash-chained audit ledger. Single-byte corruption causes `verify_chain()` to fail. | append + verify_chain test passes; tamper detection confirmed. (completed — commit db97f39) |
+| [x] PARK-019 (GitHub Issue #31) | 10,000-scenario adversarial trajectory simulation via `ScenarioRunner` + `MockClock`. Zero unsafe commands exit; < 60 s on CI. | Zero violations escape; test completes in < 60 s on CI. (completed — commit 9172191) |
 
 ---
 

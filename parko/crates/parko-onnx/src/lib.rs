@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ort::{
-    session::Session,
+    session::{builder::GraphOptimizationLevel, Session},
     value::{Tensor, ValueType},
 };
 
@@ -21,6 +21,10 @@ impl OrtBackend {
     pub fn new(model_path: &str) -> Result<Self, BackendError> {
         let session = Session::builder()
             .map_err(|e| BackendError::InitializationError(format!("ort builder error: {:?}", e)))?
+            .with_intra_threads(1)
+            .map_err(|e| BackendError::InitializationError(format!("ort intra_threads error: {:?}", e)))?
+            .with_optimization_level(GraphOptimizationLevel::Disable)
+            .map_err(|e| BackendError::InitializationError(format!("ort opt_level error: {:?}", e)))?
             .commit_from_file(model_path)
             .map_err(|e| BackendError::InitializationError(format!("ort session init error: {:?}", e)))?;
 
@@ -127,11 +131,11 @@ impl InferenceBackend for OrtBackend {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
+        // CPU ONNX Runtime baseline — update when quantized models are tested (PARK-009, ADL-007)
         BackendCapabilities {
-            precision_modes: vec![PrecisionMode::FP32],
-            supports_zero_copy_inputs: false,
-            max_batch_size: 1,
-            vendor_name: "ort-cpu",
+            supports_int8: false,
+            supports_fp16: false,
+            max_batch_size: None,
         }
     }
 }
