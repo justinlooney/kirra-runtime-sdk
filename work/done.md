@@ -40,6 +40,19 @@ Completed tasks will be appended here weekly.
 
 ---
 
+## PARK-012 — Feature-gated stub backends for CI
+Completed: 2026-05-27
+Commit: f4d1803
+Labels: backend-architecture
+
+Notes: 5 stub files in backends/ — file-level #![cfg(feature="...")] gates
+entire file cleanly. Each stub implements InferenceBackend returning empty
+TensorBatch and BackendCapabilities::default(). Feature flags added:
+backend-tensorrt, backend-qnn, backend-tidl, backend-openvino, backend-amd.
+Test counts: baseline 44 unit + 4 proptests; each stub adds 2; all five → 54.
+
+---
+
 ## PARK-011 — Define backend capability reporting
 Completed: 2026-05-27
 Commit: 0a50a0d
