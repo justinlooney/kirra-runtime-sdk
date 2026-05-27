@@ -40,6 +40,29 @@ Completed tasks will be appended here weekly.
 
 ---
 
+## PARK-010 — MockBackend for parko-core unit tests
+Completed: 2026-05-27
+Commit: 58c197b
+Labels: backend-architecture
+
+What landed:
+- parko-core/src/backends/mock.rs: MockBackend implements InferenceBackend
+- parko-core/src/backends/mod.rs: new backends/ submodule
+- lib.rs: pub mod backends + pub use backends::mock::MockBackend
+
+Notes: output_data stored as HashMap<String, Vec<f32>> — run() produces
+fresh TensorBatch<'static> via TensorStorage::Owned on each call, avoiding
+Clone requirement on TensorBatch. call_count uses AtomicU64 for Send+Sync
+without &mut self. No cfg gate — fully public; downstream test crates use
+parko_core::MockBackend directly.
+
+7 new unit tests: run output, repeatability, call count, descriptor,
+load_model shape, capabilities, Send+Sync compile-time assertion.
+
+Test count after PARK-010: 43 parko-core unit tests (was 34 after PARK-005).
+
+---
+
 ## PARK-009 — Validate parko-onnx CPU backend; fix hanging MNIST test
 Completed: 2026-05-26
 Commit: dff915c
