@@ -20,7 +20,7 @@ jobs:
         run: cargo test --workspace
 
   coverage:
-    name: MC/DC Coverage (ISO 26262)
+    name: Branch Coverage (MC/DC pending — issue #65)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
