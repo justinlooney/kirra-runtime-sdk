@@ -913,6 +913,8 @@ findings in `decisions.md` before the license expires.
 ```
 Target: cross-compile kirra-runtime-sdk for QNX and bring up kirra_verifier_service.
 
+QNX SDP 8.0 install: /opt/qnx800/sdp — source /opt/qnx800/sdp/qnxsdp-env.sh before building.
+
 Requirements:
 1. Identify the correct Rust target triple for QNX (e.g., x86_64-pc-nto-qnx710).
 2. Add cross-compilation configuration to .cargo/config.toml.
