@@ -54,33 +54,26 @@
 
 ## Current Execution Status
 
-### Unblocked — Ready to run now
-- PARK-029: OpenVINO backend (x86 laptop)
-- CERT-002: Static analysis CI
-- CERT-003: RTM audit
-- CERT-004: Fault injection suite
-- CERT-005: Rust coding standard
-- CERT-006: GovernorComparator
-- CERT-007: Safe state specification
+### Completed
+- PARK-001 through PARK-019, PARK-029
+- CERT-001 through CERT-007
 
-### Partially complete
-- PARK-024: QNX toolchain working, binary blocked on
-  upstream Rust gaps (tokio #8178, socket2 #657)
+### In Progress
+- PARK-024 (partial — toolchain working, binary blocked)
+- PARK-024b (upstream libc / tokio / socket2 QNX 8.0 fixes)
 
-### Blocked on Jetson (in transit)
-- PARK-020, PARK-021, PARK-022, PARK-023: TensorRT backend
+### Blocked on Hardware
+- PARK-020 / 021 / 022 / 023 — Jetson (in transit)
+- PARK-037 — Hiwonder robot (in transit)
+- PARK-030 — Kria K26 (not yet ordered)
+- PARK-027 — Qualcomm hardware
+- PARK-028 — TI hardware
 
-### Blocked on robot (in transit)
-- PARK-037: ROS2 cmd_vel integration
+### Blocked on PARK-024
+- PARK-025, PARK-026
 
-### Blocked on hardware procurement
-- PARK-030: AMD Vitis AI (order Kria K26 ~$200)
-- PARK-027: QNN (Qualcomm hardware)
-- PARK-028: TIDL (TI hardware)
-
-### Blocked on PARK-024 completion
-- PARK-025: QNN + QNX compatibility analysis
-- PARK-026: QNX-safe backend selection rules
+### Never ran / backlog
+- PARK-006
 
 ---
 
