@@ -49,3 +49,18 @@ Rust target: `rustup target add aarch64-unknown-linux-gnu`
 - Distribution: Jazzy
 - Installed: 2026-05-27
 - Source: source /opt/ros/jazzy/setup.bash
+
+## Inference Backends
+
+Compile each silicon backend with its feature flag from `parko-core`. The "Status on this host" column reflects what compiles and runs on the development Ubuntu 24.04 / x86_64 environment today.
+
+| Backend | Feature flag | Crate | Status on this host | Target hardware | Tracking |
+|---|---|---|---|---|---|
+| ONNX Runtime (CPU) | (default) | `parko-onnx` | ✅ Full implementation, `OrtBackend` | Any x86_64 / aarch64 | PARK-008/009 |
+| OpenVINO | `backend-openvino` | `parko-core/backends/openvino_stub.rs` | ✅ Stub compiles; `new()` returns `InitializationError` (no runtime installed) | Intel CPU / iGPU / VPU / AUTO | **PARK-029** |
+| TensorRT | `backend-tensorrt` | `parko-core/backends/tensorrt_stub.rs` | ⏳ Stub compiles; Jetson hardware in transit | NVIDIA Jetson / DRIVE | PARK-020/021 |
+| QNN | `backend-qnn` | `parko-core/backends/qnn_stub.rs` | ⏳ Stub compiles; Qualcomm hardware not on hand | Snapdragon / QCS6490 | PARK-027 |
+| TIDL | `backend-tidl` | `parko-core/backends/tidl_stub.rs` | ⏳ Stub compiles; TI hardware not on hand | TDA4VM / J7 DSP | PARK-028 |
+| AMD Vitis | `backend-amd` | `parko-core/backends/amd_stub.rs` | ⏳ Stub compiles; Kria K26 not yet ordered | Xilinx Kria / Vitis AI | PARK-030 |
+
+OpenVINO real-implementation install path: install OpenVINO runtime from <https://docs.openvino.ai/>, then replace `OpenVinoStubBackend::new()` body with an `openvino`-crate (C-API binding) backed engine. Stub's `descriptor()` and `capabilities()` remain valid as-is.
