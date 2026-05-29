@@ -523,33 +523,51 @@ source-level MC/DC reporting equivalent to LDRA/BullseyeCoverage for C.
 
 ---
 
-## ADL-010 — QNX Cross-Compilation Findings (PARK-024)
+## ADL-010 — QNX POSIX gap analysis (PARK-024 spike findings)
 
 **Date:** 2026-05-28
-**Status:** In progress — spike open
-**Target:** `x86_64-pc-nto-qnx800` via QNX SDP 8.0 at `/opt/qnx800/sdp2`
-**Toolchain:** `nightly` + `-Zbuild-std=std,panic_abort` (tier-3 target, no precompiled stdlib)
+**Status:** Spike complete — architectural gaps identified
+**Target:** `x86_64-pc-nto-qnx800` (also valid for `aarch64-unknown-nto-qnx800`)
+**Toolchain:** `nightly` + `-Zbuild-std=std,panic_abort` (tier-3, no precompiled stdlib)
+**SDP:** QNX SDP 8.0 at `/opt/qnx800/sdp2`
 
-### Toolchain confirmed working
-- `qnxsdp-env.sh` sources cleanly; `QNX_HOST`, `QNX_TARGET`, `QNX_CONFIGURATION`, and `PATH` set as expected
-- `qcc --version` returns `gcc 12.2.0`
-- `scripts/test-qnx-vm.sh` clears the SDP guard and sources env
+### Cross-compilation toolchain confirmed working
 
-### POSIX-subset gaps encountered (running list)
+- `qcc --version` → gcc 12.2.0
+- Env sourced cleanly from `/opt/qnx800/sdp2/qnxsdp-env.sh` (`QNX_HOST`, `QNX_TARGET`, `QNX_CONFIGURATION`, `PATH`)
+- `scripts/test-qnx-vm.sh` clears the SDP guard and sources env without error
+- `cargo +nightly build -Zbuild-std=std,panic_abort --target x86_64-pc-nto-qnx800` builds stdlib successfully
 
-**Gap #1 — `libc::TCP_KEEPALIVE` missing for `nto` target**
+### Architectural gaps identified
 
-- Symptom: `socket2 v0.6.3` fails to compile —
-  `error[E0432]: unresolved import 'libc::TCP_KEEPALIVE'` at `socket2/src/sys/unix.rs:309`
-- Root cause: the `libc` crate does not export `TCP_KEEPALIVE` for `target_os = "nto"`. QNX's BSD-derived TCP stack does provide the option at the C header level, but the Rust bindings haven't been generated for it.
-- Spike workaround: local `[patch.crates-io]` of `socket2` that selects `SO_KEEPALIVE` under `cfg(target_os = "nto")`. This unblocks compilation but is **not semantically correct** — `SO_KEEPALIVE` is socket-level on/off, not the TCP-level idle timer the original constant configures. Acceptable for the spike whose goal is "binary running"; **not acceptable for production**.
-- Proper fix: PR to `rust-lang/libc` exposing `TCP_KEEPALIVE` for `nto-qnx` targets; revert the `socket2` patch once that lands.
-- Tracked: GitHub Issue #66
+Two architectural gaps between QNX SDP 8.0 and Linux/macOS — **not** Rust-bindings problems. The constants are absent from the QNX C headers themselves.
 
-**Gap #2 — `libc::LOCAL_PEEREID` missing for `nto` target**
+**1. TCP keepalive per-socket options — not present in QNX**
 
-- Symptom: `tokio v1.52.3` fails to compile —
-  `error[E0432]: unresolved import 'libc::LOCAL_PEEREID'` at `tokio/src/net/unix/ucred.rs:137`
-- Root cause: same family as Gap #1. `LOCAL_PEEREID` is a BSD-style socket option (`SOL_SOCKET` level) for retrieving Unix-domain-socket peer credentials. QNX inherits the option from its BSD-derived stack, but the `libc` crate has no binding for it under `cfg(target_os = "nto")`.
-- Strategy shift: rather than fork tokio (and every other transitive `libc` consumer to come), patch `libc` directly. One `[patch.crates-io]` override of `libc` unblocks all gap-#1/#2-class compile errors at once. The `socket2` fork is no longer required once `libc` exposes `TCP_KEEPALIVE`; we keep the `socket2` patch until the libc fork is confirmed working, then drop it.
-- Tracked: GitHub Issue #66 (scope expanded to cover both constants)
+- Linux uses `TCP_KEEPIDLE`; macOS uses `TCP_KEEPALIVE`. **QNX has neither.**
+- Only hit in `/opt/qnx800/sdp2/target/qnx/usr/include/` is `curl.h`'s unrelated `CURLOPT_TCP_KEEPALIVE` (libcurl option enum, not the TCP socket option).
+- Likely available only as system-wide tuning via `sysctl` or unsupported entirely.
+- Compile symptom: `socket2 v0.6.3` fails at `src/sys/unix.rs:309` with `error[E0432]: unresolved import 'libc::TCP_KEEPALIVE'`.
+
+**2. Unix-socket peer credentials — not present in QNX via these mechanisms**
+
+- Linux uses `SO_PEERCRED`; macOS/BSD uses `LOCAL_PEEREID`. **QNX exposes neither in its headers.**
+- May be obtainable via `getpeereid()` or `SCM_CREDS` (not investigated in this spike).
+- Compile symptom: `tokio v1.52.3` fails at `src/net/unix/ucred.rs:137` with `error[E0432]: unresolved import 'libc::LOCAL_PEEREID'`.
+
+### Impact
+
+A `libc` PR adding bindings is **not** the fix — there is nothing in QNX to bind to. The proper fix is upstream changes in the **consuming crates**:
+
+- `rust-lang/socket2` — add `cfg(target_os = "nto")` arm that disables or stubs the TCP-keepalive-timer code path
+- `tokio-rs/tokio` — add `cfg(target_os = "nto")` arm in `net/unix/ucred.rs` that returns an `Unsupported` error or compiles out the peer-cred lookup
+
+The local `[patch.crates-io] socket2 = { path = "../socket2-qnx" }` in `kirra-runtime-sdk/Cargo.toml` remains as a placeholder spike fork; it should be replaced by the upstream-merged behavior.
+
+### Next steps
+
+- File upstream issues / PRs against `rust-lang/socket2` and `tokio-rs/tokio` to add QNX-aware code paths
+- Track follow-up work as PARK-024b (upstream contribution)
+- "Binary running on QNX" remains the eventual goal but is multi-day upstream-PR work, not in scope for this spike
+- Issue #66 has been re-scoped from "libc PR" to "upstream socket2/tokio contributions"
+

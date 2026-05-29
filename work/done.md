@@ -4,6 +4,26 @@ Completed tasks will be appended here weekly.
 
 ---
 
+## PARK-024 — QNX deployment spike (findings only)
+Completed: 2026-05-28
+Commit: (this commit)
+Labels: qnx, spike
+Notes: Spike complete; binary-running goal deferred to upstream
+contribution work (PARK-024b). Cross-compilation toolchain confirmed
+working — qcc 12.2.0, env from /opt/qnx800/sdp2/qnxsdp-env.sh, build-std
+on nightly compiles core/std/alloc successfully for x86_64-pc-nto-qnx800.
+Identified two architectural gaps between QNX SDP 8.0 and Linux/macOS:
+(1) TCP per-socket keepalive (TCP_KEEPIDLE / TCP_KEEPALIVE) not present in
+QNX headers; (2) Unix-socket peer credentials (SO_PEERCRED / LOCAL_PEEREID)
+not present in QNX headers. Neither is a libc-bindings gap — the constants
+are absent from QNX C headers. Fix requires upstream PRs to socket2 and
+tokio adding cfg(target_os = "nto") code paths. Spike workaround: local
+socket2 fork patched to use SO_KEEPALIVE (semantically wrong, spike-only),
+plus `[patch.crates-io]` entry in Cargo.toml. ADL-010 documents the full
+findings; issue #66 re-scoped to track the socket2 + tokio upstream work.
+
+---
+
 ## PARK-004 — NaN/Inf input guard at tick() entry
 Completed: 2026-05-27
 Commit: b4bcb2d
