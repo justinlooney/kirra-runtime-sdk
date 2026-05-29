@@ -631,7 +631,7 @@ fn run_scenario_headless(
 
         stats.check_invariant(&state, wheelbase_m, max_lateral_accel, max_speed, t);
 
-        if t % 500 == 0 {
+        if t.is_multiple_of(500) {
             if let Ok(posture_resp) = client.get_fleet_posture() {
                 let agg = posture_resp.fleet.iter()
                     .map(|n| n.propagated_status.as_str())

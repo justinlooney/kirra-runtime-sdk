@@ -57,6 +57,12 @@ pub struct RuntimeTrustEngine {
     pub reset_cooldown_end_ms: u64,
 }
 
+impl Default for RuntimeTrustEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RuntimeTrustEngine {
     pub fn new() -> Self {
         Self {
@@ -225,6 +231,12 @@ impl<C: SafetyContract> SafetyGovernor for KirraKernelGovernor<C> {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CausalFlightRecorder { pub journal: std::collections::VecDeque<JournalEntry> }
+
+impl Default for CausalFlightRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CausalFlightRecorder {
     pub fn new() -> Self { Self { journal: std::collections::VecDeque::new() } }

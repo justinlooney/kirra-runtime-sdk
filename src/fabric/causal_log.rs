@@ -125,6 +125,10 @@ impl FabricCausalLog {
     pub fn len(&self) -> usize {
         self.entries.lock().map(|e| e.len()).unwrap_or(0)
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.lock().map(|e| e.is_empty()).unwrap_or(true)
+    }
 }
 
 impl Default for FabricCausalLog {

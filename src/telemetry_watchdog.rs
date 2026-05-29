@@ -100,8 +100,8 @@ struct WatchdogNodeEntry {
 ///      a. Marks node `Untrusted("TELEMETRY_TIMEOUT")` in AppState.nodes (memory)
 ///      b. Logs a structured error
 ///      c. Sends `PostureRecalcTrigger::WatchdogTimeout` to the posture engine channel
-///         (NOT calling recalculate_and_broadcast directly — routes through the
-///          serialized worker to prevent burst recalculations)
+///      (NOT calling recalculate_and_broadcast directly — routes through the
+///      serialized worker to prevent burst recalculations)
 ///   5. Every `AV_WATCHDOG_NODE_REFRESH_MS`, refreshes the node list from SQLite
 ///      to pick up newly registered nodes
 ///

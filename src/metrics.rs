@@ -12,6 +12,12 @@ pub struct LockFreeMetricsAggregator {
     pub active_worker_threads: AtomicU64,
 }
 
+impl Default for LockFreeMetricsAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LockFreeMetricsAggregator {
     pub fn new() -> Self {
         Self {
