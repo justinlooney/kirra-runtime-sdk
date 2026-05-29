@@ -1,9 +1,14 @@
 # Kirra Runtime SDK
 
 ![CI](https://github.com/justinlooney/kirra-runtime-sdk/actions/workflows/ci.yml/badge.svg)
-![Version](https://img.shields.io/badge/version-v1.1.2-blue)
+![Version](https://img.shields.io/github/v/tag/justinlooney/kirra-runtime-sdk)
 
 A distributed runtime legitimacy engine and safety governor for AI-driven robotic and edge systems. Kirra enforces **fail-closed trust semantics** across a heterogeneous fleet — preventing unsafe or unauthorized commands from reaching actuators regardless of what an AI model, LLM output, or upstream orchestration layer instructs.
+
+> **Note on versioning:** v1.5.0 was a documentation-only release
+> (ASIL-D safety case foundation) tagged out-of-band by CI automation.
+> v1.1.x tracks the runtime SDK implementation history.
+> The next feature release will be v1.2.0.
 
 ---
 
