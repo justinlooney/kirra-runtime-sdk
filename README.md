@@ -342,4 +342,6 @@ KIRRA_VERIFIER_MODE=passive_standby KIRRA_INSTANCE_ID=kirra-standby ./kirra_veri
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+See [COPYRIGHT](COPYRIGHT) for details.
+
+© 2026 Justin Looney. All rights reserved.
