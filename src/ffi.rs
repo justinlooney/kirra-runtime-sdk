@@ -35,8 +35,25 @@ pub extern "C" fn kirra_get_trust_score() -> u32 {
     GLOBAL_GOVERNOR.lock().map(|g| g.trust_engine.current_score).unwrap_or(0)
 }
 
+/// # Safety
+///
+/// Caller must ensure:
+/// - `token_ptr` points to a valid readable region of at least
+///   `token_len` bytes
+/// - The memory region must not be aliased or mutated during the call
+/// - The memory must outlive the duration of this call
+/// - `token_len` must accurately reflect the size of the buffer;
+///   mis-sizing causes out-of-bounds read with undefined behavior
+///
+/// The null-pointer and length checks at the start of this function
+/// catch obvious invalid inputs but cannot validate that the pointer
+/// addresses real memory. Safety is irreducibly a caller responsibility
+/// at this C FFI boundary.
+///
+/// Per CERT-005 RSR-001: every pub extern "C" fn that dereferences
+/// a raw pointer must be marked unsafe fn.
 #[no_mangle]
-pub extern "C" fn kirra_reset_state(token_ptr: *const u8, token_len: usize) -> i32 {
+pub unsafe extern "C" fn kirra_reset_state(token_ptr: *const u8, token_len: usize) -> i32 {
     if token_ptr.is_null() || token_len == 0 || token_len > 64 { return 0; }
     let key = match std::env::var("KIRRA_SUPERVISOR_RESET_KEY") {
         Ok(v) if !v.is_empty() => v.into_bytes(),
