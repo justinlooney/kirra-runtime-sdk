@@ -571,6 +571,42 @@ The local `[patch.crates-io] socket2 = { path = "../socket2-qnx" }` in `kirra-ru
 - "Binary running on QNX" remains the eventual goal but is multi-day upstream-PR work, not in scope for this spike
 - Issue #66 has been re-scoped from "libc PR" to "upstream socket2/tokio contributions"
 
+### ADL-010 Update — 2026-05-29: libc QNX 8.0 gap identified
+
+Root cause refined: `libc 0.2.186` defines `TCP_KEEPALIVE` and
+`LOCAL_PEEREID` for QNX 7.0 / 7.1 (`target_env = "nto70"` / `"nto71"`)
+inside a `cfg_if!` block at `src/unix/nto/mod.rs:907`, but has no
+`nto80` arm. QNX 8.0 system headers do not contain these constants
+at all — they were present in QNX 7.x but absent in 8.0 (confirmed
+by `grep -r 'TCP_KEEPALIVE\|LOCAL_PEEREID' /opt/qnx800/sdp2/target/qnx/usr/include/`
+on the development laptop earlier in this session).
+
+Tokio PR #6421 (merged May 2024, tokio v1.37+) is **necessary but
+not sufficient**. Kirra uses tokio 1.52.3 which includes the PR — the
+`#[cfg(any(target_os = "netbsd", target_os = "nto"))]` gate around
+`impl_netbsd` in `ucred.rs` is in place — but compilation still fails
+because libc has no `nto80` definitions for the symbols tokio imports.
+Same story for socket2 0.6.3 with `TCP_KEEPALIVE`.
+
+Two possible upstream fix paths:
+
+1. **libc PR**: add explicit `target_env = "nto80"` arm to the
+   `cfg_if!` block at `src/unix/nto/mod.rs:907`. Only valid if QNX 8.0
+   headers actually define the constants — current evidence (header
+   grep) is they **do not**.
+
+2. **tokio + socket2 PRs**: gate nto socket code on
+   `target_env = "nto70"` / `"nto71"` only, **not** the broader
+   `target_os = "nto"`. QNX 8.0 builds then compile cleanly by
+   omitting the unavailable socket options. Lost functionality
+   (per-socket TCP keepalive idle timer, Unix-socket peer credentials)
+   would need either a runtime degrade-and-warn path or a separate
+   QNX 8.0 implementation using whatever the SDP 8.0 API actually
+   provides for the same goals.
+
+**Path 2 is the more likely correct fix given the header evidence.**
+Tracked in PARK-024b / GitHub issue #67.
+
 ### CERT-002 baseline (2026-05-29)
 
 - **Total initial errors:** 21 (`cargo clippy --workspace -- -D warnings`)

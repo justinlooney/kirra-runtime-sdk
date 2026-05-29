@@ -930,6 +930,72 @@ over feature completeness.
 
 ---
 
+## PARK-024b `qnx` `upstream`
+
+**QNX 8.0 upstream contributions — gate nto socket code on target_env**
+
+PARK-024 spike (see ADL-010) confirmed the cross-compilation toolchain
+is operational but landed on a precise libc / tokio / socket2 gap for
+QNX 8.0 specifically. `libc 0.2.186` defines `TCP_KEEPALIVE` and
+`LOCAL_PEEREID` under `cfg_if! { if #[cfg(any(target_env = "nto70",
+target_env = "nto71"))] }` (QNX 7.0/7.1 only). There is **no nto80
+arm**, and QNX 8.0 system headers do not define these constants —
+they were present in QNX 7.x but absent in 8.0. Tokio PR #6421
+(tokio v1.37+, kirra is on 1.52.3) added the nto code path but
+imports `libc::LOCAL_PEEREID` for any `target_os = "nto"`, so QNX 8.0
+builds fail at the libc-import step.
+
+Upstream PR work needed:
+
+- **`tokio-rs/tokio` (#8178 / new PR)** — gate `impl_netbsd` mod and
+  the `LOCAL_PEEREID` / `SO_PEERCRED` imports on
+  `cfg(any(target_env = "nto70", target_env = "nto71"))`, not the
+  broader `cfg(target_os = "nto")`. On QNX 8.0, return
+  `Unsupported` or an equivalent fail-soft for the peer-cred lookup.
+
+- **`rust-lang/socket2` (#657 / new PR)** — same pattern for
+  `TCP_KEEPALIVE` / `KEEPALIVE_TIME` in `src/sys/unix.rs:295-320`.
+
+- **Optional `rust-lang/libc` PR** — only if QNX 8.0 headers DO
+  expose these constants under a different name (needs further
+  investigation of `/opt/qnx800/sdp2/target/qnx/usr/include/`). If
+  yes, add the nto80 arm with the actual values; if no, the
+  tokio/socket2 PRs are the entire fix.
+
+Done when:
+- Both upstream PRs merged and a published release of each is in use
+- The local socket2-qnx `[patch.crates-io]` fork (laptop-only,
+  uncommitted) can be removed
+- `cargo build --target x86_64-pc-nto-qnx800 --bin kirra_verifier_service`
+  succeeds against stock upstream crates
+- Binary boots in a QNX 8.0 VM and `/health` returns 200
+
+Tracking: GitHub issue #67, ADL-010 update (2026-05-29).
+
+### Claude Code Prompt
+```
+Target: open upstream PRs against tokio-rs/tokio and rust-lang/socket2
+that gate nto-specific socket code on cfg(target_env = "nto70") /
+"nto71" instead of cfg(target_os = "nto").
+
+Requirements:
+1. Read tokio/src/net/unix/ucred.rs and confirm the impl_netbsd mod
+   (which imports libc::LOCAL_PEEREID) is the only blocker for
+   target_os = "nto" with target_env = "nto80". If so, change the
+   gate to only fire for nto70/nto71.
+2. Read socket2/src/sys/unix.rs and confirm the TCP_KEEPALIVE import
+   has the same structure. Apply the same gate refinement.
+3. For QNX 8.0, choose either (a) return io::Error::Unsupported for
+   the affected code paths, or (b) implement using a QNX 8.0-native
+   API if one exists. Document the choice.
+4. Add a CI matrix entry for x86_64-pc-nto-qnx800 (build-only is
+   acceptable for tier-3) so the gate refinement is enforced going
+   forward.
+5. Reference PARK-024b and ADL-010 in the PR description.
+```
+
+---
+
 ## PARK-025 `qnx` `backend-qnn` `docs`
 
 **QNN + QNX compatibility analysis**
