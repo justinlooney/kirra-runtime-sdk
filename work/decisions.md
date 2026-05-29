@@ -582,4 +582,5 @@ The local `[patch.crates-io] socket2 = { path = "../socket2-qnx" }` in `kirra-ru
   - `needless_range_loop` ×1 (one indexed-loop pattern that auto-fix couldn't rewrite)
 - **`cargo audit`:** 0 vulnerabilities across 268 dependencies (clean)
 - **CI static-analysis job:** pending CERT-002 CI addition
+- **`needless_range_loop` in `security.rs`:** intentionally suppressed via `#[allow]` — `write_volatile` required to prevent dead-code elimination of secret-zeroing loop. Auto-fix would introduce memory-residue side channel. Documented exception per CERT-005 RSR-007.
 

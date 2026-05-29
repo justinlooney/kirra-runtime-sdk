@@ -5,6 +5,15 @@ use std::sync::atomic::{AtomicU8, Ordering};
 pub struct VolatileZeroizer;
 
 impl VolatileZeroizer {
+    #[allow(clippy::needless_range_loop)]
+    // Intentional: uses write_volatile to prevent the compiler from
+    // optimizing away the zeroing loop as dead code after last use.
+    // Replacing with iterator assignment (*item = 0) would allow the
+    // optimizer to elide the write entirely, re-introducing a
+    // memory-residue side channel for secrets cleared before drop.
+    // This is the canonical Rust pattern for secret-zeroing (see zeroize crate).
+    // Per CERT-005 RSR-007: security-critical behavior must not be
+    // altered by style fixes. Do not auto-fix this lint.
     #[inline]
     pub fn zeroize(slice: &mut [u8]) {
         for i in 0..slice.len() {
