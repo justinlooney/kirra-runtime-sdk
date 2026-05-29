@@ -6,7 +6,7 @@ Completed tasks will be appended here weekly.
 
 ## PARK-024 — QNX deployment spike (findings only)
 Completed: 2026-05-28
-Commit: (this commit)
+Commit: ae2fe8d
 Labels: qnx, spike
 Notes: Spike complete; binary-running goal deferred to upstream
 contribution work (PARK-024b). Cross-compilation toolchain confirmed
