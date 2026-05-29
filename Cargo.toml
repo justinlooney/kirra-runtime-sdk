@@ -1,7 +1,13 @@
 [package]
 name = "kirra-runtime-sdk"
-version = "1.5.0"
+version = "1.1.2"
 edition = "2021"
+description = "Vendor-neutral runtime safety kernel for autonomous vehicles, robots, and drones"
+repository = "https://github.com/justinlooney/kirra-runtime-sdk"
+homepage = "https://kirrasystems.com"
+authors = ["Justin Looney <justin@kirrasystems.io>"]
+keywords = ["safety", "autonomous", "robotics", "automotive", "runtime"]
+categories = ["embedded", "safety-critical"]
 
 [lib]
 name = "kirra_runtime_sdk"
