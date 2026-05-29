@@ -545,3 +545,11 @@ source-level MC/DC reporting equivalent to LDRA/BullseyeCoverage for C.
 - Spike workaround: local `[patch.crates-io]` of `socket2` that selects `SO_KEEPALIVE` under `cfg(target_os = "nto")`. This unblocks compilation but is **not semantically correct** — `SO_KEEPALIVE` is socket-level on/off, not the TCP-level idle timer the original constant configures. Acceptable for the spike whose goal is "binary running"; **not acceptable for production**.
 - Proper fix: PR to `rust-lang/libc` exposing `TCP_KEEPALIVE` for `nto-qnx` targets; revert the `socket2` patch once that lands.
 - Tracked: GitHub Issue #66
+
+**Gap #2 — `libc::LOCAL_PEEREID` missing for `nto` target**
+
+- Symptom: `tokio v1.52.3` fails to compile —
+  `error[E0432]: unresolved import 'libc::LOCAL_PEEREID'` at `tokio/src/net/unix/ucred.rs:137`
+- Root cause: same family as Gap #1. `LOCAL_PEEREID` is a BSD-style socket option (`SOL_SOCKET` level) for retrieving Unix-domain-socket peer credentials. QNX inherits the option from its BSD-derived stack, but the `libc` crate has no binding for it under `cfg(target_os = "nto")`.
+- Strategy shift: rather than fork tokio (and every other transitive `libc` consumer to come), patch `libc` directly. One `[patch.crates-io]` override of `libc` unblocks all gap-#1/#2-class compile errors at once. The `socket2` fork is no longer required once `libc` exposes `TCP_KEEPALIVE`; we keep the `socket2` patch until the libc fork is confirmed working, then drop it.
+- Tracked: GitHub Issue #66 (scope expanded to cover both constants)
