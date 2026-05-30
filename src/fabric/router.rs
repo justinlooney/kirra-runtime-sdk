@@ -48,14 +48,34 @@ impl FabricRouter {
         self.governors.insert(asset.asset_id.clone(), governor);
         self.assets.insert(asset.asset_id.clone(), asset.clone());
 
-        // Initialize with Nominal posture until first real posture update
+        // INTERIM seed: Degraded.
+        //
+        // The strict fail-closed default would be LockedOut — but with no
+        // production feed from the verifier's real FleetPosture into fabric
+        // asset postures (follow-up #3), LockedOut would brick every
+        // registered asset until an operator manually pushed a posture.
+        // The registration route (/fabric/assets/register) is admin-token
+        // gated, so the registrant is a trusted operator: Degraded grants
+        // limited, MRC-envelope motion until the first real posture lands.
+        // `evaluate_command` already dispatches Degraded to the asset's
+        // per-profile `mrc_contract()` (RobotNominal→robot MRC,
+        // DroneNominal→drone MRC, etc.) — no flat 5 m/s cap is imposed
+        // here.
+        //
+        // generation: 0 is the never-yet-computed sentinel (identical
+        // convention to `CachedFleetPosture::new` for fleet posture).
+        // The first real engine-driven update supersedes it.
+        //
+        // END STATE (follow-up #3): seed LockedOut and rely on the
+        // verifier→fabric posture feed to lift verified assets to
+        // Nominal. Do NOT make Degraded the permanent default.
         let initial_posture = AssetPosture {
             asset_id: asset.asset_id.clone(),
-            posture: FleetPosture::Nominal,
-            generation: 1,
+            posture: FleetPosture::Degraded,
+            generation: 0,
             computed_at_ms: now_ms(),
             contributing_nodes: vec![],
-            blocked_by: vec![],
+            blocked_by: vec!["UNVERIFIED_PENDING_FIRST_POSTURE".to_string()],
         };
         self.asset_postures.entry(asset.asset_id.clone()).or_insert(initial_posture);
     }
@@ -75,9 +95,54 @@ impl FabricRouter {
         Ok(governor.evaluate_command(cmd, &posture))
     }
 
+    /// Low-level posture write. Used by:
+    ///   - the propagation apply-loop (write-back of derived dependent
+    ///     postures), which MUST NOT recurse, and
+    ///   - any caller that legitimately needs a posture update with no
+    ///     side effects.
+    /// For external/manual posture changes that should trigger dependent
+    /// propagation, use `update_asset_posture_and_propagate`.
     pub fn update_asset_posture(&self, asset_id: &str, posture: AssetPosture) {
         self.asset_postures.insert(asset_id.to_string(), posture);
         self.fabric_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// External-entry posture update with one bounded propagation pass.
+    ///
+    /// Bounded + non-recursive: `propagate_cross_asset_trust` rules fire
+    /// only when the SOURCE asset is `LockedOut` and the changes they
+    /// produce only ever set dependents to `Degraded`. An applied change
+    /// can therefore never become a new propagation source, so one pass
+    /// suffices and cannot recurse.
+    ///
+    /// The apply-loop deliberately writes via the BARE `update_asset_posture`
+    /// — NOT this method — so a propagation pass can never re-trigger
+    /// itself. (a)/(b) already guarantee termination via idempotence; this
+    /// guarantees each external update yields exactly one bounded pass.
+    pub fn update_asset_posture_and_propagate(&self, asset_id: &str, posture: AssetPosture) {
+        self.update_asset_posture(asset_id, posture);
+
+        let changes = self.propagate_cross_asset_trust();
+        for (dependent_id, forced) in changes {
+            if let Some(existing) = self.asset_postures.get(&dependent_id).map(|r| r.clone()) {
+                if existing.posture != forced {
+                    let next_gen = existing.generation.saturating_add(1);
+                    let now = now_ms();
+                    let updated = AssetPosture {
+                        asset_id: dependent_id.clone(),
+                        posture: forced,
+                        generation: next_gen,
+                        computed_at_ms: now,
+                        contributing_nodes: existing.contributing_nodes.clone(),
+                        blocked_by: vec![
+                            "CROSS_ASSET_PROPAGATION_FROM_LOCKED_DEPENDENCY".to_string(),
+                        ],
+                    };
+                    // Bare write — propagation must not re-enter.
+                    self.update_asset_posture(&dependent_id, updated);
+                }
+            }
+        }
     }
 
     pub fn fabric_state(&self) -> FabricState {
@@ -257,11 +322,26 @@ mod tests {
         assert_eq!(state.total_assets, 2);
     }
 
+    fn nominal_posture(id: &str) -> AssetPosture {
+        AssetPosture {
+            asset_id: id.to_string(),
+            posture: FleetPosture::Nominal,
+            generation: 1,
+            computed_at_ms: 500,
+            contributing_nodes: vec![],
+            blocked_by: vec![],
+        }
+    }
+
     #[test]
     fn test_cross_asset_propagation_drone_depends_on_ground_station() {
         let router = FabricRouter::new();
         router.register_asset(&make_asset("gcs01", AssetType::IndustrialController, KinematicProfileType::IndustrialNominal));
         router.register_asset(&make_asset("drone01", AssetType::Drone, KinematicProfileType::DroneNominal));
+        // Registration seeds Degraded; the propagation rule fires only on
+        // a Nominal dependent (a Degraded one needs no further transition).
+        // Push the drone to Nominal so the rule has something to transition.
+        router.update_asset_posture("drone01", nominal_posture("drone01"));
 
         // Lock out the ground control station
         router.update_asset_posture("gcs01", AssetPosture {
@@ -285,6 +365,8 @@ mod tests {
             vec![("convoy_role", "leader")]));
         router.register_asset(&make_asset_with_meta("follower01", AssetType::AutonomousVehicle,
             vec![("convoy_role", "follower")]));
+        // Push follower to Nominal so the rule has something to transition.
+        router.update_asset_posture("follower01", nominal_posture("follower01"));
 
         router.update_asset_posture("leader01", AssetPosture {
             asset_id: "leader01".to_string(),
@@ -306,6 +388,10 @@ mod tests {
         router.register_asset(&make_asset("wh01", AssetType::Warehouse, KinematicProfileType::IndustrialNominal));
         router.register_asset(&make_asset_with_meta("robot01", AssetType::Robot, vec![("warehouse_id", "wh01")]));
         router.register_asset(&make_asset_with_meta("robot02", AssetType::Robot, vec![("warehouse_id", "wh01")]));
+        // Push both robots to Nominal so the propagation rule transitions
+        // them down — they are seeded Degraded by registration.
+        router.update_asset_posture("robot01", nominal_posture("robot01"));
+        router.update_asset_posture("robot02", nominal_posture("robot02"));
 
         router.update_asset_posture("wh01", AssetPosture {
             asset_id: "wh01".to_string(),
@@ -319,6 +405,110 @@ mod tests {
         let changes = router.propagate_cross_asset_trust();
         assert!(changes.iter().any(|(id, p)| id == "robot01" && *p == FleetPosture::Degraded));
         assert!(changes.iter().any(|(id, p)| id == "robot02" && *p == FleetPosture::Degraded));
+    }
+
+    // FIX 1 — registration seed.
+    // A freshly-registered asset MUST start at the Degraded (MRC envelope)
+    // posture and cannot be commanded at the full nominal envelope before
+    // a real posture lands. The Degraded seed grants the per-profile MRC
+    // contract via `AssetGovernor::evaluate_command`, not a flat cap.
+    #[test]
+    fn test_newly_registered_asset_seeded_degraded_with_mrc_envelope() {
+        let router = FabricRouter::new();
+        router.register_asset(&make_asset("r01", AssetType::Robot, KinematicProfileType::RobotNominal));
+
+        let posture = router.asset_postures.get("r01").map(|p| p.clone())
+            .expect("registration must seed a posture");
+        assert_eq!(posture.posture, FleetPosture::Degraded,
+            "registration must seed Degraded (MRC envelope) — not Nominal, not LockedOut");
+        assert_eq!(posture.generation, 0,
+            "fresh registration uses generation: 0 sentinel for never-yet-computed");
+        assert!(posture.blocked_by.iter().any(|s| s == "UNVERIFIED_PENDING_FIRST_POSTURE"),
+            "blocked_by must surface the unverified state, got {:?}", posture.blocked_by);
+
+        // A command that fits the per-profile MRC envelope is allowed.
+        // Robot MRC max_speed = 1.8 * 0.3 = 0.54 m/s, so 0.1 m/s passes.
+        let result = router.route_command("r01", &safe_cmd())
+            .expect("route_command should not error");
+        assert!(matches!(result, EnforceAction::Allow | EnforceAction::ClampLinear { .. } | EnforceAction::ClampSteering { .. }),
+            "MRC-envelope command must not DenyBreach on a freshly registered asset, got {result:?}");
+
+        // A command outside the MRC envelope (full nominal speed) must NOT pass.
+        let over_mrc = ProposedVehicleCommand {
+            linear_velocity_mps: 1.5,
+            current_velocity_mps: 0.0,
+            delta_time_s: 0.1,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        let result = router.route_command("r01", &over_mrc).expect("route_command should not error");
+        assert!(!matches!(result, EnforceAction::Allow),
+            "command above MRC envelope must be clamped or denied on a freshly registered asset, got {result:?}");
+    }
+
+    // FIX 2 — auto-propagation.
+    // A single call to update_asset_posture_and_propagate on a LockedOut
+    // source produces the dependent's Degraded transition WITHOUT a
+    // separate propagate_cross_asset_trust call.
+    #[test]
+    fn test_lockout_auto_propagates_to_dependents_on_update() {
+        let router = FabricRouter::new();
+        router.register_asset(&make_asset("gcs01", AssetType::IndustrialController, KinematicProfileType::IndustrialNominal));
+        router.register_asset(&make_asset("drone01", AssetType::Drone, KinematicProfileType::DroneNominal));
+        // Elevate drone to Nominal so the propagation rule has work to do.
+        router.update_asset_posture("drone01", nominal_posture("drone01"));
+
+        router.update_asset_posture_and_propagate("gcs01", AssetPosture {
+            asset_id: "gcs01".to_string(),
+            posture: FleetPosture::LockedOut,
+            generation: 5,
+            computed_at_ms: 2000,
+            contributing_nodes: vec![],
+            blocked_by: vec!["sensor_x".to_string()],
+        });
+
+        // Drone is now Degraded — no manual propagate call was needed.
+        let drone = router.asset_postures.get("drone01").map(|p| p.clone()).expect("drone present");
+        assert_eq!(drone.posture, FleetPosture::Degraded,
+            "drone must auto-degrade on a single update_asset_posture_and_propagate call");
+        assert!(drone.blocked_by.iter().any(|s| s.contains("CROSS_ASSET_PROPAGATION")),
+            "blocked_by must indicate propagation source, got {:?}", drone.blocked_by);
+    }
+
+    // FIX 2 — termination/idempotence.
+    // A second propagating call (with no external state change) must NOT
+    // produce further cascading changes. Properties (a) and (b) guarantee
+    // this: rules fire only on LockedOut sources, changes are always
+    // Degraded, so an applied change cannot become a new source.
+    #[test]
+    fn test_propagation_pass_terminates_and_is_idempotent() {
+        let router = FabricRouter::new();
+        router.register_asset(&make_asset("gcs01", AssetType::IndustrialController, KinematicProfileType::IndustrialNominal));
+        router.register_asset(&make_asset("drone01", AssetType::Drone, KinematicProfileType::DroneNominal));
+        router.update_asset_posture("drone01", nominal_posture("drone01"));
+
+        let locking = AssetPosture {
+            asset_id: "gcs01".to_string(),
+            posture: FleetPosture::LockedOut,
+            generation: 5,
+            computed_at_ms: 2000,
+            contributing_nodes: vec![],
+            blocked_by: vec!["sensor_x".to_string()],
+        };
+        router.update_asset_posture_and_propagate("gcs01", locking.clone());
+        let drone_after_first = router.asset_postures.get("drone01").map(|p| p.clone()).unwrap();
+        assert_eq!(drone_after_first.posture, FleetPosture::Degraded);
+        let drone_gen_after_first = drone_after_first.generation;
+
+        // Second call with the same posture: drone is already Degraded,
+        // so the propagation pass produces no NEW transition for it. The
+        // drone's generation must not advance.
+        router.update_asset_posture_and_propagate("gcs01", locking);
+        let drone_after_second = router.asset_postures.get("drone01").map(|p| p.clone()).unwrap();
+        assert_eq!(drone_after_second.posture, FleetPosture::Degraded);
+        assert_eq!(drone_after_second.generation, drone_gen_after_first,
+            "second propagation pass must NOT re-degrade an already-Degraded dependent \
+             (generation must not advance)");
     }
 
     #[test]
