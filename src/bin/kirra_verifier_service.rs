@@ -1471,6 +1471,36 @@ async fn main() {
         }
     }
 
+    // One-time, idempotent: anchor the v1/v2 hash boundary in the audit
+    // chain. Active instances only (the anchor is a write; a passive
+    // standby is read-only and must not write — a later promotion path
+    // will run this and no-op via the idempotency guard). Runs AFTER
+    // set_signing_key so the HASH_V2_MIGRATION event itself is signed
+    // and therefore tamper-evident. The two info/error log lines below
+    // are the OBSERVABLE PROOF the wiring is live — operators can
+    // confirm the anchor ran (or was deliberately skipped) from the
+    // startup log alone, since the assembled-app self-test that would
+    // catch a missing call sits behind the build_app extraction follow-up
+    // (#72). Do not remove the log lines.
+    if svc_state.app.is_active() {
+        match svc_state.app.store.lock() {
+            Ok(mut store) => match store.ensure_hash_v2_migration_anchor(now_ms()) {
+                Ok(()) => tracing::info!("audit: hash-v2 migration anchor ensured"),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "audit: hash-v2 migration anchor FAILED at startup"
+                ),
+            },
+            Err(_) => tracing::error!(
+                "audit: hash-v2 migration anchor skipped — store lock poisoned at startup"
+            ),
+        }
+    } else {
+        tracing::info!(
+            "audit: hash-v2 migration anchor skipped — passive standby (read-only)"
+        );
+    }
+
     let identity_gated_routes = Router::new()
         .route("/system/posture/stream", get(system_posture_stream))
         .route("/federation/reports/submit", post(submit_federated_report))
