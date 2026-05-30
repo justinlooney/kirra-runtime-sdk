@@ -4,6 +4,71 @@ Completed tasks will be appended here weekly.
 
 ---
 
+## HA-001 — Durable HA epoch fence (split-brain prevention)
+Completed: 2026-05-30
+Commit: 56e1fa7
+Labels: safety, ha, fix
+Notes: Replaces the in-memory `mode_active` AtomicBool CAS in
+`perform_promotion` (which falsely claimed to "ensure only one standby
+promotes even under split-brain" — a per-process atomic cannot
+coordinate across instances). Adds a singleton `ha_state` row
+(epoch, active_instance_id, updated_at_ms) and a `try_claim_epoch`
+conditional UPDATE that gives a real distributed compare-and-set —
+SQLite serializes write transactions, so two racers reading the same
+observed epoch can never both see `rows_affected == 1`. AppState
+gains `held_epoch: Arc<AtomicU64>`; the gateway mutation gate compares
+held vs current DB epoch on every state-mutating request and
+self-demotes (`mode_active.store(false)`) + returns 503 on mismatch.
+Heartbeat-aware startup arbitration: a configured-Active node defers
+to a live holder rather than steal. Heartbeat writer now performs a
+per-tick proactive epoch check and self-demotes if fenced. Five real
+concurrent-promotion tests added (temp-file SQLite, NOT :memory:).
+Three tautological tests removed (re-tested std AtomicBool /
+assert!(true)). Safety invariant: under partition, clock skew, or a
+restarted old primary, at-most-one-effective-writer holds. Filed
+follow-ups: #79 (epoch-in-write-transaction for top-tier writes,
+closes gate TOCTOU), #80 (clock-skew failover detection — liveness
+only), #81 (full leader election for zero spurious failovers).
+
+---
+
+## AUDIT-002 — Wire hash-v2 migration anchor into verifier service startup
+Completed: 2026-05-30
+Commit: 55e3e9e
+Labels: safety, audit, fix
+Notes: `ensure_hash_v2_migration_anchor` was defined and tested but
+had ZERO production callers — the v1/v2 boundary anchor was never
+written. Wired into `kirra_verifier_service::main` after
+`set_signing_key` (so the HASH_V2_MIGRATION entry is signed) and
+before `axum::serve`. Active-only (passive standby is read-only;
+logs a skip line). Failure is logged loudly, never silently
+swallowed. Both info/error log lines retained as observable proof
+the wiring is live until the build_app extraction (#72) provides
+an automated guard. Promotion-path call deliberately not added in
+this commit — flagged as #78.
+
+---
+
+## AUDIT-001 — Hash-v2 versioned audit chain (bind event_type + sequence)
+Completed: 2026-05-30
+Commit: 6f25437
+Labels: safety, audit, fix
+Notes: v1 hash bound `(previous_hash, event_json, created_at_ms)`
+only — relabeling an entry's `event_type` or shuffling the audit
+table order survived the hash-only integrity check. v2 hashing
+(`canonical_signing_payload_v2`, `compute_record_hash_v2`) is
+length-prefixed + domain-separated ("KIRRA-AUDIT-V2") and binds
+`event_type` + `sequence` into the hash. Non-destructive migration:
+`hash_version INTEGER NOT NULL DEFAULT 1` and nullable `sequence`
+columns added via idempotent ALTER; both verifiers dispatch by
+`hash_version`. `ensure_hash_v2_migration_anchor` writes a one-time
+HASH_V2_MIGRATION boundary marker. Also fixed: `append_audit_event_tx`
+no longer treats `QueryReturnedNoRows` (legitimate genesis) as a read
+error that silently forks the chain. Two test suites added:
+`audit_chain_bypass_tests` and `audit_hash_v2_tests`.
+
+---
+
 ## PARK-024 — QNX deployment spike (findings only)
 Completed: 2026-05-28
 Commit: ae2fe8d
