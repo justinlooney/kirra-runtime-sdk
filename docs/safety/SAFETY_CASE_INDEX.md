@@ -24,6 +24,7 @@ Date: 2026-05-23
 | KIRRA-RTA-001 | ASTM F3269-21 Bounded Operation Mapping (current) | 1.0 | Draft | docs/safety/ASTM_F3269_RTA_MAPPING.md | 2026-05-29 |
 | AEGIS-61508-001 | IEC 61508 SIL 3 Preliminary Claim Mapping | 1.0.0 | Draft | docs/safety/IEC_61508_MAPPING.md | 2026-05-23 |
 | KIRRA-SIL3-001 | IEC 61508 SIL 3 Requirements Mapping (current) | 1.0 | Draft | docs/safety/IEC_61508_SIL3_MAPPING.md | 2026-05-29 |
+| KIRRA-REV-001 | External Security/Safety Review Wrap-Up | 1.0 | Final | docs/safety/REVIEW_WRAPUP_2026-05-30.md | 2026-05-30 |
 
 ---
 
