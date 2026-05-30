@@ -97,6 +97,21 @@ async fn require_client_identity(
 
 // --- Real-time posture stream -----------------------------------------------
 
+/// Sends an event-driven posture recalc trigger to the worker if the
+/// `posture_engine_tx` is initialized (Active path). On PassiveStandby the
+/// OnceLock is unset and this is a no-op — correct, since a standby does
+/// not maintain a posture cache. A `try_send` failure (channel full or
+/// worker gone) is logged; the periodic-refresh loop will fail-close the
+/// cache and gate on its own if the worker has truly died.
+fn enqueue_recalc(svc: &ServiceState, trigger: kirra_runtime_sdk::posture_engine_v2::PostureRecalcTrigger) {
+    if let Some(tx) = svc.posture_engine_tx.get() {
+        if let Err(e) = tx.try_send(trigger) {
+            tracing::warn!(error = %e,
+                "posture recalc trigger: try_send failed (channel full or worker gone)");
+        }
+    }
+}
+
 /// Fail-closed posture read for action/actuator gating sites.
 ///
 /// Delegates to `resolve_posture_with_reason` so the cache-staleness check
@@ -344,6 +359,10 @@ async fn verify_attestation(
         }
     }
     emit_posture_event(&svc.app, "NODE_STATUS_CHANGED", Some(req.node_id.clone()));
+    enqueue_recalc(&svc, kirra_runtime_sdk::posture_engine_v2::PostureRecalcTrigger::NodeTrustChanged {
+        node_id: req.node_id.clone(),
+        reason:  "ATTESTATION_TRUSTED".to_string(),
+    });
 
     (StatusCode::OK, Json(json!({ "node_id": req.node_id, "attested": true }))).into_response()
 }
@@ -411,6 +430,7 @@ async fn register_dependencies(
         }
     }
     emit_posture_event(&svc.app, "DEPENDENCY_GRAPH_MUTATED", Some(req.node_id.clone()));
+    enqueue_recalc(&svc, kirra_runtime_sdk::posture_engine_v2::PostureRecalcTrigger::DependencyGraphChanged);
 
     (StatusCode::OK, Json(json!({ "node_id": req.node_id, "dependencies_registered": true }))).into_response()
 }
@@ -1099,6 +1119,10 @@ async fn handle_sensor_fault_report(
         }
 
         emit_posture_event(&svc.app, "NODE_STATUS_CHANGED", Some(req.source_node_id.clone()));
+        enqueue_recalc(&svc, kirra_runtime_sdk::posture_engine_v2::PostureRecalcTrigger::NodeTrustChanged {
+            node_id: req.source_node_id.clone(),
+            reason:  format!("SENSOR_FAULT:{reason}"),
+        });
 
         return (StatusCode::OK, Json(json!({
             "source_node_id": req.source_node_id,
@@ -1164,6 +1188,10 @@ async fn handle_sensor_fault_report(
             }
 
             emit_posture_event(&svc.app, "NODE_STATUS_CHANGED", Some(req.source_node_id.clone()));
+            enqueue_recalc(&svc, kirra_runtime_sdk::posture_engine_v2::PostureRecalcTrigger::NodeTrustChanged {
+                node_id: req.source_node_id.clone(),
+                reason:  "SENSOR_RECOVERY_CONFIRMED".to_string(),
+            });
         }
         HysteresisDecision::StreakBuilding { .. } | HysteresisDecision::WindowExpired { .. } => {}
         HysteresisDecision::NotApplicable => {
@@ -1439,6 +1467,7 @@ async fn main() {
         fabric_router: Arc::new(FabricRouter::new()),
         fabric_telemetry: Arc::new(FabricTelemetry::new()),
         fabric_causal_log: Arc::new(FabricCausalLog::new(signing_key)),
+        posture_engine_tx: std::sync::OnceLock::new(),
     });
 
     {
@@ -1600,6 +1629,78 @@ async fn main() {
     } else {
         tracing::info!(
             "audit: hash-v2 migration anchor skipped — passive standby (read-only)"
+        );
+    }
+
+    // ── Posture-cache freshness wiring (Active path only) ────────────────
+    //
+    // Without this, a fresh Active primary serves 503 for every functional
+    // route: the posture cache starts as `None`, the routing gate
+    // fail-closes on None or stale, and nothing on the Active path was
+    // populating the cache. The three-part fix:
+    //
+    //   (a) one synchronous initial recalc BEFORE axum::serve so the gate
+    //       has a populated cache on first request,
+    //   (b) the serialized posture-engine worker spawned so event-driven
+    //       triggers (NodeTrustChanged, DependencyGraphChanged, etc.)
+    //       refresh the cache,
+    //   (c) a periodic recompute-and-restamp loop at POSTURE_REFRESH_INTERVAL_MS
+    //       (= TTL/2) — load-bearing: without it the cache goes stale
+    //       one TTL after the last event and the gate fails closed
+    //       fleet-wide. The same loop is the engine-liveness signal: if
+    //       the loop stops (worker dead, channel full repeatedly), the
+    //       cache goes stale and the gate fails closed — the desired
+    //       fail-safe.
+    //
+    // PassiveStandby does not run this — its promotion path already calls
+    // recalculate_and_broadcast once on transition to Active. Ongoing
+    // freshness on the freshly-promoted node is filed as a C2 follow-up.
+    if svc_state.app.is_active() {
+        kirra_runtime_sdk::posture_engine::recalculate_and_broadcast(
+            &svc_state.app,
+            &svc_state.posture_cache,
+        );
+        tracing::info!("posture: initial recalc complete; cache populated");
+
+        let posture_tx = kirra_runtime_sdk::posture_engine_v2::start_posture_engine_worker(
+            Arc::clone(&svc_state.app),
+            Arc::clone(&svc_state.posture_cache),
+        );
+        svc_state
+            .posture_engine_tx
+            .set(posture_tx.clone())
+            .expect("posture_engine_tx must not be set before startup wiring");
+        tracing::info!("posture: serialized worker started");
+
+        let refresh_tx = posture_tx;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(
+                kirra_runtime_sdk::posture_cache::POSTURE_REFRESH_INTERVAL_MS,
+            ));
+            // First tick fires immediately; skip it (the synchronous
+            // initial recalc above already covered cold start).
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if refresh_tx
+                    .try_send(kirra_runtime_sdk::posture_engine_v2::PostureRecalcTrigger::PeriodicRefresh)
+                    .is_err()
+                {
+                    tracing::error!(
+                        "posture periodic refresh: worker channel unavailable — \
+                         cache will go stale (gate will fail-close fleet-wide)"
+                    );
+                }
+            }
+        });
+        tracing::info!(
+            interval_ms = kirra_runtime_sdk::posture_cache::POSTURE_REFRESH_INTERVAL_MS,
+            ttl_ms = kirra_runtime_sdk::posture_cache::POSTURE_CACHE_TTL_MS,
+            "posture: periodic refresh loop started"
+        );
+    } else {
+        tracing::info!(
+            "posture: freshness wiring skipped — passive standby (no recalc/worker/refresh)"
         );
     }
 

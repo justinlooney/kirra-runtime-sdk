@@ -40,6 +40,19 @@ use crate::gateway::policy::OperationalCommand;
 /// considered stale and resolve_posture fails closed.
 pub const POSTURE_CACHE_TTL_MS: u64 = 5_000;
 
+/// Cadence at which the Active primary's liveness loop sends a
+/// `PostureRecalcTrigger::PeriodicRefresh` to re-stamp the cache. MUST be
+/// strictly less than POSTURE_CACHE_TTL_MS — set to ~half the TTL so the
+/// gate's staleness check has comfortable headroom for jitter or a single
+/// missed tick. Without this refresh the gate fail-closes one TTL after the
+/// last event-driven recalc and the service goes dark (503 fleet-wide).
+pub const POSTURE_REFRESH_INTERVAL_MS: u64 = POSTURE_CACHE_TTL_MS / 2;
+
+const _: () = assert!(
+    POSTURE_REFRESH_INTERVAL_MS < POSTURE_CACHE_TTL_MS,
+    "POSTURE_REFRESH_INTERVAL_MS must be strictly less than POSTURE_CACHE_TTL_MS"
+);
+
 // ---------------------------------------------------------------------------
 // CachedFleetPosture
 // ---------------------------------------------------------------------------
@@ -138,6 +151,17 @@ pub struct ServiceState {
     pub fabric_router: Arc<FabricRouter>,
     pub fabric_telemetry: Arc<FabricTelemetry>,
     pub fabric_causal_log: Arc<FabricCausalLog>,
+    /// Channel to the serialized posture-engine worker. Populated by the
+    /// Active startup path via `OnceLock::set` AFTER the `ServiceState` is
+    /// already wrapped in `Arc` (the worker spawn needs Arc<AppState>).
+    /// `get() == None` on PassiveStandby (no worker is spawned until the
+    /// standby promotes). Handlers that mutate trust state, dependency
+    /// graph, or other recalc-relevant state call `.get()` and `try_send`
+    /// a `PostureRecalcTrigger` so the cache stays in sync with the DAG
+    /// truth. A `try_send` failure means the worker is gone or its
+    /// channel is full; the gate fail-closes on the resulting stale cache.
+    pub posture_engine_tx:
+        std::sync::OnceLock<crate::posture_engine_v2::PostureEngineSender>,
 }
 
 /// Returns current time as milliseconds since UNIX epoch.

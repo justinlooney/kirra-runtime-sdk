@@ -30,6 +30,7 @@ fn build_state(posture: FleetPosture) -> Arc<ServiceState> {
         fabric_router: Arc::new(kirra_runtime_sdk::fabric::router::FabricRouter::new()),
         fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
         fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
+        posture_engine_tx: std::sync::OnceLock::new(),
     })
 }
 
@@ -44,6 +45,7 @@ fn build_state_empty_cache() -> Arc<ServiceState> {
         fabric_router: Arc::new(kirra_runtime_sdk::fabric::router::FabricRouter::new()),
         fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
         fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
+        posture_engine_tx: std::sync::OnceLock::new(),
     })
 }
 

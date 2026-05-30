@@ -156,6 +156,12 @@ pub enum PostureRecalcTrigger {
     /// An RSS safe-distance evaluation result (violation or recovery tick).
     /// safe==false activates the violation flag; safe==true advances recovery streak.
     RssViolation(RssState),
+    /// Periodic liveness refresh — recompute and re-stamp the cache so it
+    /// never idles past POSTURE_CACHE_TTL_MS. Not tied to any state change.
+    /// A no-change recompute produces no transition (no broadcast) but DOES
+    /// re-stamp `generated_at_ms` under a new generation, which is the
+    /// freshness signal `should_route_command` depends on.
+    PeriodicRefresh,
 }
 
 impl fmt::Display for PostureRecalcTrigger {
@@ -172,6 +178,8 @@ impl fmt::Display for PostureRecalcTrigger {
             Self::RssViolation(rss) =>
                 write!(f, "RssViolation(safe={}, lon={:.2}, lat={:.2})",
                     rss.safe, rss.longitudinal_margin, rss.lateral_margin),
+            Self::PeriodicRefresh =>
+                write!(f, "PeriodicRefresh"),
         }
     }
 }
@@ -422,5 +430,51 @@ mod posture_engine_v2_tests {
         let _ = tx.try_send(PostureRecalcTrigger::DependencyGraphChanged);
         let result = tx.try_send(PostureRecalcTrigger::DependencyGraphChanged);
         assert!(result.is_err(), "full channel must return error");
+    }
+
+    #[test]
+    fn test_periodic_refresh_display_is_distinct() {
+        let s = PostureRecalcTrigger::PeriodicRefresh.to_string();
+        assert_eq!(s, "PeriodicRefresh",
+            "PeriodicRefresh Display must be the bare variant name (no state to print)");
+    }
+
+    /// PeriodicRefresh on an Active instance must re-stamp the cache —
+    /// strictly-increasing generation and updated `generated_at_ms` — but
+    /// NOT cause a posture change when state is unchanged. The first call
+    /// populates from `None`; the second call updates only the generation
+    /// (posture stays Nominal). Proves the gate's staleness check will
+    /// observe a fresh entry after each tick.
+    #[tokio::test]
+    async fn test_periodic_refresh_restamps_cache_without_changing_posture() {
+        use std::sync::Arc;
+        use crate::verifier::{AppState, FleetPosture, VerifierOperationMode};
+        use crate::verifier_store::VerifierStore;
+        use crate::posture_cache::SharedPostureCache;
+
+        let store = VerifierStore::new(":memory:").unwrap();
+        let app = Arc::new(AppState::new(store, VerifierOperationMode::Active));
+        let cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(None));
+
+        crate::posture_engine::recalculate_and_broadcast(&app, &cache);
+        let first = cache.read().unwrap().as_ref().cloned()
+            .expect("initial recalc must populate the cache");
+        assert_eq!(first.posture, FleetPosture::Nominal);
+
+        // Wait so generated_at_ms can advance; not strictly required since
+        // the generation already increments, but proves the re-stamp.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        crate::posture_engine::recalculate_and_broadcast(&app, &cache);
+        let second = cache.read().unwrap().as_ref().cloned()
+            .expect("periodic refresh must keep the cache populated");
+
+        assert!(second.generation > first.generation,
+            "periodic refresh must produce a strictly-increasing generation \
+             (was {} → {})", first.generation, second.generation);
+        assert!(second.generated_at_ms >= first.generated_at_ms,
+            "periodic refresh must re-stamp generated_at_ms (monotonic)");
+        assert_eq!(second.posture, FleetPosture::Nominal,
+            "PeriodicRefresh on unchanged state must NOT alter the cached posture");
     }
 }
