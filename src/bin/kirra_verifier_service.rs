@@ -660,16 +660,25 @@ async fn evaluate_industrial_adapter(
                     "lockout_reason": lockout_reason.as_ref().map(|r| r.to_string()),
                     "audit_ref": audit_ref,
                 });
-                if let Ok(mut store) = svc.app.store.lock() {
-                    let event_type = if result.allowed {
-                        "INDUSTRIAL_ACTION_ALLOWED_BROADCAST"
-                    } else {
-                        "INDUSTRIAL_ACTION_DENIED"
-                    };
-                    let _ = store.save_posture_event_chained(
-                        "industrial_adapter", event_type,
-                        &audit.to_string(), None, now_ms(),
-                    );
+                let event_type = if result.allowed {
+                    "INDUSTRIAL_ACTION_ALLOWED_BROADCAST"
+                } else {
+                    "INDUSTRIAL_ACTION_DENIED"
+                };
+                match svc.app.store.lock() {
+                    Ok(mut store) => {
+                        if let Err(e) = store.save_posture_event_chained(
+                            "industrial_adapter", event_type,
+                            &audit.to_string(), None, now_ms(),
+                        ) {
+                            tracing::error!(error = %e, event_type = event_type,
+                                "AUDIT-CHAIN WRITE FAILED for industrial adapter event — event missing from tamper-evident log");
+                        }
+                    }
+                    Err(_) => {
+                        tracing::error!(event_type = event_type,
+                            "industrial adapter: store lock poisoned — audit write SKIPPED for this event");
+                    }
                 }
             }
 
@@ -718,18 +727,28 @@ async fn evaluate_ethernet_ip_adapter(
     let audit_ref = now_ms().to_string();
 
     if !allowed {
-        if let Ok(mut store) = svc.app.store.lock() {
-            let _ = store.save_posture_event_chained(
-                "ethernet_ip_adapter", "INDUSTRIAL_ACTION_DENIED",
-                &json!({
-                    "service_name": eval.service_name,
-                    "safety_relevant": eval.safety_relevant,
-                    "posture": posture_str,
-                    "denial_reason": denial_reason,
-                    "lockout_reason": lockout_reason.as_ref().map(|r| r.to_string()),
-                }).to_string(),
-                None, now_ms(),
-            );
+        match svc.app.store.lock() {
+            Ok(mut store) => {
+                if let Err(e) = store.save_posture_event_chained(
+                    "ethernet_ip_adapter", "INDUSTRIAL_ACTION_DENIED",
+                    &json!({
+                        "service_name": eval.service_name,
+                        "safety_relevant": eval.safety_relevant,
+                        "posture": posture_str,
+                        "denial_reason": denial_reason,
+                        "lockout_reason": lockout_reason.as_ref().map(|r| r.to_string()),
+                    }).to_string(),
+                    None, now_ms(),
+                ) {
+                    tracing::error!(error = %e, event_type = "INDUSTRIAL_ACTION_DENIED",
+                        "AUDIT-CHAIN WRITE FAILED for ethernet_ip adapter event — event missing from tamper-evident log");
+                }
+            }
+            Err(_) => {
+                tracing::error!(
+                    "ethernet_ip adapter: store lock poisoned — audit write SKIPPED for this denial"
+                );
+            }
         }
     }
 
@@ -772,25 +791,55 @@ async fn evaluate_canopen_adapter(
     let audit_ref = now_ms().to_string();
 
     if !allowed || eval.triggers_recalculation {
-        if let Ok(mut store) = svc.app.store.lock() {
-            let event_type = if eval.triggers_recalculation {
-                "CANOPEN_NMT_NODE_OFFLINE"
-            } else {
-                "INDUSTRIAL_ACTION_DENIED"
-            };
-            let _ = store.save_posture_event_chained(
-                "canopen_adapter", event_type,
-                &json!({
-                    "node_id": eval.node_id,
-                    "message_type": format!("{:?}", eval.message_type),
-                    "is_emergency": eval.is_emergency,
-                    "triggers_recalculation": eval.triggers_recalculation,
-                    "posture": posture_str,
-                    "lockout_reason": lockout_reason.as_ref().map(|r| r.to_string()),
-                }).to_string(),
-                None, now_ms(),
-            );
+        match svc.app.store.lock() {
+            Ok(mut store) => {
+                let event_type = if eval.triggers_recalculation {
+                    "CANOPEN_NMT_NODE_OFFLINE"
+                } else {
+                    "INDUSTRIAL_ACTION_DENIED"
+                };
+                if let Err(e) = store.save_posture_event_chained(
+                    "canopen_adapter", event_type,
+                    &json!({
+                        "node_id": eval.node_id,
+                        "message_type": format!("{:?}", eval.message_type),
+                        "is_emergency": eval.is_emergency,
+                        "triggers_recalculation": eval.triggers_recalculation,
+                        "posture": posture_str,
+                        "lockout_reason": lockout_reason.as_ref().map(|r| r.to_string()),
+                    }).to_string(),
+                    None, now_ms(),
+                ) {
+                    tracing::error!(error = %e, event_type = event_type,
+                        "AUDIT-CHAIN WRITE FAILED for canopen adapter event — event missing from tamper-evident log");
+                }
+            }
+            Err(_) => {
+                tracing::error!(
+                    "canopen adapter: store lock poisoned — audit write SKIPPED for this event"
+                );
+            }
         }
+    }
+
+    // CANopen NMT node-offline / reset surfaces an underlying-fleet change,
+    // but there is no production CANopen-bus-address → fleet-node-id
+    // mapping in this repo today. The honest minimal wiring is to enqueue
+    // a `DependencyGraphChanged` so the freshness pipeline runs — but
+    // because no underlying state changed, the resulting recalc recomputes
+    // the SAME posture. This is a partial fix; tracked as follow-up so the
+    // recalc becomes effectful once the mapping exists.
+    if eval.triggers_recalculation {
+        tracing::warn!(
+            canopen_node_id = eval.node_id,
+            source_node     = %msg.source_node,
+            "CANopen NMT node-offline triggers recalc, but no CANopen→fleet-node \
+             mapping exists yet — recalc is a no-op until that mapping is defined"
+        );
+        enqueue_recalc(
+            &svc,
+            kirra_runtime_sdk::posture_engine_v2::PostureRecalcTrigger::DependencyGraphChanged,
+        );
     }
 
     Json(json!({
@@ -833,25 +882,34 @@ async fn evaluate_dnp3_adapter(
     let audit_ref = now_ms().to_string();
 
     if !allowed || eval.is_broadcast {
-        if let Ok(mut store) = svc.app.store.lock() {
-            let event_type = if eval.is_broadcast {
-                "DNP3_BROADCAST_COMMAND"
-            } else {
-                "INDUSTRIAL_ACTION_DENIED"
-            };
-            let _ = store.save_posture_event_chained(
-                "dnp3_adapter", event_type,
-                &json!({
-                    "function_name": eval.function_name,
-                    "is_broadcast": eval.is_broadcast,
-                    "is_control": eval.is_control,
-                    "critical_infrastructure_relevant": eval.critical_infrastructure_relevant,
-                    "dest_address": msg.dest_address,
-                    "posture": posture_str,
-                    "lockout_reason": lockout_reason.as_ref().map(|r| r.to_string()),
-                }).to_string(),
-                None, now_ms(),
-            );
+        let event_type = if eval.is_broadcast {
+            "DNP3_BROADCAST_COMMAND"
+        } else {
+            "INDUSTRIAL_ACTION_DENIED"
+        };
+        match svc.app.store.lock() {
+            Ok(mut store) => {
+                if let Err(e) = store.save_posture_event_chained(
+                    "dnp3_adapter", event_type,
+                    &json!({
+                        "function_name": eval.function_name,
+                        "is_broadcast": eval.is_broadcast,
+                        "is_control": eval.is_control,
+                        "critical_infrastructure_relevant": eval.critical_infrastructure_relevant,
+                        "dest_address": msg.dest_address,
+                        "posture": posture_str,
+                        "lockout_reason": lockout_reason.as_ref().map(|r| r.to_string()),
+                    }).to_string(),
+                    None, now_ms(),
+                ) {
+                    tracing::error!(error = %e, event_type = event_type,
+                        "AUDIT-CHAIN WRITE FAILED for dnp3 adapter event — event missing from tamper-evident log");
+                }
+            }
+            Err(_) => {
+                tracing::error!(event_type = event_type,
+                    "dnp3 adapter: store lock poisoned — audit write SKIPPED for this event");
+            }
         }
     }
 

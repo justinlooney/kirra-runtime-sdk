@@ -28,6 +28,23 @@ impl ProtocolAdapter for ModbusTcpAdapter {
     }
 
     fn encode_response(&self, sanitized_value: f64, original_frame: &[u8]) -> Vec<u8> {
+        // Defense-in-depth: indexing bytes [10]/[11] requires len >= 12.
+        // The wired call path goes through `decode_demand` first, which
+        // already enforces FrameTruncated on len < 12 — so this guard is
+        // unreachable today. Keep it anyway: a safety component cannot
+        // rely on caller discipline for memory safety, and a future
+        // caller that skips decode must NOT panic the verifier.
+        if original_frame.len() < 12 {
+            // Runtime guard is the contract: a safety component must NEVER
+            // panic on caller error in either debug or release. (No
+            // `debug_assert!` here — it would panic under `cargo test` and
+            // contradict the no-panic invariant exercised below.)
+            tracing::error!(
+                len = original_frame.len(),
+                "modbus encode_response: under-length frame — returning unmodified (no sanitization applied)"
+            );
+            return original_frame.to_vec();
+        }
         let mut modified_buffer = original_frame.to_vec();
         let raw_counts = (sanitized_value * self.scale_factor).round();
         let safe_u16_bytes = (raw_counts.clamp(0.0, 65535.0) as u16).to_be_bytes();
@@ -49,5 +66,42 @@ impl ProtocolAdapter for ModbusTcpAdapter {
         exception_buffer.push(original_frame[7] | 0x80);
         exception_buffer.push(exception_code);
         exception_buffer
+    }
+}
+
+#[cfg(test)]
+mod modbus_adapter_tests {
+    use super::*;
+
+    /// Under-length frames must NOT panic the verifier. The wired call path
+    /// gates on `decode_demand`'s len>=12 check, but a safety component
+    /// cannot rely on caller discipline for memory safety.
+    #[test]
+    fn test_encode_response_short_frame_does_not_panic() {
+        let adapter = ModbusTcpAdapter::new(0, 1.0);
+        let short_frame: [u8; 8] = [0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x06];
+        let out = adapter.encode_response(42.0, &short_frame);
+        assert_eq!(out.as_slice(), &short_frame[..],
+            "under-length frame must be returned unmodified, not panic or partially written");
+    }
+
+    /// Empty frame is also handled — exercises the extreme of the guard.
+    #[test]
+    fn test_encode_response_empty_frame_does_not_panic() {
+        let adapter = ModbusTcpAdapter::new(0, 1.0);
+        let out = adapter.encode_response(42.0, &[]);
+        assert!(out.is_empty(),
+            "empty-frame input must return empty-frame output without panic");
+    }
+
+    /// Sanity: a well-formed 12-byte frame still works end-to-end.
+    #[test]
+    fn test_encode_response_writes_clamped_value_into_bytes_10_11() {
+        let adapter = ModbusTcpAdapter::new(0, 1.0);
+        let frame: [u8; 12] = [0, 1, 0, 0, 0, 6, 1, 6, 0, 0, 0xFF, 0xFF];
+        let out = adapter.encode_response(1.0, &frame);
+        assert_eq!(out.len(), 12);
+        assert_eq!(out[10], 0x00);
+        assert_eq!(out[11], 0x01);
     }
 }
