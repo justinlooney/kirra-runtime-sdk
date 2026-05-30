@@ -42,7 +42,9 @@ use kirra_runtime_sdk::federation::{
 };
 use kirra_runtime_sdk::standby_monitor::{spawn_heartbeat_writer, spawn_promotion_monitor};
 use kirra_runtime_sdk::gateway::kinematics_contract::ProposedVehicleCommand;
-use kirra_runtime_sdk::gateway::policy_layer::enforce_actuator_safety_envelope;
+use kirra_runtime_sdk::gateway::policy_layer::{
+    enforce_actuator_safety_envelope, enforce_posture_routing,
+};
 use kirra_runtime_sdk::recovery_hysteresis::{evaluate_recovery_report, HysteresisDecision};
 use kirra_runtime_sdk::fabric::asset::{AssetPosture, AssetType, FabricAsset, KinematicProfileType};
 use kirra_runtime_sdk::fabric::router::FabricRouter;
@@ -1519,8 +1521,18 @@ async fn main() {
         .merge(actuator_routes)
         .merge(attestation_routes)
         .merge(read_routes)
-        .with_state(svc_state)
-        .layer(cors);
+        .with_state(svc_state.clone())
+        .layer(cors)
+        // Outermost layer: command-classification + posture-routing gate.
+        // Runs BEFORE auth and the actuator envelope on every request;
+        // is_posture_exempt allowlists liveness / observability paths so
+        // probes stay reachable regardless of fleet posture. Returns 503
+        // SERVICE_UNAVAILABLE on denial (transient server-state condition,
+        // retryable once posture recovers).
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&svc_state),
+            enforce_posture_routing,
+        ));
 
     println!("Kirra Verifier Service listening on {listen_addr} (db: {db_path})");
     let listener = tokio::net::TcpListener::bind(&listen_addr).await
