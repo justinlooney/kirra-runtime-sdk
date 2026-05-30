@@ -6,6 +6,28 @@ pub struct RssState {
     pub lateral_margin: f64,
 }
 
+// ---------------------------------------------------------------------------
+// Fail-safe defence in depth
+// ---------------------------------------------------------------------------
+
+/// Returned when RSS inputs are invalid or a computation is non-finite.
+/// A deliberately unreachable required separation: forces the governor to
+/// treat the situation as unsafe (clamp / stop) rather than ever reading a
+/// misconfiguration as "no gap required". Large but FINITE so it does not
+/// propagate Inf / NaN downstream.
+///
+/// Background: every safe-distance computation here divides by a brake or
+/// lateral-accel parameter. If that parameter is zero, the division yields
+/// NaN; `NaN.max(0.0) == 0.0` in Rust, which would silently report that no
+/// gap is required (the unsafe direction). On any invalid input we instead
+/// return this large finite distance — the governor will clamp or stop.
+pub const RSS_FAILSAFE_DISTANCE_M: f64 = 1.0e6;
+
+#[inline]
+fn finite_positive(x: f64) -> bool {
+    x.is_finite() && x > 0.0
+}
+
 /// Computes the lateral RSS safe-distance per IEEE 2846-2022 §5.2.
 ///
 /// Returns the minimum required lateral separation (metres) between ego and
@@ -16,14 +38,37 @@ pub struct RssState {
 /// Parameters:
 ///   ego_lat_vel   — ego lateral velocity (m/s, signed)
 ///   obj_lat_vel   — object lateral velocity (m/s, signed)
-///   lat_accel_max — maximum lateral acceleration / deceleration (m/s²)
-///   reaction_time — actor reaction / response time (s)
+///   lat_accel_max — maximum lateral acceleration / deceleration (m/s²);
+///                   must be finite and > 0 or this function fails safe
+///   reaction_time — actor reaction / response time (s); must be finite
+///
+/// On any invalid input (non-finite, or `lat_accel_max <= 0`) returns
+/// `RSS_FAILSAFE_DISTANCE_M`. This is defence in depth — the primary
+/// defence is validating the asset profile at load time (see module-level
+/// note about the absence of a profile loader as of this writing).
 pub fn lateral_safe_distance(
     ego_lat_vel: f64,
     obj_lat_vel: f64,
     lat_accel_max: f64,
     reaction_time: f64,
 ) -> f64 {
+    // Note: no debug_assert! here. The runtime guard below is the
+    // authoritative safety contract; a debug_assert! would panic in
+    // dev/test builds for the very inputs the fail-safe tests drive
+    // (zero / non-finite divisors), making the tested fail-safe path
+    // unreachable from #[cfg(test)] code.
+    if !(finite_positive(lat_accel_max)
+        && ego_lat_vel.is_finite()
+        && obj_lat_vel.is_finite()
+        && reaction_time.is_finite())
+    {
+        // TODO: route this through the project's safety-event / telemetry
+        // channel so a bad parameter is loudly visible, not silently
+        // absorbed. No such channel exists in parko-core today; tracked
+        // as a follow-up alongside the missing asset-profile loader.
+        return RSS_FAILSAFE_DISTANCE_M;
+    }
+
     let lateral_stop_distance = |lat_vel: f64| -> f64 {
         let v = lat_vel.abs();
         let d_reaction = v * reaction_time + 0.5 * lat_accel_max * reaction_time.powi(2);
@@ -32,6 +77,9 @@ pub fn lateral_safe_distance(
         d_reaction + d_brake
     };
     let margin = lateral_stop_distance(ego_lat_vel) + lateral_stop_distance(obj_lat_vel);
+    if !margin.is_finite() {
+        return RSS_FAILSAFE_DISTANCE_M;
+    }
     margin.max(0.0)
 }
 
@@ -42,12 +90,18 @@ pub fn lateral_safe_distance(
 /// pulling away fast enough that no gap is needed.
 ///
 /// Parameters:
-///   ego_vel       — ego longitudinal velocity (m/s)
-///   lead_vel      — lead-vehicle longitudinal velocity (m/s)
-///   reaction_time — ego reaction / response time (s)
-///   accel_max     — maximum ego acceleration during response phase (m/s²)
-///   brake_min     — minimum ego braking deceleration after response (m/s²)
-///   brake_max     — maximum lead-vehicle braking deceleration (m/s²)
+///   ego_vel       — ego longitudinal velocity (m/s); must be finite
+///   lead_vel      — lead-vehicle longitudinal velocity (m/s); must be finite
+///   reaction_time — ego reaction / response time (s); must be finite
+///   accel_max     — maximum ego acceleration during response phase (m/s²);
+///                   must be finite (may be 0.0)
+///   brake_min     — minimum ego braking deceleration after response (m/s²);
+///                   must be finite and > 0 or this function fails safe
+///   brake_max     — maximum lead-vehicle braking deceleration (m/s²);
+///                   must be finite and > 0 or this function fails safe
+///
+/// On any invalid input (non-finite, or `brake_min <= 0`, or
+/// `brake_max <= 0`) returns `RSS_FAILSAFE_DISTANCE_M`.
 pub fn longitudinal_safe_distance(
     ego_vel: f64,
     lead_vel: f64,
@@ -56,12 +110,28 @@ pub fn longitudinal_safe_distance(
     brake_min: f64,
     brake_max: f64,
 ) -> f64 {
-    let d_response = ego_vel * reaction_time
-        + 0.5 * accel_max * reaction_time.powi(2);
+    // See lateral note: no debug_assert! — runtime guard is the contract.
+    if !(finite_positive(brake_min)
+        && finite_positive(brake_max)
+        && ego_vel.is_finite()
+        && lead_vel.is_finite()
+        && reaction_time.is_finite()
+        && accel_max.is_finite())
+    {
+        // TODO: surface through a safety-event channel — see lateral.
+        return RSS_FAILSAFE_DISTANCE_M;
+    }
+
+    let d_response = ego_vel * reaction_time + 0.5 * accel_max * reaction_time.powi(2);
     let v_after = ego_vel + accel_max * reaction_time;
     let d_brake_ego = v_after.powi(2) / (2.0 * brake_min);
     let d_brake_lead = lead_vel.powi(2) / (2.0 * brake_max);
-    (d_response + d_brake_ego - d_brake_lead).max(0.0)
+
+    let raw = d_response + d_brake_ego - d_brake_lead;
+    if !raw.is_finite() {
+        return RSS_FAILSAFE_DISTANCE_M;
+    }
+    raw.max(0.0)
 }
 
 #[cfg(test)]
@@ -189,5 +259,75 @@ mod tests {
         let result = lateral_safe_distance(30.0, -25.0, 6.0, 0.5);
         assert!(result.is_finite(), "large velocities: result must be finite, got {result}");
         assert!(result >= 0.0, "result must be non-negative, got {result}");
+    }
+
+    // ── fail-safe on invalid inputs ─────────────────────────────────────────
+    //
+    // The unsafe direction for these functions is "report a small required
+    // gap (or 0.0) when the inputs were actually invalid". On any invalid
+    // input we instead return RSS_FAILSAFE_DISTANCE_M (a deliberately
+    // unreachable required separation) so the governor clamps / stops.
+
+    /// brake_min = 0 with stationary ego (raw numerator would be 0) must NOT
+    /// collapse to 0.0 via the NaN→0.0 sink — must fail safe.
+    #[test]
+    fn test_long_zero_brake_min_is_failsafe_not_zero() {
+        let r = longitudinal_safe_distance(0.0, 0.0, 0.5, 3.0, 0.0, 8.0);
+        assert!(
+            r >= RSS_FAILSAFE_DISTANCE_M,
+            "zero brake_min must fail safe (unreachable distance), got {r}"
+        );
+    }
+
+    /// brake_max = 0 must fail safe (lead-brake divisor → NaN otherwise).
+    #[test]
+    fn test_long_zero_brake_max_is_failsafe_not_zero() {
+        let r = longitudinal_safe_distance(10.0, 5.0, 0.5, 3.0, 6.0, 0.0);
+        assert!(
+            r >= RSS_FAILSAFE_DISTANCE_M,
+            "zero brake_max must fail safe, got {r}"
+        );
+    }
+
+    /// NaN input to longitudinal_safe_distance must yield the fail-safe
+    /// distance, never 0.0.
+    #[test]
+    fn test_long_nan_input_is_failsafe() {
+        let r = longitudinal_safe_distance(f64::NAN, 10.0, 0.5, 3.0, 6.0, 8.0);
+        assert!(
+            r >= RSS_FAILSAFE_DISTANCE_M,
+            "NaN ego_vel must fail safe, got {r}"
+        );
+    }
+
+    /// Negative brake_min (would be physically nonsensical) must fail safe.
+    #[test]
+    fn test_long_negative_brake_min_is_failsafe() {
+        let r = longitudinal_safe_distance(10.0, 5.0, 0.5, 3.0, -6.0, 8.0);
+        assert!(
+            r >= RSS_FAILSAFE_DISTANCE_M,
+            "negative brake_min must fail safe, got {r}"
+        );
+    }
+
+    /// lat_accel_max = 0 with stationary actors (raw numerator would be 0)
+    /// must fail safe — the 0/0 NaN would otherwise collapse to 0.0 m.
+    #[test]
+    fn test_lat_zero_accel_is_failsafe() {
+        let r = lateral_safe_distance(0.0, 0.0, 0.0, 0.5);
+        assert!(
+            r >= RSS_FAILSAFE_DISTANCE_M,
+            "zero lat_accel_max must fail safe, got {r}"
+        );
+    }
+
+    /// NaN reaction_time on lateral must fail safe.
+    #[test]
+    fn test_lat_nan_input_is_failsafe() {
+        let r = lateral_safe_distance(3.0, 1.0, 4.0, f64::NAN);
+        assert!(
+            r >= RSS_FAILSAFE_DISTANCE_M,
+            "NaN reaction_time must fail safe, got {r}"
+        );
     }
 }
