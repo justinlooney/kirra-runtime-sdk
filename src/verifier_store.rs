@@ -107,6 +107,27 @@ impl VerifierStore {
             [],
         )?;
 
+        // HA fencing token (durable epoch). Singleton row (CHECK id = 1).
+        // The `epoch` column is the source of truth for "which generation of
+        // Active currently owns writes." Promotion bumps it via a conditional
+        // UPDATE (rows_affected == 1 → durable compare-and-set). Active
+        // instances cache their claimed epoch in `AppState::held_epoch`; the
+        // mutation gate fails closed when held != current.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ha_state (
+                id                 INTEGER PRIMARY KEY CHECK (id = 1),
+                epoch              INTEGER NOT NULL DEFAULT 0,
+                active_instance_id TEXT,
+                updated_at_ms      INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO ha_state (id, epoch, active_instance_id, updated_at_ms)
+             VALUES (1, 0, NULL, 0)",
+            [],
+        )?;
+
         Self::init_audit_chain_schema(&conn)?;
 
         conn.execute_batch(
@@ -1087,6 +1108,61 @@ impl VerifierStore {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    // --- HA epoch fence (durable split-brain guard) -------------------------
+    //
+    // SQLite serializes write transactions, so a conditional UPDATE on the
+    // singleton `ha_state` row gives a real distributed compare-and-set:
+    // two racers that both read the same `observed` epoch will serialize at
+    // commit time and only one of them will see `rows_affected == 1`.
+    // The atomic on AppState is per-process and CANNOT do this — that is
+    // why we keep the durable epoch as source of truth.
+
+    /// Current durable HA epoch. Source of truth for "who owns writes."
+    pub fn current_epoch(&self) -> Result<u64> {
+        let e: i64 = self.conn.query_row(
+            "SELECT epoch FROM ha_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(e as u64)
+    }
+
+    /// Returns (current_epoch, active_instance_id) for startup arbitration.
+    pub fn current_active_holder(&self) -> Result<(u64, Option<String>)> {
+        let (e, holder): (i64, Option<String>) = self.conn.query_row(
+            "SELECT epoch, active_instance_id FROM ha_state WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((e as u64, holder))
+    }
+
+    /// Conditional claim: bump epoch from `observed` to `observed + 1` and
+    /// record this instance as the new holder, IFF the DB epoch still equals
+    /// `observed`. Returns the new epoch on a win, or None if another
+    /// instance already moved the epoch (claim aborted, fence held).
+    ///
+    /// `rows_affected == 1` is the durable compare-and-set: two concurrent
+    /// callers reading the same `observed` will serialize at the write
+    /// transaction boundary and only one will see the row update.
+    pub fn try_claim_epoch(
+        &mut self,
+        observed: u64,
+        instance_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<u64>> {
+        let n = self.conn.execute(
+            "UPDATE ha_state SET epoch = epoch + 1, active_instance_id = ?2, updated_at_ms = ?3 \
+             WHERE id = 1 AND epoch = ?1",
+            params![observed as i64, instance_id, now_ms as i64],
+        )?;
+        if n == 1 {
+            Ok(Some(observed + 1))
+        } else {
+            Ok(None)
+        }
     }
 
     // --- Fabric asset persistence -------------------------------------------

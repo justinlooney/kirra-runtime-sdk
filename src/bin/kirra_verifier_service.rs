@@ -40,7 +40,10 @@ use kirra_runtime_sdk::federation::{
     RegisterFederationControllerRequest,
     ReportEvaluation,
 };
-use kirra_runtime_sdk::standby_monitor::{spawn_heartbeat_writer, spawn_promotion_monitor};
+use kirra_runtime_sdk::standby_monitor::{
+    instance_id as ha_instance_id, spawn_heartbeat_writer, spawn_promotion_monitor,
+    HEARTBEAT_KEY, PROMOTION_TIMEOUT_MS,
+};
 use kirra_runtime_sdk::gateway::kinematics_contract::ProposedVehicleCommand;
 use kirra_runtime_sdk::gateway::policy_layer::{
     enforce_actuator_safety_envelope, enforce_posture_routing,
@@ -1457,7 +1460,108 @@ async fn main() {
         tracing::info!(count = assets_loaded, "Loaded fabric assets from store");
     }
 
-    match mode {
+    // Heartbeat-aware startup arbitration (HA epoch fence).
+    //
+    // A configured-Active instance must CLAIM the durable epoch before
+    // it starts heartbeating, but must NOT steal from a live holder
+    // (prevents a restarted old primary from stealing back from a
+    // standby that has already promoted). The decision is:
+    //
+    //   1. Read (epoch E, active_id A) from the singleton ha_state row.
+    //   2. Read primary heartbeat age. If A is some OTHER instance and
+    //      heartbeat is fresh, stand down to PassiveStandby.
+    //   3. Otherwise try_claim_epoch(E, my_id, now). On win, hold the
+    //      epoch and proceed Active. On loss, stand down to PassiveStandby
+    //      (a concurrent claim landed first — fence held).
+    //
+    // Even if clock skew makes a live holder LOOK stale, the worst case
+    // here is an EXTRA failover: this node claims and bumps the epoch,
+    // the real holder gets fenced at its gate (STEP 5) and self-demotes.
+    // Still at most one effective writer.
+    //
+    // A configured-PassiveStandby instance does NOT attempt to claim at
+    // startup; it spawns the promotion monitor as before. The monitor
+    // will claim via perform_promotion when the primary heartbeat goes
+    // stale (the same conditional CAS path).
+    let my_id = ha_instance_id();
+    let effective_mode = match mode {
+        VerifierOperationMode::PassiveStandby => VerifierOperationMode::PassiveStandby,
+        VerifierOperationMode::Active => {
+            let arbitration = svc_state.app.store.lock().ok().and_then(|store| {
+                let (epoch, holder) = store.current_active_holder().ok()?;
+                let hb_str = store.load_engine_state(HEARTBEAT_KEY).ok()?;
+                let now = now_ms();
+                let hb_fresh = hb_str
+                    .as_deref()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(|ts| now.saturating_sub(ts) < PROMOTION_TIMEOUT_MS)
+                    .unwrap_or(false);
+                Some((epoch, holder, hb_fresh))
+            });
+
+            match arbitration {
+                Some((epoch, Some(holder), true)) if holder != my_id => {
+                    tracing::warn!(
+                        my_id = %my_id,
+                        live_holder = %holder,
+                        epoch = epoch,
+                        "another Active instance is alive at startup — starting as PassiveStandby instead"
+                    );
+                    VerifierOperationMode::PassiveStandby
+                }
+                Some((epoch, _holder, _stale_or_self)) => {
+                    let claim = svc_state.app.store.lock().ok().and_then(|mut s| {
+                        s.try_claim_epoch(epoch, &my_id, now_ms()).ok().flatten()
+                    });
+                    match claim {
+                        Some(new_epoch) => {
+                            svc_state
+                                .app
+                                .held_epoch
+                                .store(new_epoch, std::sync::atomic::Ordering::SeqCst);
+                            tracing::info!(
+                                my_id = %my_id,
+                                epoch = new_epoch,
+                                "Active startup: durable epoch claimed"
+                            );
+                            VerifierOperationMode::Active
+                        }
+                        None => {
+                            tracing::error!(
+                                my_id = %my_id,
+                                observed_epoch = epoch,
+                                "Active startup: epoch claim LOST — another instance won the race; \
+                                 starting as PassiveStandby (fail-closed; one writer invariant preserved)"
+                            );
+                            VerifierOperationMode::PassiveStandby
+                        }
+                    }
+                }
+                None => {
+                    // Could not read ha_state (store error). Fail closed to
+                    // PassiveStandby rather than serve as an unfenced Active.
+                    tracing::error!(
+                        my_id = %my_id,
+                        "Active startup: unable to read ha_state for epoch arbitration; \
+                         starting as PassiveStandby (fail-closed)"
+                    );
+                    VerifierOperationMode::PassiveStandby
+                }
+            }
+        }
+    };
+
+    // Bring the per-process mode atomic in line with the arbitrated decision.
+    // (AppState::new initialized mode_active from the env-derived `mode`; if
+    // arbitration downgraded Active→PassiveStandby, flip it off.)
+    if effective_mode == VerifierOperationMode::PassiveStandby {
+        svc_state
+            .app
+            .mode_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    match effective_mode {
         VerifierOperationMode::Active => {
             spawn_heartbeat_writer(Arc::clone(&svc_state.app));
             tracing::info!("Heartbeat writer started (Active mode)");

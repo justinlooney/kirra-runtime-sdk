@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -182,8 +182,14 @@ pub struct AppState {
     pub store: Arc<Mutex<VerifierStore>>,
     /// Runtime-mutable operational mode.
     /// true = Active (accepts mutations); false = PassiveStandby (read-only).
-    /// Promotion from PassiveStandby → Active uses compare_exchange on this atomic.
+    /// LOCAL only — coordinates this process. Distributed split-brain is
+    /// prevented by `held_epoch` against the durable `ha_state` row.
     pub mode_active: Arc<AtomicBool>,
+    /// HA fencing token (durable epoch) currently claimed by this instance.
+    /// 0 = no claim yet. The mutation gate compares this to the DB epoch on
+    /// every state-mutating request; if they diverge this node has been
+    /// fenced (another instance promoted) and must self-demote.
+    pub held_epoch: Arc<AtomicU64>,
     /// Bounded broadcast channel for real-time posture stream subscribers.
     pub posture_tx: broadcast::Sender<PostureStreamEvent>,
     /// Transport identity enforcement config — reads from env at startup.
@@ -203,6 +209,7 @@ impl AppState {
             pending_challenges: DashMap::new(),
             store: Arc::new(Mutex::new(store)),
             mode_active: Arc::new(AtomicBool::new(mode == VerifierOperationMode::Active)),
+            held_epoch: Arc::new(AtomicU64::new(0)),
             posture_tx,
             transport_identity: TransportIdentityConfig::from_env(),
             rss_active_violation: Arc::new(AtomicBool::new(false)),

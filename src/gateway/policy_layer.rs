@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::gateway::kinematics_contract::{
     validate_vehicle_command, EnforceAction, ProposedVehicleCommand, VehicleKinematicsContract,
 };
-use crate::gateway::policy::classify_http_command;
+use crate::gateway::policy::{classify_http_command, OperationalCommand};
 use crate::posture_cache::{
     now_ms as posture_now_ms, should_route_command, CachedFleetPosture, ServiceState,
 };
@@ -201,6 +201,54 @@ pub async fn enforce_posture_routing(
 
     let method = req.method().as_str().to_string();
     let cmd = classify_http_command(&method, &path);
+
+    // HA epoch fence (durable split-brain guard).
+    //
+    // For STATE-MUTATING commands only, compare our held epoch against the
+    // DB epoch. If they diverge we have been fenced — another instance
+    // claimed a higher epoch via the conditional UPDATE in
+    // `try_claim_epoch`. Self-demote (mode_active → false) and reject
+    // with the same 503 shape as other transient gate denials. Reads stay
+    // exempt so a self-demoted node still serves health/metrics/reads.
+    //
+    // RESIDUAL TOCTOU (documented + filed as follow-up): the epoch is read
+    // here and the actual write lands a moment later in the handler. A
+    // promotion that lands in that window allows ONE stale mutation
+    // before the next request is fenced. Closing this fully requires
+    // re-checking the epoch INSIDE the write transaction for top-tier
+    // writes (actuator admittance, trust-state changes). Tracked
+    // separately — promotion is rare and the window is small but not zero.
+    let is_mutation = matches!(
+        cmd,
+        OperationalCommand::WriteState | OperationalCommand::SystemMutation
+    );
+    if is_mutation {
+        let held = svc.app.held_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let db_epoch = match svc.app.store.lock() {
+            Ok(s) => s.current_epoch().ok(),
+            Err(_) => None,
+        };
+        if let Some(db) = db_epoch {
+            // held == 0 means we never claimed an epoch (configured-passive
+            // never promoted): fall through to the posture / mode checks
+            // already in place, which fail closed for mutations on non-Active.
+            if held != 0 && held != db {
+                svc.app
+                    .mode_active
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                tracing::error!(
+                    method = %method,
+                    path   = %path,
+                    held   = held,
+                    db     = db,
+                    "FENCED — held epoch stale; self-demoting and rejecting mutation (HA split-brain prevention)"
+                );
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
+        // db_epoch unreadable -> fall through. Existing mode/posture
+        // checks below remain fail-closed for mutations on non-Active.
+    }
 
     // Fail-closed snapshot: poisoned lock -> None -> block.
     let snapshot: Option<CachedFleetPosture> = match svc.posture_cache.read() {

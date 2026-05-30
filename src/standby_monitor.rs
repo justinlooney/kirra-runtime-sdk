@@ -75,7 +75,7 @@ pub const PROMOTION_POLL_MS: u64 = 1_000;
 pub const PROMOTION_TIMEOUT_MS: u64 = 10_000;
 
 /// SQLite key for the primary heartbeat timestamp.
-const HEARTBEAT_KEY: &str = "primary_heartbeat_ms";
+pub const HEARTBEAT_KEY: &str = "primary_heartbeat_ms";
 
 /// SQLite key for the primary instance ID.
 const PRIMARY_INSTANCE_KEY: &str = "primary_instance_id";
@@ -159,11 +159,41 @@ pub fn spawn_heartbeat_writer(app: Arc<AppState>) {
 
                     let _ = store.save_engine_state(PRIMARY_INSTANCE_KEY, &id);
 
+                    // Proactive epoch-fence check: if the durable epoch has
+                    // advanced past our held value, another instance has
+                    // promoted and we have been fenced. Self-demote and stop
+                    // heartbeating. This fixes the pre-existing gap where
+                    // PROMOTION_RECORD_KEY detection only stopped the
+                    // heartbeat loop but left mode_active = true (the
+                    // mutation gate would still let writes through until
+                    // the next request-time epoch check).
+                    let held = app.held_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    match store.current_epoch() {
+                        Ok(db_epoch) if held != 0 && db_epoch != held => {
+                            app.mode_active.store(false, std::sync::atomic::Ordering::SeqCst);
+                            tracing::error!(
+                                instance_id = %id,
+                                held        = held,
+                                db_epoch    = db_epoch,
+                                "FENCED — durable epoch advanced past held value; self-demoting and stopping heartbeat"
+                            );
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, instance_id = %id,
+                                "Heartbeat writer: epoch read failed");
+                        }
+                    }
+
                     if let Ok(Some(promoted_by)) = store.load_engine_state(PROMOTION_RECORD_KEY) {
+                        // Mirror the epoch path: tear down the local Active
+                        // flag too, not just the heartbeat loop.
+                        app.mode_active.store(false, std::sync::atomic::Ordering::SeqCst);
                         tracing::error!(
                             promoted_by = %promoted_by,
                             instance_id = %id,
-                            "Standby has promoted — primary heartbeat writer stopping. \
+                            "Standby has promoted — primary self-demoting and stopping heartbeat. \
                              Restart this instance in PassiveStandby mode."
                         );
                         break;
@@ -302,28 +332,91 @@ async fn perform_promotion(
 ) {
     let ts = now_ms();
 
-    // Step 1: Atomic mode transition PassiveStandby → Active.
-    // compare_exchange ensures only one standby promotes even under split-brain.
-    let promoted = app.mode_active.compare_exchange(
-        false,
-        true,
-        std::sync::atomic::Ordering::SeqCst,
-        std::sync::atomic::Ordering::SeqCst,
-    ).is_ok();
+    // Step 1: DURABLE epoch claim (the real split-brain fence).
+    //
+    // SQLite serializes write transactions, so a conditional UPDATE on the
+    // singleton `ha_state` row gives a real distributed CAS: two standbys
+    // that both read the same `observed` epoch will serialize at commit
+    // and only one will see rows_affected == 1 (Some(new_epoch)). The
+    // loser sees None and MUST abort — its in-memory mode_active stays
+    // false and no audit/cache state is written. The previous in-memory
+    // `compare_exchange` did NOT provide this guarantee: it was per-process.
+    let observed = match app.store.lock() {
+        Ok(store) => match store.current_epoch() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!(error = %e, instance_id = %id,
+                    "promotion: cannot read epoch — aborting");
+                return;
+            }
+        },
+        Err(_) => {
+            tracing::error!(instance_id = %id,
+                "promotion: store lock poisoned reading epoch — aborting");
+            return;
+        }
+    };
 
-    if !promoted {
-        tracing::warn!(instance_id = %id, "Promotion attempted but mode was already Active");
-        return;
+    let new_epoch = match app.store.lock() {
+        Ok(mut store) => match store.try_claim_epoch(observed, id, ts) {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                // Fence held: another instance advanced the epoch between
+                // our read and our write. We stay PassiveStandby.
+                tracing::warn!(
+                    instance_id = %id,
+                    observed    = observed,
+                    reason      = %reason,
+                    "promotion ABORTED — epoch already advanced by another instance (durable fence held)"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, instance_id = %id,
+                    "promotion: epoch claim execute failed — aborting");
+                return;
+            }
+        },
+        Err(_) => {
+            tracing::error!(instance_id = %id,
+                "promotion: store lock poisoned during claim — aborting");
+            return;
+        }
+    };
+
+    // Step 2: Cache the won epoch in memory so the mutation gate can
+    // compare it against the DB epoch on every write. If a later
+    // promotion fences us, gate-level checks will detect held != db and
+    // self-demote.
+    app.held_epoch.store(new_epoch, std::sync::atomic::Ordering::SeqCst);
+
+    // Step 3: Flip the local mode atomic. By this point the durable
+    // claim already succeeded, so this is a per-process bookkeeping
+    // step, not a split-brain guard. A racing local CAS failure here
+    // (e.g. a force-promote already flipped us) is informational only.
+    if app
+        .mode_active
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        tracing::warn!(instance_id = %id,
+            "Local mode atomic was already Active at promotion (continuing — durable epoch already claimed)");
     }
 
     tracing::info!(
         instance_id = %id,
         reason      = %reason,
         ts          = ts,
-        "Promoted to Active"
+        epoch       = new_epoch,
+        "Promoted to Active (durable epoch claimed)"
     );
 
-    // Step 2: Persist promotion record (disk-first).
+    // Step 4: Persist promotion record (disk-first).
     // save_engine_state takes &self; acquire lock once for that, then release
     // and re-acquire as mut for save_posture_event_chained (&mut self).
     if let Ok(store) = app.store.lock() {
@@ -331,11 +424,15 @@ async fn perform_promotion(
     }
 
     if let Ok(mut store) = app.store.lock() {
+        // Tag the audit payload with `epoch` so a partitioned write is
+        // identifiable after the fact (the audit chain itself is
+        // monotonic; the epoch column adds the HA-generation linkage).
         let audit = serde_json::json!({
             "event":          "STANDBY_PROMOTED_TO_ACTIVE",
             "instance_id":    id,
             "reason":         reason,
             "promoted_at_ms": ts,
+            "epoch":          new_epoch,
         });
         let _ = store.save_posture_event_chained(
             "standby_monitor",
@@ -346,13 +443,14 @@ async fn perform_promotion(
         );
     }
 
-    // Step 3: Initial recalculation as Active instance.
+    // Step 5: Initial recalculation as Active instance.
     // is_active() now returns true, so recalculate_and_broadcast will write
     // to the cache and emit broadcasts instead of returning early.
     recalculate_and_broadcast(app, cache);
 
     tracing::info!(
         instance_id = %id,
+        epoch       = new_epoch,
         "Promotion complete — posture cache populated, SSE broadcast active"
     );
 }
@@ -364,8 +462,6 @@ async fn perform_promotion(
 #[cfg(test)]
 mod standby_monitor_tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn test_heartbeat_within_timeout_does_not_trigger_promotion() {
@@ -410,38 +506,6 @@ mod standby_monitor_tests {
     }
 
     #[test]
-    fn test_promotion_cas_succeeds_from_passive() {
-        let mode_active = Arc::new(AtomicBool::new(false));
-        let result = mode_active.compare_exchange(
-            false, true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        );
-        assert!(result.is_ok(), "CAS must succeed when transitioning from PassiveStandby");
-        assert!(mode_active.load(std::sync::atomic::Ordering::SeqCst),
-            "mode must be Active after successful CAS");
-    }
-
-    #[test]
-    fn test_promotion_cas_fails_if_already_active() {
-        let mode_active = Arc::new(AtomicBool::new(true));
-        let result = mode_active.compare_exchange(
-            false, true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        );
-        assert!(result.is_err(), "CAS must fail when already Active (double-promotion guard)");
-    }
-
-    #[test]
-    fn test_promotion_is_one_way_by_task_exit() {
-        // One-way enforcement is by task exit: perform_promotion() returns after
-        // completing, and the caller (spawn_promotion_monitor) also returns.
-        // No code path reverts mode_active to false after promotion.
-        assert!(true, "one-way invariant is enforced by task lifecycle");
-    }
-
-    #[test]
     fn test_promotion_timeout_exceeds_heartbeat_interval() {
         assert!(PROMOTION_TIMEOUT_MS > HEARTBEAT_INTERVAL_MS,
             "timeout must exceed interval to allow for missed writes");
@@ -471,5 +535,208 @@ mod standby_monitor_tests {
         let id1 = instance_id();
         let id2 = instance_id();
         assert_eq!(id1, id2, "instance_id must be stable within a process lifetime");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HA epoch fence — real-state tests (temp-file SQLite, NOT :memory:)
+// ---------------------------------------------------------------------------
+//
+// :memory: is per-connection — two VerifierStore instances opened against
+// ":memory:" do NOT see each other's writes, which would silently turn a
+// concurrent-promotion test into a no-op. These tests deliberately share a
+// single temp file path so two stores genuinely share the ha_state row.
+
+#[cfg(test)]
+mod ha_epoch_fence_tests {
+    use crate::verifier_store::VerifierStore;
+    use std::path::PathBuf;
+
+    fn tmp_db_path(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = format!(
+            "kirra-ha-fence-{}-{}-{}.sqlite",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        p.push(nonce);
+        p
+    }
+
+    /// CORE FENCE PROPERTY: two stores racing to promote — exactly ONE wins,
+    /// the loser sees None, the final epoch == observed + 1 (not + 2).
+    #[test]
+    fn test_concurrent_promotion_only_one_instance_claims_epoch() {
+        let path = tmp_db_path("concurrent");
+        let path_str = path.to_str().unwrap().to_string();
+
+        // Initialize the DB once (schema), then open two independent stores
+        // sharing the same file — mirrors two processes pointing at the
+        // same SQLite DB (or replicated WAL).
+        let _seed = VerifierStore::new(&path_str).expect("seed open");
+        let mut store_a = VerifierStore::new(&path_str).expect("store A");
+        let mut store_b = VerifierStore::new(&path_str).expect("store B");
+
+        let observed_a = store_a.current_epoch().unwrap();
+        let observed_b = store_b.current_epoch().unwrap();
+        assert_eq!(observed_a, observed_b,
+            "both standbys must read the same observed epoch in the race");
+        assert_eq!(observed_a, 0, "fresh DB starts at epoch 0");
+
+        let claim_a = store_a.try_claim_epoch(observed_a, "instance-A", 1_000).unwrap();
+        let claim_b = store_b.try_claim_epoch(observed_b, "instance-B", 1_000).unwrap();
+
+        // The fence: exactly one Some, exactly one None.
+        let wins = [claim_a.is_some(), claim_b.is_some()]
+            .iter()
+            .filter(|w| **w)
+            .count();
+        assert_eq!(wins, 1, "exactly one instance must win the epoch claim");
+
+        // Epoch advanced by exactly 1 (not by 2).
+        let final_epoch = store_a.current_epoch().unwrap();
+        assert_eq!(final_epoch, 1,
+            "exactly one bump must land — observed=0, final=1, not 2");
+
+        let (db_epoch, holder) = store_a.current_active_holder().unwrap();
+        assert_eq!(db_epoch, 1);
+        let holder = holder.expect("a holder must be recorded after a successful claim");
+        assert!(
+            holder == "instance-A" || holder == "instance-B",
+            "holder must be one of the racers, got {holder}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stale-epoch holder is fenced: we hold epoch 1 but DB has been
+    /// bumped to 2 by a separate instance — current_epoch reports 2,
+    /// so the gate check (held != db) fails closed.
+    #[test]
+    fn test_stale_epoch_holder_is_fenced() {
+        let path = tmp_db_path("stale-holder");
+        let path_str = path.to_str().unwrap().to_string();
+
+        let _seed = VerifierStore::new(&path_str).expect("seed");
+        let mut store_a = VerifierStore::new(&path_str).expect("store A");
+        let mut store_b = VerifierStore::new(&path_str).expect("store B");
+
+        // A claims epoch 1.
+        let e_a = store_a.try_claim_epoch(0, "A", 100).unwrap();
+        assert_eq!(e_a, Some(1));
+        let held_a: u64 = 1;
+
+        // B reads observed=1 and claims epoch 2.
+        let e_b = store_b.try_claim_epoch(1, "B", 200).unwrap();
+        assert_eq!(e_b, Some(2));
+
+        // A's gate check: held (1) vs current DB epoch (2) → fenced.
+        let db_epoch = store_a.current_epoch().unwrap();
+        assert_eq!(db_epoch, 2, "DB must reflect B's successful claim");
+        assert_ne!(held_a, db_epoch,
+            "A is fenced — its held epoch is now stale relative to the DB");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A startup-time Active instance on a clean DB claims and records its
+    /// epoch — the holder column matches the instance ID, epoch == 1.
+    #[test]
+    fn test_startup_active_claims_epoch_on_clean_db() {
+        let path = tmp_db_path("startup-clean");
+        let path_str = path.to_str().unwrap().to_string();
+
+        let mut store = VerifierStore::new(&path_str).expect("store");
+
+        let (initial_epoch, initial_holder) = store.current_active_holder().unwrap();
+        assert_eq!(initial_epoch, 0);
+        assert!(initial_holder.is_none(), "clean DB has no holder yet");
+
+        let claimed = store.try_claim_epoch(initial_epoch, "primary-1", 5_000).unwrap();
+        assert_eq!(claimed, Some(1), "first claim on clean DB must succeed");
+
+        let (final_epoch, final_holder) = store.current_active_holder().unwrap();
+        assert_eq!(final_epoch, 1);
+        assert_eq!(final_holder.as_deref(), Some("primary-1"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A second concurrent Active attempt loses the claim race — its
+    /// try_claim_epoch returns None. The bin's startup logic stands the
+    /// loser down to PassiveStandby (the test asserts the primitive
+    /// return value; the bin asserts the policy on top of it).
+    #[test]
+    fn test_promotion_aborts_when_epoch_already_advanced() {
+        let path = tmp_db_path("aborts");
+        let path_str = path.to_str().unwrap().to_string();
+
+        let _seed = VerifierStore::new(&path_str).expect("seed");
+        let mut store_a = VerifierStore::new(&path_str).expect("store A");
+        let mut store_b = VerifierStore::new(&path_str).expect("store B");
+
+        let observed = store_a.current_epoch().unwrap();
+        let _win = store_a.try_claim_epoch(observed, "winner", 1).unwrap();
+
+        // B observed `observed` (0) too, but the DB is now at 1. Its
+        // conditional UPDATE finds zero matching rows.
+        let lose = store_b.try_claim_epoch(observed, "loser", 2).unwrap();
+        assert!(lose.is_none(),
+            "stale-observed claim must abort with None (durable fence)");
+
+        let (final_epoch, holder) = store_a.current_active_holder().unwrap();
+        assert_eq!(final_epoch, 1, "exactly one bump");
+        assert_eq!(holder.as_deref(), Some("winner"),
+            "loser must NOT have overwritten the holder column");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Startup-defer policy primitive: when a live holder is detected, the
+    /// configured-Active node must NOT issue a claim. We assert the read
+    /// surface the bin uses (current_active_holder + heartbeat freshness)
+    /// gives the expected inputs for that decision.
+    #[test]
+    fn test_startup_defers_to_live_active_holder() {
+        let path = tmp_db_path("defer");
+        let path_str = path.to_str().unwrap().to_string();
+
+        let _seed = VerifierStore::new(&path_str).expect("seed");
+        let mut store_primary = VerifierStore::new(&path_str).expect("primary");
+        let store_new = VerifierStore::new(&path_str).expect("new");
+
+        // Primary claims and writes a fresh heartbeat.
+        let _ = store_primary.try_claim_epoch(0, "primary", 1_000).unwrap();
+        store_primary
+            .save_engine_state(super::HEARTBEAT_KEY, "1000")
+            .unwrap();
+
+        // New instance, ~half the timeout later — heartbeat is fresh.
+        let now: u64 = 1_000 + super::PROMOTION_TIMEOUT_MS / 2;
+        let (epoch, holder) = store_new.current_active_holder().unwrap();
+        let hb_str = store_new
+            .load_engine_state(super::HEARTBEAT_KEY)
+            .unwrap()
+            .expect("heartbeat must be present");
+        let hb_ts: u64 = hb_str.parse().unwrap();
+        let fresh = now.saturating_sub(hb_ts) < super::PROMOTION_TIMEOUT_MS;
+
+        assert_eq!(epoch, 1);
+        assert_eq!(holder.as_deref(), Some("primary"));
+        assert!(fresh, "heartbeat must read as fresh within the timeout window");
+
+        // The bin's policy: holder is some OTHER id AND heartbeat is fresh
+        // ⇒ stand down. We model that decision here so the test fails if
+        // either input changes meaning.
+        let my_id = "newcomer";
+        let should_defer = matches!(holder.as_deref(), Some(h) if h != my_id) && fresh;
+        assert!(should_defer,
+            "startup must defer to a live holder rather than steal the epoch");
+
+        let _ = std::fs::remove_file(&path);
     }
 }
