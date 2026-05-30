@@ -94,7 +94,11 @@ impl CachedFleetPosture {
     }
 
     /// Convenience constructor for tests and cold-start initialization.
-    /// Uses generation=1 and the current system time.
+    /// Uses generation=0 (sentinel for "no engine recalculation has landed
+    /// yet") and the current system time. `next_generation()` always returns
+    /// >= 1, so a generation=0 seed is guaranteed to be superseded by the
+    /// first real engine write — required for the monotonic-replace check
+    /// in `replace_cache_if_newer` to accept the first recalc result.
     /// For production engine writes, use `new_with_generation` instead.
     pub fn new(posture: FleetPosture) -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -106,7 +110,7 @@ impl CachedFleetPosture {
             posture,
             generated_at_ms: now,
             ttl_ms: POSTURE_CACHE_TTL_MS,
-            generation: 1,
+            generation: 0,
         }
     }
 
@@ -252,9 +256,14 @@ mod posture_cache_tests {
     }
 
     #[test]
-    fn test_new_convenience_constructor_uses_generation_1() {
+    fn test_new_convenience_constructor_uses_generation_0_sentinel() {
+        // generation=0 is the "no engine write yet" sentinel — the first
+        // recalculate_and_broadcast (which calls next_generation() returning
+        // >= 1) must be able to supersede a seed entry. A non-zero default
+        // would collide with the first real generation and the monotonic
+        // replace would reject the first recalc — breaking cold-start.
         let entry = CachedFleetPosture::new(FleetPosture::Nominal);
-        assert_eq!(entry.generation, 1);
+        assert_eq!(entry.generation, 0);
         assert_eq!(entry.ttl_ms, POSTURE_CACHE_TTL_MS);
     }
 

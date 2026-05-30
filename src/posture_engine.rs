@@ -108,6 +108,16 @@ pub fn recalculate_and_broadcast(app: &Arc<AppState>, cache: &SharedPostureCache
     let generation = next_generation();
 
     // Step 4: Persist to audit chain (disk-first, invariant #12).
+    //
+    // The doc above promises subscribers never observe a transition that
+    // hasn't been committed to the audit chain. That requires the cache
+    // write AND the broadcast to be gated on a SUCCESSFUL audit commit —
+    // a failed/skipped audit must NOT yield an enforced posture change.
+    // We capture the outcome here and fail closed (return without
+    // touching the cache or broadcast) if the commit did not land.
+    //
+    // Consuming a generation and then bailing leaves a harmless gap in
+    // the generation sequence; monotonicity is preserved.
     let audit_payload = serde_json::json!({
         "new_posture":      format!("{new_posture:?}"),
         "previous_posture": previous_posture.as_ref().map(|p| format!("{p:?}")),
@@ -123,15 +133,41 @@ pub fn recalculate_and_broadcast(app: &Arc<AppState>, cache: &SharedPostureCache
         "POSTURE_CACHE_REFRESHED"
     };
 
-    if let Ok(mut store) = app.store.lock() {
-        let _ = store.save_posture_event_chained(
-            "posture_engine",
-            event_type,
-            &audit_payload.to_string(),
-            Some("Fleet posture recomputed from DAG traversal"),
-            ts,
-        );
-        let _ = store.save_last_generation(generation);
+    let audit_committed = match app.store.lock() {
+        Ok(mut store) => {
+            match store.save_posture_event_chained(
+                "posture_engine",
+                event_type,
+                &audit_payload.to_string(),
+                Some("Fleet posture recomputed from DAG traversal"),
+                ts,
+            ) {
+                Ok(()) => {
+                    let _ = store.save_last_generation(generation);
+                    true
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error      = %e,
+                        generation = generation,
+                        "AUDIT-CHAIN WRITE FAILED for posture transition — suppressing cache/broadcast (fail closed)"
+                    );
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error      = %e,
+                generation = generation,
+                "store lock poisoned — posture audit not written; suppressing cache/broadcast (fail closed)"
+            );
+            false
+        }
+    };
+
+    if !audit_committed {
+        return;
     }
 
     // Step 5: PassiveStandby — audit only, no cache or broadcast mutation.
@@ -144,22 +180,16 @@ pub fn recalculate_and_broadcast(app: &Arc<AppState>, cache: &SharedPostureCache
         return;
     }
 
-    // Step 6: Atomic cache replacement.
+    // Step 6: Generation-monotonic cache replace.
+    // Two recalcs can race (promotion path + Step-C worker), and a SLOWER
+    // one carrying a LOWER generation must not clobber a newer posture.
     let new_cached = CachedFleetPosture::new_with_generation(new_posture.clone(), generation, ts);
-    match cache.write() {
-        Ok(mut guard) => { *guard = Some(new_cached); }
-        Err(e) => {
-            tracing::error!(
-                error      = %e,
-                generation = generation,
-                "Posture cache RwLock poisoned — cache not updated"
-            );
-            return;
-        }
-    }
+    let cache_written = replace_cache_if_newer(cache, new_cached);
 
-    // Step 7: Broadcast only on transition, after cache write.
-    if is_transition {
+    // Step 7: Broadcast ONLY if we actually wrote a newer entry AND it's a
+    // transition. A broadcast without a corresponding cache update would
+    // mislead subscribers.
+    if cache_written && is_transition {
         let _ = app.posture_tx.send(crate::verifier::PostureStreamEvent {
             event_type: event_type.to_string(),
             node_id:    None,
@@ -173,6 +203,40 @@ pub fn recalculate_and_broadcast(app: &Arc<AppState>, cache: &SharedPostureCache
             generation       = generation,
             "Fleet posture transition"
         );
+    }
+}
+
+/// Replaces the cached posture ONLY if `candidate.generation` is strictly
+/// greater than the currently cached generation. Returns `true` if a write
+/// landed. Prevents a slow / out-of-order recalc (lower generation) from
+/// clobbering a newer posture already in the cache. Pure w.r.t. callers —
+/// holds the cache write lock for the duration of the compare-and-swap.
+fn replace_cache_if_newer(
+    cache: &SharedPostureCache,
+    candidate: CachedFleetPosture,
+) -> bool {
+    match cache.write() {
+        Ok(mut guard) => {
+            let cur_gen = guard.as_ref().map(|c| c.generation).unwrap_or(0);
+            if candidate.generation > cur_gen {
+                *guard = Some(candidate);
+                true
+            } else {
+                tracing::debug!(
+                    candidate_gen = candidate.generation,
+                    current_gen   = cur_gen,
+                    "Skipping cache replace — a newer or equal generation is already cached"
+                );
+                false
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Posture cache RwLock poisoned — cache not updated"
+            );
+            false
+        }
     }
 }
 
@@ -301,10 +365,85 @@ mod posture_engine_tests {
 
         recalculate_and_broadcast(&app, &cache);
 
+        // Happy path: audit committed → cache + broadcast may proceed.
         let guard = cache.read().unwrap();
         assert!(guard.is_some(), "cache must be populated after recalculate");
         let entry = guard.as_ref().unwrap();
         assert_eq!(entry.posture, FleetPosture::Nominal);
         assert!(entry.generation > 0);
+    }
+
+    #[test]
+    fn test_passive_standby_audits_but_does_not_write_cache() {
+        use std::sync::Arc;
+        use crate::verifier::{AppState, VerifierOperationMode};
+        use crate::verifier_store::VerifierStore;
+
+        let store = VerifierStore::new(":memory:").unwrap();
+        let app = Arc::new(AppState::new(store, VerifierOperationMode::PassiveStandby));
+        let cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(None));
+
+        recalculate_and_broadcast(&app, &cache);
+
+        let guard = cache.read().unwrap();
+        assert!(guard.is_none(),
+            "PassiveStandby must NOT populate the cache even after a successful audit commit");
+    }
+
+    // FIX 1: generation-monotonic replace.
+    //
+    // NOTE: each `cache.read()` is scoped in its own block. std::sync::RwLock
+    // does not guarantee write-prefer scheduling, and holding a read guard
+    // across a subsequent `replace_cache_if_newer` (which acquires the
+    // write lock) deadlocks.
+    #[test]
+    fn test_replace_cache_if_newer_rejects_lower_generation() {
+        use std::sync::Arc;
+        use crate::posture_cache::CachedFleetPosture;
+
+        fn snapshot(cache: &SharedPostureCache) -> (u64, FleetPosture) {
+            let g = cache.read().unwrap();
+            let entry = g.as_ref().expect("cache populated");
+            (entry.generation, entry.posture.clone())
+        }
+
+        let cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(None));
+
+        // Seed with generation 10.
+        let g10 = CachedFleetPosture::new_with_generation(FleetPosture::Nominal, 10, 1_000);
+        assert!(replace_cache_if_newer(&cache, g10));
+        assert_eq!(snapshot(&cache), (10, FleetPosture::Nominal));
+
+        // Lower generation 9 must be rejected, cache unchanged.
+        let g9 = CachedFleetPosture::new_with_generation(FleetPosture::Degraded, 9, 2_000);
+        assert!(!replace_cache_if_newer(&cache, g9),
+            "lower generation must NOT replace the cache");
+        assert_eq!(snapshot(&cache), (10, FleetPosture::Nominal),
+            "older recalc must NOT have clobbered the newer posture");
+
+        // Equal generation 10 must also be rejected (strictly greater).
+        let g10_eq = CachedFleetPosture::new_with_generation(FleetPosture::LockedOut, 10, 3_000);
+        assert!(!replace_cache_if_newer(&cache, g10_eq),
+            "equal generation must NOT replace (strict > required)");
+        assert_eq!(snapshot(&cache), (10, FleetPosture::Nominal));
+
+        // Strictly greater generation 11 wins.
+        let g11 = CachedFleetPosture::new_with_generation(FleetPosture::Degraded, 11, 4_000);
+        assert!(replace_cache_if_newer(&cache, g11));
+        assert_eq!(snapshot(&cache), (11, FleetPosture::Degraded));
+    }
+
+    // FIX 1: an empty cache always accepts (current_gen treated as 0).
+    #[test]
+    fn test_replace_cache_if_newer_accepts_into_empty_cache() {
+        use std::sync::Arc;
+        use crate::posture_cache::CachedFleetPosture;
+
+        let cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(None));
+        let g1 = CachedFleetPosture::new_with_generation(FleetPosture::Nominal, 1, 0);
+        assert!(replace_cache_if_newer(&cache, g1),
+            "generation > 0 must populate an empty cache");
+        let snap_gen = cache.read().unwrap().as_ref().unwrap().generation;
+        assert_eq!(snap_gen, 1);
     }
 }
