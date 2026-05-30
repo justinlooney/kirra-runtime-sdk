@@ -194,6 +194,7 @@ pub fn should_route_command(
     now_ms: u64,
     command: OperationalCommand,
 ) -> bool {
+    // Safety: SG-006 (AEGIS-SG-001) ≅ SG9 (OCCY_SAFETY_GOALS).
     // Invariant #9: Unknown is denied before any posture evaluation.
     // This early return must never be removed.
     if command == OperationalCommand::Unknown {
@@ -205,6 +206,7 @@ pub fn should_route_command(
         return false;
     };
 
+    // Safety: SG-005 (AEGIS-SG-001) ≅ SG8/SG9 (OCCY_SAFETY_GOALS).
     // Staleness check uses entry.is_stale() — the TTL is owned by the entry,
     // not hardcoded here. This aligns with policy_layer.rs resolve_posture.
     if entry.is_stale(now_ms) {

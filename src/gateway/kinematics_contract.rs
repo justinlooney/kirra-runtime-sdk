@@ -136,6 +136,7 @@ pub fn validate_vehicle_command(
     contract: &VehicleKinematicsContract,
 ) -> EnforceAction {
     // ------------------------------------------------------------------
+    // Safety: SG-004 (AEGIS-SG-001) ≅ SG9 (OCCY_SAFETY_GOALS).
     // Priority 0: NaN/Inf guard — must run before ANY arithmetic.
     //
     // IEEE 754 NaN/Inf values poison every subsequent computation silently:
@@ -176,6 +177,7 @@ pub fn validate_vehicle_command(
     }
 
     // ------------------------------------------------------------------
+    // Safety: SG-001 (AEGIS-SG-001) ≅ SG3 (OCCY_SAFETY_GOALS).
     // Priority 2: Linear velocity hard ceiling
     // Checked before acceleration rate — a velocity-over-limit command
     // implies an over-limit acceleration; no need to compute it.
@@ -248,6 +250,7 @@ pub fn validate_vehicle_command(
         delta_clamped = true;
     }
 
+    // Safety: SG-002 (AEGIS-SG-001) ≅ SG3 (OCCY_SAFETY_GOALS).
     // Priority 6: Dynamic lateral acceleration envelope (bicycle model)
     //
     //   a_lat = (v² × |tan(δ)|) / L
