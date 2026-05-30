@@ -318,10 +318,13 @@ async fn verify_attestation(
 
     let posture = svc.app.calculate_posture(&req.node_id);
     if let Ok(posture_json) = serde_json::to_string(&posture) {
-        if let Ok(store) = svc.app.store.lock() {
-            let _ = store.save_posture_event(
+        if let Ok(mut store) = svc.app.store.lock() {
+            if let Err(e) = store.save_posture_event_chained(
                 &req.node_id, "ATTESTATION_TRUSTED", &posture_json, None, now,
-            );
+            ) {
+                tracing::error!(error=%e, node_id=%req.node_id,
+                    "AUDIT-CHAIN WRITE FAILED for ATTESTATION_TRUSTED — event missing from tamper-evident log");
+            }
         }
     }
     emit_posture_event(&svc.app, "NODE_STATUS_CHANGED", Some(req.node_id.clone()));
@@ -382,10 +385,13 @@ async fn register_dependencies(
     let posture = svc.app.calculate_posture(&req.node_id);
     let now = now_ms();
     if let Ok(posture_json) = serde_json::to_string(&posture) {
-        if let Ok(store) = svc.app.store.lock() {
-            let _ = store.save_posture_event(
+        if let Ok(mut store) = svc.app.store.lock() {
+            if let Err(e) = store.save_posture_event_chained(
                 &req.node_id, "DEPENDENCY_UPDATED", &posture_json, None, now,
-            );
+            ) {
+                tracing::error!(error=%e, node_id=%req.node_id,
+                    "AUDIT-CHAIN WRITE FAILED for DEPENDENCY_UPDATED — event missing from tamper-evident log");
+            }
         }
     }
     emit_posture_event(&svc.app, "DEPENDENCY_GRAPH_MUTATED", Some(req.node_id.clone()));
@@ -1008,11 +1014,14 @@ async fn handle_actuator_motion_command(
         "delta_time_s":               cmd.delta_time_s,
         "admitted_at_ms":             now,
     });
-    if let Ok(store) = svc.app.store.lock() {
-        let _ = store.save_posture_event(
+    if let Ok(mut store) = svc.app.store.lock() {
+        if let Err(e) = store.save_posture_event_chained(
             "actuator_motion", "MOTION_COMMAND_ADMITTED",
             &audit.to_string(), None, now,
-        );
+        ) {
+            tracing::error!(error=%e,
+                "AUDIT-CHAIN WRITE FAILED for MOTION_COMMAND_ADMITTED — event missing from tamper-evident log");
+        }
     }
 
     (StatusCode::OK, Json(serde_json::json!({
@@ -1078,11 +1087,14 @@ async fn handle_sensor_fault_report(
             "hardware_fault_detected": req.hardware_fault_detected,
             "reason":                  reason,
         });
-        if let Ok(store) = svc.app.store.lock() {
-            let _ = store.save_posture_event(
+        if let Ok(mut store) = svc.app.store.lock() {
+            if let Err(e) = store.save_posture_event_chained(
                 &req.source_node_id, "SENSOR_HEALTH_REPORT_FAULT",
                 &event.to_string(), None, now,
-            );
+            ) {
+                tracing::error!(error=%e, node_id=%req.source_node_id,
+                    "AUDIT-CHAIN WRITE FAILED for SENSOR_HEALTH_REPORT_FAULT — event missing from tamper-evident log");
+            }
         }
 
         emit_posture_event(&svc.app, "NODE_STATUS_CHANGED", Some(req.source_node_id.clone()));
@@ -1135,16 +1147,19 @@ async fn handle_sensor_fault_report(
                         Json(json!({ "error": "failed to persist node state" }))).into_response();
             }
 
-            if let Ok(store) = svc.app.store.lock() {
+            if let Ok(mut store) = svc.app.store.lock() {
                 let _ = store.reset_recovery_streak(&req.source_node_id, now);
                 let event = json!({
                     "source_node_id": req.source_node_id,
                     "streak":         streak,
                 });
-                let _ = store.save_posture_event(
+                if let Err(e) = store.save_posture_event_chained(
                     &req.source_node_id, "SENSOR_RECOVERY_CONFIRMED",
                     &event.to_string(), None, now,
-                );
+                ) {
+                    tracing::error!(error=%e, node_id=%req.source_node_id,
+                        "AUDIT-CHAIN WRITE FAILED for SENSOR_RECOVERY_CONFIRMED — event missing from tamper-evident log");
+                }
             }
 
             emit_posture_event(&svc.app, "NODE_STATUS_CHANGED", Some(req.source_node_id.clone()));
@@ -1182,7 +1197,7 @@ async fn handle_register_av_asset(
     let floor = req.confidence_floor.unwrap_or(0.70);
 
     match svc.app.store.lock() {
-        Ok(store) => {
+        Ok(mut store) => {
             if let Err(e) = store.register_av_subsystem_meta(
                 &req.node_id, &req.subsystem_type, &req.hardware_id, floor, now,
             ) {
@@ -1197,9 +1212,12 @@ async fn handle_register_av_asset(
                 "hardware_id":      req.hardware_id,
                 "confidence_floor": floor,
             });
-            let _ = store.save_posture_event(
+            if let Err(e) = store.save_posture_event_chained(
                 &req.node_id, "AV_ASSET_REGISTERED", &meta.to_string(), None, now,
-            );
+            ) {
+                tracing::error!(error=%e, node_id=%req.node_id,
+                    "AUDIT-CHAIN WRITE FAILED for AV_ASSET_REGISTERED — event missing from tamper-evident log");
+            }
         }
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
                           Json(json!({ "error": "store lock poisoned" }))).into_response(),
