@@ -39,7 +39,7 @@ default = []
 #   source /opt/ros/jazzy/setup.bash
 #   apt install ros-jazzy-lanelet2 libboost-serialization-dev
 # (or the integrator's equivalents) — see README.
-ros2 = ["dep:r2r", "dep:cxx", "dep:cxx-build", "dep:tracing-subscriber"]
+ros2 = ["dep:r2r", "dep:cxx", "dep:cxx-build", "dep:tracing-subscriber", "dep:futures"]
 
 [dependencies]
 # Concurrency primitives shared with the safety kernel.
@@ -68,6 +68,13 @@ cxx = { version = "1.0", optional = true }
 # the ros2 feature because only the binary uses it (the library uses
 # `tracing` directly without a subscriber).
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optional = true }
+
+# Phase 4: futures Stream / StreamExt for consuming r2r's untyped
+# subscription streams in the subscription-stamping tasks. r2r itself
+# pulls this in transitively at the same major version; depending on it
+# explicitly pins our usage. Gated on `ros2` since only the node code
+# touches r2r streams.
+futures = { version = "0.3", optional = true }
 
 [build-dependencies]
 # cxx-build — compiles the C++ shim and the cxx-generated glue. Must

@@ -84,6 +84,13 @@ fn wall_clock_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Same as `wall_clock_ms` but with a name that's less likely to collide
+/// inside a closure body that already has a `wall_clock_ms` shadow. The
+/// stamping tasks call this on every received message; it's hot enough
+/// that the call is inlined.
+#[inline]
+fn now_ms_wall() -> u64 { wall_clock_ms() }
+
 /// Trajectory ingress payload. The subscription callback (Phase 2B —
 /// when Lanelet2 wiring lands) deserializes
 /// `autoware_planning_msgs::Trajectory` into this shape. Carries the
@@ -171,12 +178,15 @@ pub async fn run_adapter(
     // r2r 0.9 takes string-typed message names so the integrator's
     // package layout is what binds them. The exact field shapes are
     // pinned in Phase 2 with the integrator's Autoware release tag.
-    let _traj_sub = node.subscribe_untyped(
+    // Each subscription returns a Stream<Item = …> that we hold for the
+    // lifetime of the adapter task and drain in dedicated stamping
+    // tasks (below).
+    let traj_stream = node.subscribe_untyped(
         "~/input/trajectory",
         "autoware_planning_msgs/msg/Trajectory",
         r2r::QosProfile::default(),
     )?;
-    let _obj_sub = node.subscribe_untyped(
+    let obj_stream = node.subscribe_untyped(
         "~/input/objects",
         "autoware_perception_msgs/msg/PredictedObjects",
         r2r::QosProfile::default(),
@@ -186,7 +196,7 @@ pub async fn run_adapter(
         "autoware_map_msgs/msg/LaneletMapBin",
         r2r::QosProfile::default(),
     )?;
-    let _odom_sub = node.subscribe_untyped(
+    let odom_stream = node.subscribe_untyped(
         "~/input/odometry",
         "nav_msgs/msg/Odometry",
         r2r::QosProfile::default(),
@@ -201,8 +211,65 @@ pub async fn run_adapter(
         node = node_name,
         traj_cap = TRAJECTORY_CHANNEL_CAPACITY,
         ctrl_cap = CONTROL_CHANNEL_CAPACITY,
-        "kirra-ros2-adapter: subscriptions registered (Phase 1 skeleton)"
+        "kirra-ros2-adapter: subscriptions registered"
     );
+
+    // ----- Subscription-stamping tasks (SG9 liveness) -------------------
+    //
+    // For each REQUIRED subscription (trajectory / objects / odometry),
+    // spawn a task that drains the stream and stamps the matching
+    // `last_*_ms` slot on AdaptorState on every received message. This
+    // is what makes `AdaptorState::any_subscription_stale` actually
+    // observe liveness in production — without these stamping tasks,
+    // the AtomicU64 slots stay at the cold-start sentinel `0` and the
+    // fast loop publishes MRC every cycle (the safe direction, but
+    // useless behavior).
+    //
+    // Phase 4: untyped — we throw away the deserialized payload and
+    // only carry the arrival timestamp. Phase 4-follow-up (or the
+    // integrator's typed-callback pin) replaces these with typed
+    // deserializers that also push to trajectory_tx / control_tx /
+    // update_objects / update_odom.
+    use futures::StreamExt;
+
+    let traj_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut s = traj_stream;
+        while let Some(item) = s.next().await {
+            match item {
+                Ok(_msg) => traj_state.touch_trajectory(now_ms_wall()),
+                Err(e) => tracing::warn!(error = ?e,
+                    "trajectory subscription stream returned Err — slot left un-touched this tick"),
+            }
+        }
+        tracing::error!("trajectory subscription stream closed — staleness will fire fleet-wide");
+    });
+
+    let obj_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut s = obj_stream;
+        while let Some(item) = s.next().await {
+            match item {
+                Ok(_msg) => obj_state.touch_objects(now_ms_wall()),
+                Err(e) => tracing::warn!(error = ?e,
+                    "objects subscription stream returned Err — slot left un-touched this tick"),
+            }
+        }
+        tracing::error!("objects subscription stream closed — staleness will fire fleet-wide");
+    });
+
+    let odom_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut s = odom_stream;
+        while let Some(item) = s.next().await {
+            match item {
+                Ok(_msg) => odom_state.touch_odom(now_ms_wall()),
+                Err(e) => tracing::warn!(error = ?e,
+                    "odometry subscription stream returned Err — slot left un-touched this tick"),
+            }
+        }
+        tracing::error!("odometry subscription stream closed — staleness will fire fleet-wide");
+    });
 
     // ----- Slow loop (Phase 2A) ----------------------------------------
     //

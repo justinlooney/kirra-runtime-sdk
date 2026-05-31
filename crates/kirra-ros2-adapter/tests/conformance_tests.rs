@@ -126,6 +126,14 @@ fn test_no_trajectory_mrcs() {
 /// regardless of the AcceptedTrajectory + command state. The freshly-
 /// constructed AdaptorState has all three `last_*_ms = 0` so it is
 /// stale immediately — the safe direction at cold start.
+///
+/// NOTE (Phase 4b): this test exercises the staleness logic and the
+/// `touch_*` / `any_subscription_stale` contract directly. The
+/// subscription → state plumbing (the spawned drain tasks in
+/// `node.rs::run_adapter` that turn r2r `subscribe_untyped` streams
+/// into `state.touch_*(now_ms)` calls) is gated behind the `ros2`
+/// feature and is tested as part of the CARLA scenario suite (requires
+/// ROS env). See `docs/testing/CARLA_SCENARIO_SUITE.md` §B and §C.1.
 #[test]
 fn test_stale_subscription_mrcs() {
     let state = AdaptorState::new();
