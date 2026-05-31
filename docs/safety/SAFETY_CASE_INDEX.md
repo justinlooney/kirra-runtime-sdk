@@ -37,6 +37,8 @@ Date: 2026-05-23
 | KIRRA-OCCY-ADR-004 | ADR-0004: Independent Safety Channel — D1–D3 settlement | 1.0 | Superseded by ADR-0003 | docs/adr/0004-independent-safety-channel.md | 2026-05-31 |
 | KIRRA-OCCY-INTEG-001 | Occy Governor integrity evidence plan (S3 — WCET / MC/DC / traceability / FFI / Ferrocene / safety manual) | 0.1 | Draft | docs/safety/GOVERNOR_INTEGRITY_EVIDENCE.md | 2026-05-31 |
 | KIRRA-OCCY-FAULT-001 | Occy Governor fault model + degraded-mode availability (S7) | 0.1 | Draft | docs/safety/OCCY_FAULT_MODEL.md | 2026-05-31 |
+| KIRRA-OCCY-TRACE-001 | Occy Safety Traceability Convention (tag format + CI gate spec) | 0.1 | Draft | docs/safety/TRACEABILITY.md | 2026-05-31 |
+| KIRRA-OCCY-TRACE-MATRIX-001 | Occy Safety Traceability Matrix (auto-generated from `// SAFETY:` tags) | 0.1 | Auto-generated | docs/safety/TRACEABILITY_MATRIX.md | 2026-05-31 |
 
 ---
 
