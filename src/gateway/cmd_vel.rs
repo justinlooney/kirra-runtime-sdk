@@ -130,4 +130,80 @@ mod tests {
             "non-zero angular_y must reject"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // MC/DC pair-completion tests (S3 / #115 — KIRRA-OCCY-MCDC-001).
+    //
+    // The first six clauses of `validate_cmd_vel` (the `is_finite()` OR-chain
+    // at l.34–39) and the two-clause angular-non-zero guard at l.44 each have
+    // both their true and false arms exercised by the parameterised tests
+    // above. The final bounded-magnitude AND-chain at l.48–51 also requires
+    // an independent-effect demonstration of each clause's FALSE arm. Two
+    // clauses cannot have a non-zero limit and a non-zero permitted input
+    // simultaneously under `DEFAULT_CMD_VEL_LIMITS` (max_linear_y_abs and
+    // max_linear_z_abs are both 0.0 — a differential-drive platform), so we
+    // construct a custom `CmdVelLimits` profile that admits non-zero y / z
+    // and then push each axis past its bound in isolation.
+    // ---------------------------------------------------------------------
+
+    /// MC/DC: independent-effect of `linear_y.abs() <= max_linear_y_abs`
+    /// (l.49). All other clauses pass; only the linear_y clause flips
+    /// FALSE. Validates the false arm of the AND term.
+    #[test]
+    fn test_cmd_vel_exceeds_linear_y_with_custom_limits() {
+        let limits = CmdVelLimits {
+            max_linear_x_abs: 1.0,
+            max_linear_y_abs: 0.5,
+            max_linear_z_abs: 0.5,
+            max_angular_z_abs: 1.0,
+        };
+        let cmd = CmdVel {
+            linear_x: 0.25, linear_y: 0.9, linear_z: 0.0,
+            angular_x: 0.0, angular_y: 0.0, angular_z: 0.2,
+        };
+        assert!(
+            !validate_cmd_vel(&cmd, limits),
+            "linear_y over the per-axis cap must reject"
+        );
+    }
+
+    /// MC/DC: independent-effect of `linear_z.abs() <= max_linear_z_abs`
+    /// (l.50). Only the linear_z clause flips FALSE; all others pass.
+    #[test]
+    fn test_cmd_vel_exceeds_linear_z_with_custom_limits() {
+        let limits = CmdVelLimits {
+            max_linear_x_abs: 1.0,
+            max_linear_y_abs: 0.5,
+            max_linear_z_abs: 0.5,
+            max_angular_z_abs: 1.0,
+        };
+        let cmd = CmdVel {
+            linear_x: 0.25, linear_y: 0.0, linear_z: -0.9,
+            angular_x: 0.0, angular_y: 0.0, angular_z: 0.2,
+        };
+        assert!(
+            !validate_cmd_vel(&cmd, limits),
+            "linear_z over the per-axis cap must reject"
+        );
+    }
+
+    /// MC/DC: all four bounded-magnitude clauses true → Allow.
+    /// Anchors the AND-chain's TRUE arm on the custom-limits profile.
+    #[test]
+    fn test_cmd_vel_all_bounds_satisfied_with_custom_limits() {
+        let limits = CmdVelLimits {
+            max_linear_x_abs: 1.0,
+            max_linear_y_abs: 0.5,
+            max_linear_z_abs: 0.5,
+            max_angular_z_abs: 1.0,
+        };
+        let cmd = CmdVel {
+            linear_x: 0.25, linear_y: 0.2, linear_z: -0.3,
+            angular_x: 0.0, angular_y: 0.0, angular_z: 0.2,
+        };
+        assert!(
+            validate_cmd_vel(&cmd, limits),
+            "all axes within their per-axis caps must Allow"
+        );
+    }
 }

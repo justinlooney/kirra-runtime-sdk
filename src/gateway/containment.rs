@@ -567,6 +567,129 @@ mod tests {
         assert_eq!(as_json, "\"DRIVABLE_SPACE_DEPARTURE\"");
     }
 
+    // ---------------------------------------------------------------------
+    // MC/DC pair-completion tests (S3 / #115 — KIRRA-OCCY-MCDC-001).
+    //
+    // The AND-chain in `Corridor::is_healthy` (l.96–104) and the
+    // `footprint_is_finite` guard at l.171 each need an independent-effect
+    // demonstration of every clause. Existing tests cover the
+    // `confidence < min_confidence` and `age_ms > max_age_ms` clauses; the
+    // remaining false-arm gaps are the `right.len() >= 2`, both
+    // `len() <= MAX_CORRIDOR_VERTICES` clauses, the `confidence.is_finite()`
+    // tail, and the footprint-finite guard.
+    // ---------------------------------------------------------------------
+
+    /// MC/DC: independent-effect of `right.len() >= 2` (is_healthy l.100
+    /// FALSE arm). Left side is fine; right side has only one vertex.
+    #[test]
+    fn containment_rejects_when_right_side_too_short() {
+        let left = vec![
+            Point { x_m: 0.0,   y_m: 3.0 },
+            Point { x_m: 100.0, y_m: 3.0 },
+        ];
+        let right = vec![Point { x_m: 0.0, y_m: -3.0 }]; // < 2
+        let corridor = Corridor {
+            left: &left, right: &right,
+            confidence: 0.95, age_ms: 10,
+            min_confidence: 0.5, max_age_ms: 500,
+        };
+        let traj = vec![pose(20.0, 0.0, 0.0)];
+        let action = validate_trajectory_containment(&traj, &corridor, &sedan());
+        assert_eq!(
+            action,
+            EnforceAction::DenyBreach(DenyCode::DrivableSpaceDeparture),
+            "single-vertex right side must Reject (is_healthy false)"
+        );
+    }
+
+    /// MC/DC: independent-effect of `left.len() <= MAX_CORRIDOR_VERTICES`
+    /// (is_healthy l.101 FALSE arm). Right side ok; left side over-cap.
+    #[test]
+    fn containment_rejects_when_left_side_overflows_max_vertices() {
+        let left: Vec<Point> = (0..(MAX_CORRIDOR_VERTICES + 1))
+            .map(|i| Point { x_m: i as f64, y_m: 3.0 })
+            .collect();
+        let right: Vec<Point> = (0..8)
+            .map(|i| Point { x_m: (i as f64) * 10.0, y_m: -3.0 })
+            .collect();
+        let corridor = Corridor {
+            left: &left, right: &right,
+            confidence: 0.95, age_ms: 10,
+            min_confidence: 0.5, max_age_ms: 500,
+        };
+        let traj = vec![pose(20.0, 0.0, 0.0)];
+        let action = validate_trajectory_containment(&traj, &corridor, &sedan());
+        assert_eq!(
+            action,
+            EnforceAction::DenyBreach(DenyCode::DrivableSpaceDeparture),
+            "left-side over MAX_CORRIDOR_VERTICES must Reject"
+        );
+    }
+
+    /// MC/DC: independent-effect of `right.len() <= MAX_CORRIDOR_VERTICES`
+    /// (is_healthy l.102 FALSE arm). Left side ok; right side over-cap.
+    #[test]
+    fn containment_rejects_when_right_side_overflows_max_vertices() {
+        let left: Vec<Point> = (0..8)
+            .map(|i| Point { x_m: (i as f64) * 10.0, y_m: 3.0 })
+            .collect();
+        let right: Vec<Point> = (0..(MAX_CORRIDOR_VERTICES + 1))
+            .map(|i| Point { x_m: i as f64, y_m: -3.0 })
+            .collect();
+        let corridor = Corridor {
+            left: &left, right: &right,
+            confidence: 0.95, age_ms: 10,
+            min_confidence: 0.5, max_age_ms: 500,
+        };
+        let traj = vec![pose(20.0, 0.0, 0.0)];
+        let action = validate_trajectory_containment(&traj, &corridor, &sedan());
+        assert_eq!(
+            action,
+            EnforceAction::DenyBreach(DenyCode::DrivableSpaceDeparture),
+            "right-side over MAX_CORRIDOR_VERTICES must Reject"
+        );
+    }
+
+    /// MC/DC: independent-effect of `confidence.is_finite()` (is_healthy
+    /// l.103 FALSE arm). A NaN confidence with all other geometry clauses
+    /// true must reject. The other clauses are constructed so the
+    /// confidence.is_finite() result is the sole determinant.
+    #[test]
+    fn containment_rejects_when_confidence_is_nan() {
+        let (left, right) = straight_corridor(3.0, 100.0);
+        let corridor = Corridor {
+            left: &left, right: &right,
+            confidence: f32::NAN, // breaks is_finite()
+            age_ms: 10,
+            min_confidence: 0.5, max_age_ms: 500,
+        };
+        let traj = vec![pose(20.0, 0.0, 0.0)];
+        let action = validate_trajectory_containment(&traj, &corridor, &sedan());
+        assert_eq!(
+            action,
+            EnforceAction::DenyBreach(DenyCode::DrivableSpaceDeparture),
+            "NaN confidence must Reject (is_finite false)"
+        );
+    }
+
+    /// MC/DC: independent-effect of `footprint_is_finite(footprint)`
+    /// guard in validate_trajectory_containment (l.171 TRUE arm). All
+    /// other gates pass; the footprint has a NaN field.
+    #[test]
+    fn containment_rejects_when_footprint_nonfinite() {
+        let (left, right) = straight_corridor(3.0, 100.0);
+        let corridor = healthy_corridor(&left, &right);
+        let mut bad = sedan();
+        bad.width_m = f64::NAN;
+        let traj = vec![pose(20.0, 0.0, 0.0)];
+        let action = validate_trajectory_containment(&traj, &corridor, &bad);
+        assert_eq!(
+            action,
+            EnforceAction::DenyBreach(DenyCode::DrivableSpaceDeparture),
+            "non-finite footprint geometry must Reject"
+        );
+    }
+
     #[test]
     fn footprint_from_contract_picks_up_geometry() {
         let c = VehicleKinematicsContract::nominal_reference_profile();
