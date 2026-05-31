@@ -81,10 +81,11 @@ Notes on the hard ones (be honest about residuals):
   tracking, prediction stay planner-side; the Governor does not need them to
   veto.
 
-## 6. Decisions (settled — see ADR-0003 + ADR-0004)
+## 6. Decisions (settled — see ADR-0003)
 
 D1–D3 were "to confirm" before ADR-0003 re-framed the IDC as the optional
-Tier-2 D1 add-on. **ADR-0004** records the technical settlement below.
+Tier-2 D1 add-on. ADR-0003 records the settlement; the per-sensor / per-class
+detail below is the canonical technical spec.
 
 - **D1 — Sensor mix (hybrid, dedicated where diversity matters).** SETTLED:
   - **Radar — DEDICATED** (obstacle in path; moving-VRU micro-Doppler).

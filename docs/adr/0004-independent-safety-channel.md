@@ -1,8 +1,23 @@
 # ADR-0004: Independent Safety Channel — D1–D3 settlement
 
+> **SUPERSEDED by [ADR-0003](0003-two-tier-base-and-d1-addon.md)** — 2026-05-31.
+>
+> ADR-0003 (two-tier architecture: base downstream Governor + optional D1
+> add-on) is the canonical record of the D1 add-on decision and its scope.
+> This ADR was filed to formalize the D1–D3 technical settlement (sensor mix,
+> v1 scope, compute placement) but is **superseded** by ADR-0003 per owner
+> decision; ADR-0003 carries the D1–D3 settlement as part of the two-tier
+> architecture record.
+>
+> The technical detail below — hybrid sensor mix per class, v1 scope decision,
+> Governor + D1 as one independent safety channel — remains accurate and is
+> retained in `docs/safety/OCCY_INDEPENDENT_DETECTOR.md` §6 (the canonical
+> spec location). This file is kept for historical traceability and SHOULD
+> NOT be referenced as authoritative; cite ADR-0003 instead.
+
 | Field | Value |
 |---|---|
-| Status | Accepted |
+| Status | **Superseded by ADR-0003** |
 | Date | 2026-05-31 |
 | Deciders | Project owner |
 | Issues | #124 (D1 add-on), #114 (S2 DFA), #120 (S8 V&V), #123 (G2 localization), #122 (G1 occlusion) |
