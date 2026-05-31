@@ -47,7 +47,7 @@ fn test_clean_trajectory_accepts() {
     let cfg = VehicleConfig::default_urban();
 
     let start = std::time::Instant::now();
-    let verdict = validate_trajectory_slow(&trajectory, &corridor, &objects, &cfg);
+    let verdict = validate_trajectory_slow(&trajectory, &corridor, &objects, &cfg, None);
     let elapsed_us = start.elapsed().as_micros();
 
     // Print the WCET for the report.
@@ -74,7 +74,7 @@ fn test_corridor_departure_rejects() {
     let objects: Vec<PerceivedObject> = Vec::new();
     let cfg = VehicleConfig::default_urban();
 
-    let verdict = validate_trajectory_slow(&trajectory, &corridor, &objects, &cfg);
+    let verdict = validate_trajectory_slow(&trajectory, &corridor, &objects, &cfg, None);
     assert_eq!(verdict, TrajectoryVerdict::MRCFallback,
         "pose outside the corridor must MRC; got {verdict:?}");
 }
@@ -100,7 +100,7 @@ fn test_rss_violation_rejects() {
     }];
     let cfg = VehicleConfig::default_urban();
 
-    let verdict = validate_trajectory_slow(&trajectory, &corridor, &objects, &cfg);
+    let verdict = validate_trajectory_slow(&trajectory, &corridor, &objects, &cfg, None);
     assert_eq!(verdict, TrajectoryVerdict::MRCFallback,
         "object 4 m ahead at ego 10 m/s must trigger RSS MRC; got {verdict:?}");
 }
@@ -131,7 +131,7 @@ fn test_kinematic_deny_rejects() {
     let objects: Vec<PerceivedObject> = Vec::new();
     let cfg = VehicleConfig::default_urban();
 
-    let verdict = validate_trajectory_slow(&trajectory, &corridor, &objects, &cfg);
+    let verdict = validate_trajectory_slow(&trajectory, &corridor, &objects, &cfg, None);
     assert_eq!(verdict, TrajectoryVerdict::MRCFallback,
         "P1 InvalidTimeDelta DenyBreach must MRC; got {verdict:?}");
 }
@@ -166,7 +166,7 @@ fn test_clamp_returns_clamp() {
     let objects: Vec<PerceivedObject> = Vec::new();
     let cfg = VehicleConfig::default_urban();
 
-    let verdict = validate_trajectory_slow(&trajectory, &corridor, &objects, &cfg);
+    let verdict = validate_trajectory_slow(&trajectory, &corridor, &objects, &cfg, None);
     assert_eq!(verdict, TrajectoryVerdict::Clamp,
         "trajectory with per-pose ClampLinear (P3 accel ceiling) but containment + RSS \
          clean must produce Clamp; got {verdict:?}");

@@ -175,6 +175,30 @@ pub struct PerceivedObject {
     pub heading_rad: f64,
 }
 
+/// Minimal ego-odometry snapshot. Phase 3 introduces this to fix the
+/// `current_steering_angle_deg = 0.0` approximation in
+/// `validate_trajectory_slow` AND to feed the fast-loop conformance
+/// check the current ego velocity for the staleness / nearest-point
+/// lookup.
+///
+/// `linear_x_mps` is the ego longitudinal velocity in the vehicle frame
+/// (from `nav_msgs::Odometry::twist.twist.linear.x`). `yaw_rate_rads`
+/// is the angular velocity around the vertical axis (from
+/// `twist.twist.angular.z`). `stamp_ms` is the message timestamp in
+/// wall-clock ms — used to detect a stale odom snapshot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EgoOdom {
+    pub linear_x_mps: f64,
+    pub yaw_rate_rads: f64,
+    pub stamp_ms: u64,
+}
+
+impl Default for EgoOdom {
+    fn default() -> Self {
+        Self { linear_x_mps: 0.0, yaw_rate_rads: 0.0, stamp_ms: 0 }
+    }
+}
+
 /// Per-asset accepted-trajectory store + perception cache + vehicle config.
 /// DashMap on the trajectory side fits the existing AppState concurrency
 /// model: the slow loop installs / updates entries; the fast loop reads
@@ -195,6 +219,11 @@ pub struct AdaptorState {
     /// Per-asset vehicle config (Phase 2A: single config, shared). Phase
     /// 4 may make this per-asset.
     pub config: Arc<VehicleConfig>,
+    /// Latest ego odometry snapshot. `Option` is `None` from boot until
+    /// the first `nav_msgs::Odometry` lands. Slow loop reads it to derive
+    /// `current_steering_angle_deg` for the FIRST pose-pair (Phase 3 fix);
+    /// fast loop reads it for the conformance check.
+    pub latest_odom: Arc<RwLock<Option<EgoOdom>>>,
 }
 
 impl AdaptorState {
@@ -203,6 +232,7 @@ impl AdaptorState {
             by_asset: DashMap::new(),
             objects_cache: Arc::new(RwLock::new(Vec::new())),
             config: Arc::new(VehicleConfig::default_urban()),
+            latest_odom: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -214,7 +244,28 @@ impl AdaptorState {
             by_asset: DashMap::new(),
             objects_cache: Arc::new(RwLock::new(Vec::new())),
             config: Arc::new(config),
+            latest_odom: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Replaces the ego-odometry snapshot. Called by the adapter's
+    /// `nav_msgs::Odometry` subscriber on each tick.
+    pub fn update_odom(&self, odom: EgoOdom) {
+        if let Ok(mut guard) = self.latest_odom.write() {
+            *guard = Some(odom);
+        } else {
+            tracing::error!(
+                "latest_odom RwLock POISONED — ego-odometry snapshot dropped"
+            );
+        }
+    }
+
+    /// Read-and-clone of the latest ego-odometry snapshot. Fast-loop +
+    /// slow-loop both use this. Returns `None` until the first odom
+    /// message lands; callers MUST treat `None` as "no estimate
+    /// available" and fall back conservatively.
+    pub fn snapshot_odom(&self) -> Option<EgoOdom> {
+        self.latest_odom.read().ok().and_then(|g| *g)
     }
 
     /// Replaces the perception snapshot with a fresh one. Called by the

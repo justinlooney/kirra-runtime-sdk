@@ -39,8 +39,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::corridor::CorridorSource;
-use crate::state::{AdaptorState, TrajectoryPoint};
-use crate::validation::validate_trajectory_slow;
+use crate::state::{AdaptorState, EgoOdom, TrajectoryPoint};
+use crate::validation::{
+    check_command_conforms, validate_trajectory_slow, ConformanceVerdict, IncomingControl,
+};
 
 /// Capacity of the trajectory channel between the ROS subscription side
 /// and the slow-loop validator. 4 is generous: the slow loop processes
@@ -54,6 +56,21 @@ pub const TRAJECTORY_CHANNEL_CAPACITY: usize = 4;
 /// conformance check defaults to MRC via the staleness path).
 pub const CONTROL_CHANNEL_CAPACITY: usize = 16;
 
+/// Fast-loop conformance budget — see design §4 (per-cycle FTTI).
+/// 200 µs = 2% of a 100 Hz control cycle (10 ms). This is separate from
+/// the existing 100 µs SG9 timeout for the kernel's per-command verdict
+/// path; the two loops have independent budgets because they fire at
+/// different rates.
+pub const FAST_LOOP_WCET_BUDGET_US: u128 = 200;
+
+#[inline]
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Trajectory ingress payload. The subscription callback (Phase 2B —
 /// when Lanelet2 wiring lands) deserializes
 /// `autoware_planning_msgs::Trajectory` into this shape. Carries the
@@ -66,13 +83,54 @@ pub struct IngressTrajectory {
     pub points: Vec<TrajectoryPoint>,
 }
 
-/// Stub payload for control-command ingress. Phase 2 replaces with a
-/// typed `autoware_control_msgs::Control` map.
+/// Control-command ingress payload (envelope over the typed
+/// `autoware_control_msgs::Control` map). The fast-loop task converts
+/// this to `IncomingControl` for the conformance check.
 #[derive(Debug, Clone)]
 pub struct IngressControlCommand {
     pub asset_id: String,
     pub linear_velocity_mps: f64,
     pub steering_angle_rad: f64,
+    /// Wall-clock ms when the command was received.
+    pub stamp_ms: u64,
+}
+
+/// Outgoing control command — the gated command (pass-through on
+/// Accept, MRC on Reject/no-trajectory). Phase 4 replaces with a typed
+/// `autoware_control_msgs::Control` publisher.
+#[derive(Debug, Clone)]
+pub struct OutgoingControlCommand {
+    pub asset_id: String,
+    pub linear_velocity_mps: f64,
+    pub steering_angle_rad: f64,
+    pub accel_mps2: f64,
+}
+
+/// Returns the MRC command: zero velocity, neutral steering, max-decel
+/// brake ramp. The integrator's vehicle interface honours the
+/// `accel_mps2 = -config.max_decel_mps2` as a service-brake demand
+/// (separate from any hardware emergency-brake interlock).
+pub fn mrc_command(asset_id: impl Into<String>, max_decel_mps2: f64) -> OutgoingControlCommand {
+    OutgoingControlCommand {
+        asset_id: asset_id.into(),
+        linear_velocity_mps: 0.0,
+        steering_angle_rad: 0.0,
+        accel_mps2: -max_decel_mps2,
+    }
+}
+
+#[inline]
+fn cmd_to_output(asset_id: &str, cmd: &IncomingControl) -> OutgoingControlCommand {
+    OutgoingControlCommand {
+        asset_id: asset_id.to_string(),
+        linear_velocity_mps: cmd.velocity_mps,
+        steering_angle_rad: cmd.steering_rad,
+        // Pass-through accel: Phase 3 carries 0 (the integrator's
+        // existing accel-from-velocity controller computes this on the
+        // vehicle side). Phase 4 may carry the planner's commanded
+        // accel through if `autoware_control_msgs::Control` has it.
+        accel_mps2: 0.0,
+    }
 }
 
 /// Run the adapter node. Owns the r2r context for the lifetime of the
@@ -150,11 +208,13 @@ pub async fn run_adapter(
         while let Some(traj) = rx.recv().await {
             let start = std::time::Instant::now();
             let objects = slow_state.snapshot_objects();
+            let odom = slow_state.snapshot_odom();
             let verdict = validate_trajectory_slow(
                 &traj.points,
                 slow_corridor.as_ref(),
                 &objects,
                 &slow_state.config,
+                odom.as_ref(),
             );
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -185,24 +245,87 @@ pub async fn run_adapter(
         }
     });
 
-    // ----- Fast loop ----------------------------------------------------
+    // ----- Fast loop (Phase 3) -----------------------------------------
     //
-    // Receives every outgoing control command and (in Phase 3) checks
-    // it conforms to the per-asset AcceptedTrajectory. Phase 1: log
-    // receipt only.
+    // For each incoming control command from vehicle_cmd_gate's output:
+    //   1. Snapshot the per-asset AcceptedTrajectory (clone — do NOT
+    //      hold the DashMap shard lock across the conformance check).
+    //   2. Snapshot the latest ego odometry (read-and-clone).
+    //   3. Call check_command_conforms.
+    //   4. On Accept: publish the pass-through command.
+    //      On MRCFallback OR no trajectory installed: publish the MRC
+    //      command (zero velocity, neutral steering, max-decel brake).
+    //   5. Log WCET; warn if elapsed > 200 µs (the fast-loop budget per
+    //      design §4 — 2% of a 100 Hz control cycle).
+    //
+    // Publication: Phase 3 emits `OutgoingControlCommand` on an
+    // internal channel `fast_loop_out_rx`. Phase 4 (or the integrator's
+    // glue) wires this to a `~/output/control_cmd` r2r publisher; the
+    // separation keeps the conformance check stays ROS-free.
+    let (fast_loop_out_tx, mut fast_loop_out_rx) =
+        mpsc::channel::<OutgoingControlCommand>(CONTROL_CHANNEL_CAPACITY);
     let fast_state = Arc::clone(&state);
     tokio::spawn(async move {
         let mut rx = control_rx;
-        while let Some(cmd) = rx.recv().await {
+        while let Some(in_cmd) = rx.recv().await {
+            let start = std::time::Instant::now();
+            let now_ms = wall_clock_ms();
+            let cmd = IncomingControl {
+                velocity_mps: in_cmd.linear_velocity_mps,
+                steering_rad: in_cmd.steering_angle_rad,
+                stamp_ms:     in_cmd.stamp_ms,
+            };
+            let odom = fast_state.snapshot_odom().unwrap_or_default();
+            let traj = fast_state.snapshot(&in_cmd.asset_id);
+            let verdict = match traj.as_ref() {
+                Some(t) => check_command_conforms(
+                    &cmd, t, &odom, &fast_state.config, now_ms,
+                ),
+                None => ConformanceVerdict::MRCFallback,
+            };
+            let out = match verdict {
+                ConformanceVerdict::Accept => cmd_to_output(&in_cmd.asset_id, &cmd),
+                ConformanceVerdict::MRCFallback =>
+                    mrc_command(in_cmd.asset_id.clone(), fast_state.config.max_decel_mps2),
+            };
+            if let Err(e) = fast_loop_out_tx.try_send(out) {
+                tracing::error!(
+                    asset_id = %in_cmd.asset_id,
+                    error = ?e,
+                    "fast-loop output channel send failed — downstream publisher missing or full",
+                );
+            }
+            let elapsed_us = start.elapsed().as_micros();
             tracing::debug!(
-                asset_id = %cmd.asset_id,
-                v = cmd.linear_velocity_mps,
-                delta = cmd.steering_angle_rad,
-                "fast-loop received control command (Phase 1 stub: no conformance check)"
+                asset_id = %in_cmd.asset_id,
+                verdict = ?verdict,
+                elapsed_us = elapsed_us,
+                "fast_loop_verdict"
             );
-            // Phase 3: read fast_state.snapshot, compute nearest-point
-            // conformance, publish gated command OR MRC.
-            let _ = fast_state.len();
+            if elapsed_us > FAST_LOOP_WCET_BUDGET_US {
+                tracing::warn!(
+                    asset_id = %in_cmd.asset_id,
+                    elapsed_us = elapsed_us,
+                    "fast_loop_wcet_exceeded"
+                );
+            }
+        }
+    });
+
+    // ----- Output publisher (Phase 3 placeholder) ----------------------
+    //
+    // For Phase 3 we drain the fast-loop output channel and log each
+    // command. Phase 4 replaces this with an r2r publisher to
+    // ~/output/control_cmd.
+    tokio::spawn(async move {
+        while let Some(out) = fast_loop_out_rx.recv().await {
+            tracing::debug!(
+                asset_id = %out.asset_id,
+                v = out.linear_velocity_mps,
+                delta = out.steering_angle_rad,
+                accel = out.accel_mps2,
+                "fast-loop output (Phase 3 placeholder: would publish on ~/output/control_cmd)"
+            );
         }
     });
 
