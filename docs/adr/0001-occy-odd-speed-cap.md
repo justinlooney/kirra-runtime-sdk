@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Accepted |
+| Status | Accepted (extended by ADR-0002) |
 | Date | 2026-05-31 |
 | Deciders | Project owner |
 | Issues | S1 (#113), S4 (#116), S8 (#120), S3 (#115), #99 |

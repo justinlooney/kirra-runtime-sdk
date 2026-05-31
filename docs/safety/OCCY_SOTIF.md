@@ -46,14 +46,48 @@ depth-evidence earn-back (#98) and the flood demo (#100). Rail crossings are
 This is the full-driverless deployment basis: all core safety goals carry
 ASIL D under C3 controllability; SG4 and SG5 are **active at ASIL B** (not QM).
 
-### 1.2 Target ODD
+### 1.2 Sub-ODD model + condition-dependent speed cap (design hook for highway operation)
 
-The L4 generalization expands the road envelope to include highways / ramps
-and raises the speed cap (per a separate S8 validation that the worst-case
-detection range supports the higher cap's required look-ahead). Weather, night,
-water-prone, and rail-dense regions are already in Phase-1 scope. ODD expansion
-remains the unit of safety-scope growth: each expansion is a distinct S8
-evidence package + ADR + re-validation of the cap rule.
+The deployment ODD is partitioned into **sub-ODDs**, each with its own nominal
+cap and entry conditions. The Governor enforces the cap of the **currently
+confirmed sub-ODD** — never the planner's requested sub-ODD without independent
+verification.
+
+| Sub-ODD | Status | Road type | Nominal cap | Hazard profile |
+|---|---|---|---|---|
+| **A — Urban / surface** | **ACTIVE at launch** | Surface streets | 50 mph (ADR-0001) | Full: VRU, intersections, water, rail |
+| **B — Controlled-access highway** | **DEFINED, NOT ACTIVATED** | Divided, controlled-access; no at-grade crossings; no VRU / cross-traffic / driveways | Higher (earned later) | Reduced: no VRU / no crossings |
+
+**Sub-ODD B is keyed on road type — access-control + divided — NOT posted
+speed.** A fast undivided arterial stays Sub-ODD A regardless of its speed
+limit. Conflating "fast" with "controlled-access" is the dangerous failure mode
+this rule exists to prevent.
+
+**Condition-dependent cap function (enforced each cycle by the Governor):**
+
+    cap = min( subODD_nominal(confirmed sub-ODD),
+               weather_derate(conditions),
+               range_supported(validated detection range) )
+
+The most-conservative input always wins.
+
+**Mode determination — Governor-confirmed, default-deny.** HD-map road class +
+localization confidence + perception corroboration. The planner may *request* a
+sub-ODD; the Governor independently *verifies* before honoring it. Sub-ODD
+determination rides on localization integrity — a common-cause input that DFA
+C6 / G2 (#123) addresses.
+
+**Asymmetric transitions — earn up slowly, drop down instantly:**
+
+- **Raise** the cap only on positive high-confidence Sub-ODD-B confirmation AND
+  validated detection range supporting the higher cap.
+- **Derate** to Sub-ODD A immediately on any loss of confirmation: off-ramp,
+  localization-confidence drop, perception ambiguity, weather, sensor
+  degradation. No hysteresis on the drop.
+
+**Activation rule.** Sub-ODD B is NOT active at launch. Activation requires its
+own safety case — tracked by a dedicated deferred issue. Recorded in ADR-0002.
+**Only Sub-ODD A is active today.**
 
 ---
 
