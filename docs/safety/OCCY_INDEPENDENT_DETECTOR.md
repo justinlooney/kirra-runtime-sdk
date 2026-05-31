@@ -52,7 +52,7 @@ here, or the ODD excludes that hazard.
 | Obstacle in path (stopped vehicle, debris) | SG1 | 4D imaging radar + classical occupancy / CFAR free-space check | radar modality + classical algorithm; weather-robust; no shared ML | low–med |
 | VRU presence incl. night (pedestrian/cyclist) | SG1, SG6 | thermal/IR + classical hot-blob; radar micro-Doppler for moving VRU | thermal sees body heat where visible camera is weakest (night); classical; radar for motion | **high (the hard one)** |
 | Standing water / untraversable surface | SG4 | lidar return-anomaly (specular/absorption "holes") + polarization-camera signature; classical | optical-physics principle, diverse from DL segmentation; flags surface anomaly → untraversable-default (no depth claim) | high |
-| Crossing state (gate/lights/train) | SG5 | map-anchored prior (already) + crossing-signal detector + radar for a fast approaching track-bearing return | primarily map + localization (G2); IDC supplements | med (mostly map-covered) |
+| Crossing state (gate/lights/train) | SG5 | v1: map-anchored prior + G2 localization. v2: crossing-signal detector + radar for a fast approaching track-bearing return | primarily map + localization (G2) in v1; D1 supplements in v2 | **v2 (deferred — map + G2 cover v1)** |
 
 Notes on the hard ones (be honest about residuals):
 - **VRU** is the highest severity and hardest. Thermal closes the night gap but
@@ -81,22 +81,30 @@ Notes on the hard ones (be honest about residuals):
   tracking, prediction stay planner-side; the Governor does not need them to
   veto.
 
-## 6. Decisions (SETTLED for the D1 add-on)
+## 6. Decisions (settled — see ADR-0003 + ADR-0004)
 
-These were "to confirm" before ADR-0003 re-framed the IDC as the optional
-Tier-2 D1 add-on. As the add-on (not core), they are now **settled**:
+D1–D3 were "to confirm" before ADR-0003 re-framed the IDC as the optional
+Tier-2 D1 add-on. **ADR-0004** records the technical settlement below.
 
-- **D1 — Dedicated sensors.** SETTLED: D1 ships with **dedicated radar +
-  thermal/IR + optical/polarization (water)** independent of integrator
-  perception. Lidar may still be shared but processed independently. Genuine
-  modality diversity is the point of the add-on; settling it any other way
-  would defeat the premium tier and the C7 independence claim.
+- **D1 — Sensor mix (hybrid, dedicated where diversity matters).** SETTLED:
+  - **Radar — DEDICATED** (obstacle in path; moving-VRU micro-Doppler).
+  - **Thermal / IR — DEDICATED** (night / stationary VRU — **the BOM cost
+    item, accepted** as the price of closing the night-VRU omission, the
+    highest-severity class).
+  - **Lidar — SHARED, independently processed** (water-surface anomaly); **not
+    sole-source** for any safety claim.
+  - **Optical / polarization — DEDICATED** for water-surface detection, so
+    SG4 isn't lidar-common-mode.
+
 - **D2 — v1 scope.** SETTLED: **v1 = obstacle-in-path + VRU + water-surface**.
-  Crossing state covered via map + G2 (#123) + signal-detector supplement (v2).
-  VRU is non-deferrable for any driverless pedestrian-bearing ODD.
-- **D3 — Compute.** SETTLED: D1 runs on the **Governor's independent compute**
-  (folds into the #114 compute-separation decision: argues for separate
-  compute, not just an MPU-isolated partition on a shared SoC).
+  Crossing state DEFERRED to **v2** — in v1 it's covered by the map-anchored
+  Governor check + G2 (#123). VRU is non-deferrable for any driverless
+  pedestrian-bearing ODD.
+
+- **D3 — Compute.** SETTLED: **Governor + D1 form one INDEPENDENT SAFETY
+  CHANNEL** on compute separate from the planner. **Separate SoC preferred;
+  hardware-isolated partition is the minimum acceptable.** This closes the
+  #114 compute-separation decision.
 
 ## 7. Validation (ties S8 / #120)
 
