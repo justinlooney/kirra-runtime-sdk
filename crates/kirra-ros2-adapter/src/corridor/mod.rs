@@ -1,7 +1,28 @@
-// crates/kirra-ros2-adapter/src/corridor.rs
+// crates/kirra-ros2-adapter/src/corridor/mod.rs
+//
+// Sub-modules:
+//   - this file: the `CorridorSource` trait + `MockCorridorSource`
+//     (always built; no ROS deps).
+//   - `lanelet2_bridge` (feature `ros2`): the cxx::bridge calling into
+//     the lanelet2_core C++ boost::serialization deserializer.
+//   - `lanelet2` (feature `ros2`): the `Lanelet2CorridorSource` impl
+//     of `CorridorSource`.
 //
 // CorridorSource — the seam between the map/perception side (Lanelet2 +
 // localization in production) and the slow-loop containment check.
+//
+
+#[cfg(feature = "ros2")]
+pub mod lanelet2_bridge;
+
+#[cfg(feature = "ros2")]
+pub mod lanelet2;
+
+#[cfg(feature = "ros2")]
+pub use self::lanelet2::{Lanelet2CorridorSource, Lanelet2Error};
+
+// ---------------------------------------------------------------------------
+// The trait + Mock impl — always built, no ROS deps.
 //
 // Phase 1 ships a single `MockCorridorSource` (a 5 m half-width straight
 // corridor) so the adapter and its state machine can be exercised

@@ -31,10 +31,15 @@ license = "Apache-2.0 OR MIT"
 # only, which is what the rest of the workspace consumes today.
 default = []
 
-# Enable r2r + the ROS 2 node skeleton in src/node.rs. ROS distros: Humble
-# / Jazzy / Kilted (per r2r 0.9.5 support matrix). Production integrators
-# turn this on; the safety kernel CI keeps it OFF.
-ros2 = ["dep:r2r"]
+# Enable r2r + the ROS 2 node skeleton in src/node.rs + the
+# Lanelet2CorridorSource (cxx wrap of `lanelet2_core`'s
+# boost::serialization deserializer). ROS distros: Humble / Jazzy /
+# Kilted (per r2r 0.9.5 support matrix). Production integrators turn
+# this on; the safety kernel CI keeps it OFF. Requires
+#   source /opt/ros/jazzy/setup.bash
+#   apt install ros-jazzy-lanelet2 libboost-serialization-dev
+# (or the integrator's equivalents) — see README.
+ros2 = ["dep:r2r", "dep:cxx", "dep:cxx-build"]
 
 [dependencies]
 # Concurrency primitives shared with the safety kernel.
@@ -53,6 +58,17 @@ parko-core        = { path = "../../parko/crates/parko-core" }
 # not guarantee API stability; a deliberate bump is a separate maintenance
 # action. Runtime-agnostic + async-from-the-ground-up.
 r2r = { version = "=0.9.5", optional = true }
+
+# cxx — Rust ↔ C++ FFI bridge. Used by `Lanelet2CorridorSource` to call
+# into `lanelet2_core`'s boost::serialization deserializer (`fromBinMsg`
+# canonical path). Pinned to 1.0 to match cxx-build (build-deps below).
+cxx = { version = "1.0", optional = true }
+
+[build-dependencies]
+# cxx-build — compiles the C++ shim and the cxx-generated glue. Must
+# match the `cxx` major version pinned above. Skipped when the `ros2`
+# feature is OFF: `build.rs` is a no-op without it.
+cxx-build = { version = "1.0", optional = true }
 
 [dev-dependencies]
 # State-machine tests don't need the ros2 feature.

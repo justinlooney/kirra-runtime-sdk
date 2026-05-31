@@ -5,19 +5,15 @@ wiring on top of Autoware's ROS 2 interfaces — see
 `docs/safety/OCCY_131_OPTIONB_DESIGN.md` (KIRRA-OCCY-OPTIONB-001) for the
 architecture this crate instantiates. Tracking issue: #131.
 
-## Phase 1 scope (this commit)
+## Phase progression (this branch is Phase 2B)
 
-- `AcceptedTrajectory` state machine + `AdaptorState` (DashMap-backed).
-- `CorridorSource` trait + `MockCorridorSource` (Phase 2 adds the Lanelet2 impl).
-- `run_adapter` — r2r-backed ROS 2 node skeleton with stubbed subscriptions
-  and slow- / fast-loop task stubs. Gated behind the `ros2` feature.
-
-Phase 1 deliberately ships **no verdict logic**: the slow- and fast-loop
-stubs log receipt and the slow loop never installs an `AcceptedTrajectory`.
-Phase 2 turns the slow loop into a real
-`validate_trajectory_containment` + per-pose kinematics + RSS driver;
-Phase 3 turns the fast loop into the conformance check; Phase 4 wires MRC
-injection + the CARLA demo.
+| Phase | Scope | Status |
+|-------|-------|--------|
+| 1     | `AcceptedTrajectory` state machine + `AdaptorState` + `CorridorSource` trait + `MockCorridorSource` + r2r node skeleton (stubs). | landed (`occy-131-phase1-adapter`) |
+| 2A    | Slow-loop validator: `validate_trajectory_slow` composes containment + per-pose kinematics + RSS into one verdict. `VehicleConfig` + `PerceivedObject`. Verified with `MockCorridorSource`. | landed (`occy-131-phase2a-validator`) |
+| **2B**    | **`Lanelet2CorridorSource` — cxx wrapper around `lanelet2_core` + `boost::serialization` so the slow loop reads a real `LaneletMapBin.data` payload independently of the planner's `drivable_area`.** | **this branch (`occy-131-phase2b-lanelet2`)** |
+| 3     | Fast-loop conformance check against the AcceptedTrajectory. | not started |
+| 4     | MRC injection + wire `spawn_telemetry_watchdog` + CARLA demo. | not started |
 
 ## Build
 
@@ -34,18 +30,43 @@ dependencies. This is what the workspace CI runs.
 ### With ROS 2 (`ros2` feature) — integrator builds
 
 ```sh
-source /opt/ros/jazzy/setup.bash    # or humble, kilted — whichever the integrator runs
+source /opt/ros/jazzy/setup.bash      # or humble / kilted
+sudo apt install ros-${ROS_DISTRO}-lanelet2 libboost-serialization-dev
+
 cargo build -p kirra-ros2-adapter --features ros2
 ```
 
-Pulls `r2r = "=0.9.5"` (pinned) and compiles the node skeleton in
-`src/node.rs`. **Requires `ROS_DISTRO` and `AMENT_PREFIX_PATH` to be set
-in the build shell** — r2r's `build.rs` panics otherwise. This is the
-expected gate; the safety-kernel CI does not have ROS sourced and so
-correctly skips the `ros2` feature.
+Pulls `r2r = "=0.9.5"` (pinned), `cxx = "1.0"`, `cxx-build = "1.0"` and
+compiles:
+- `src/node.rs` — the r2r ROS 2 node skeleton.
+- `src/corridor/lanelet2_bridge.{rs,cpp,h}` — the cxx::bridge calling
+  into `lanelet2_core` + `boost::serialization` to deserialize
+  `LaneletMapBin.data`. Built via `cxx-build` from `build.rs`.
+- `src/corridor/lanelet2.rs` — `Lanelet2CorridorSource` implementing
+  the Phase 1 `CorridorSource` trait.
+
+**Prerequisites:**
+1. `ROS_DISTRO` + `AMENT_PREFIX_PATH` + `CMAKE_PREFIX_PATH` set in the
+   build shell (the standard `source /opt/ros/<distro>/setup.bash`).
+   `build.rs` discovers the lanelet2 headers and libs from these env
+   vars; without them it `panic!`s with a precise error.
+2. `lanelet2_core` available — `apt install ros-${ROS_DISTRO}-lanelet2`
+   on Ubuntu, or equivalent.
+3. `boost-serialization` available — `apt install libboost-serialization-dev`
+   on Ubuntu. The same boost version that the integrator's Autoware /
+   map server used to produce `LaneletMapBin` must be used here to
+   consume it (boost::archive::binary_iarchive is not portable across
+   boost versions — see spike report §6.4).
 
 Supported ROS distros via r2r 0.9.5: Humble, Iron, Jazzy. Pin the
 integrator's Autoware release in the integrator's `package.xml`.
+
+### Phase 2B test fixtures
+
+Tests in `src/corridor/lanelet2.rs::lanelet2_tests` need a fixture
+`tests/fixtures/straight_corridor.osm.bin`. The fixture is intentionally
+not committed (Boost-version pinning makes a committed fixture brittle).
+See `tests/fixtures/README.md` for the one-shot regeneration recipe.
 
 ## Why r2r (not rclrs)?
 
