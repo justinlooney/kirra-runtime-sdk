@@ -39,10 +39,23 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::corridor::CorridorSource;
-use crate::state::{AdaptorState, EgoOdom, TrajectoryPoint};
+use crate::state::{
+    AdaptorState, EgoOdom, TrajectoryPoint, SUBSCRIPTION_STALENESS_TIMEOUT_MS,
+};
 use crate::validation::{
     check_command_conforms, validate_trajectory_slow, ConformanceVerdict, IncomingControl,
 };
+
+/// Read the subscription staleness timeout (ms) from
+/// `KIRRA_SUBSCRIPTION_STALENESS_MS`, falling back to the constant
+/// default. Phase 4: lets the integrator widen the window for slow
+/// sensor pipelines without recompile.
+fn subscription_staleness_timeout_ms() -> u64 {
+    std::env::var("KIRRA_SUBSCRIPTION_STALENESS_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SUBSCRIPTION_STALENESS_TIMEOUT_MS)
+}
 
 /// Capacity of the trajectory channel between the ROS subscription side
 /// and the slow-loop validator. 4 is generous: the slow loop processes
@@ -265,6 +278,7 @@ pub async fn run_adapter(
     let (fast_loop_out_tx, mut fast_loop_out_rx) =
         mpsc::channel::<OutgoingControlCommand>(CONTROL_CHANNEL_CAPACITY);
     let fast_state = Arc::clone(&state);
+    let staleness_timeout_ms = subscription_staleness_timeout_ms();
     tokio::spawn(async move {
         let mut rx = control_rx;
         while let Some(in_cmd) = rx.recv().await {
@@ -275,6 +289,34 @@ pub async fn run_adapter(
                 steering_rad: in_cmd.steering_angle_rad,
                 stamp_ms:     in_cmd.stamp_ms,
             };
+            // SAFETY: SG9 | REQ: subscription-liveness | TEST: test_stale_subscription_mrcs
+            // Subscription staleness check (SG9) — adapter's own
+            // fail-closed path. If any of the three required upstream
+            // subscriptions (trajectory / objects / odometry) hasn't
+            // delivered a message within the configured window, MRC
+            // regardless of any other state. Done BEFORE the
+            // conformance check so the upstream-dropout case fails
+            // closed even if a stale AcceptedTrajectory + a clean
+            // command would otherwise pass.
+            if fast_state.any_subscription_stale(now_ms, staleness_timeout_ms) {
+                let out = mrc_command(
+                    in_cmd.asset_id.clone(),
+                    fast_state.config.max_decel_mps2,
+                );
+                if let Err(e) = fast_loop_out_tx.try_send(out) {
+                    tracing::error!(
+                        asset_id = %in_cmd.asset_id,
+                        error = ?e,
+                        "fast-loop output channel send failed (staleness path)",
+                    );
+                }
+                tracing::warn!(
+                    asset_id = %in_cmd.asset_id,
+                    timeout_ms = staleness_timeout_ms,
+                    "subscription_staleness_mrc"
+                );
+                continue;
+            }
             let odom = fast_state.snapshot_odom().unwrap_or_default();
             let traj = fast_state.snapshot(&in_cmd.asset_id);
             let verdict = match traj.as_ref() {

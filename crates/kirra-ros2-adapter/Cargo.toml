@@ -39,7 +39,7 @@ default = []
 #   source /opt/ros/jazzy/setup.bash
 #   apt install ros-jazzy-lanelet2 libboost-serialization-dev
 # (or the integrator's equivalents) — see README.
-ros2 = ["dep:r2r", "dep:cxx", "dep:cxx-build"]
+ros2 = ["dep:r2r", "dep:cxx", "dep:cxx-build", "dep:tracing-subscriber"]
 
 [dependencies]
 # Concurrency primitives shared with the safety kernel.
@@ -64,6 +64,11 @@ r2r = { version = "=0.9.5", optional = true }
 # canonical path). Pinned to 1.0 to match cxx-build (build-deps below).
 cxx = { version = "1.0", optional = true }
 
+# Phase 4: structured logging in the adapter binary. Optional + gated on
+# the ros2 feature because only the binary uses it (the library uses
+# `tracing` directly without a subscriber).
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optional = true }
+
 [build-dependencies]
 # cxx-build — compiles the C++ shim and the cxx-generated glue. Must
 # match the `cxx` major version pinned above. Skipped when the `ros2`
@@ -73,3 +78,12 @@ cxx-build = { version = "1.0", optional = true }
 [dev-dependencies]
 # State-machine tests don't need the ros2 feature.
 tokio = { version = "1", features = ["full", "test-util"] }
+
+# Phase 4: the adapter node binary. Feature-gated to `ros2`; the default
+# cargo build does not see this entry. `tracing-subscriber` is only
+# referenced from the binary's `init_tracing()`, so it's a feature-gated
+# dev-style dep folded into the optional set.
+[[bin]]
+name = "kirra_ros2_adapter_node"
+path = "src/bin/kirra_ros2_adapter_node.rs"
+required-features = ["ros2"]

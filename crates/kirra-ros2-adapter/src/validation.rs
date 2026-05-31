@@ -255,7 +255,7 @@ pub struct IncomingControl {
     pub stamp_ms:      u64,
 }
 
-/// SAFETY: SG7 SG8 | REQ: fast-loop-trajectory-conformance | TEST: test_conforming_command_passes,test_overspeed_command_mrcs,test_stale_trajectory_mrcs,test_no_trajectory_mrcs
+// SAFETY: SG7 SG8 | REQ: fast-loop-trajectory-conformance | TEST: test_conforming_command_passes,test_overspeed_command_mrcs,test_stale_trajectory_mrcs,test_no_trajectory_mrcs
 /// Per-cycle conformance check.
 ///
 /// The fast loop calls this once per outgoing control command. Returns

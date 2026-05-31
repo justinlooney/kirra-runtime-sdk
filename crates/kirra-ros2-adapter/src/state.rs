@@ -17,6 +17,7 @@
 // `kirra-runtime-sdk` (added as a dep in that phase) and the slow loop in.
 
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::config::VehicleConfig;
@@ -89,6 +90,17 @@ pub struct AcceptedTrajectory {
 /// still leaves headroom; a SECOND missed cycle exceeds it and the slot
 /// fails closed. The design's per-trajectory FTTI budget (§4).
 pub const DEFAULT_MAX_AGE_MS: u64 = 200;
+
+/// Default subscription-staleness timeout (ms). Phase 4: the adapter's
+/// own SG9 fail-closed path. If any of the REQUIRED upstream
+/// subscriptions (trajectory / objects / odometry) hasn't delivered a
+/// message within this window, the fast loop publishes MRC regardless
+/// of any other state.
+///
+/// 500 ms = ~5× one planning cycle at 10 Hz; conservative without
+/// being twitchy. Configurable at startup via
+/// `KIRRA_SUBSCRIPTION_STALENESS_MS`.
+pub const SUBSCRIPTION_STALENESS_TIMEOUT_MS: u64 = 500;
 
 impl AcceptedTrajectory {
     /// Constructs a freshly-accepted trajectory record. The slow loop
@@ -224,6 +236,15 @@ pub struct AdaptorState {
     /// `current_steering_angle_deg` for the FIRST pose-pair (Phase 3 fix);
     /// fast loop reads it for the conformance check.
     pub latest_odom: Arc<RwLock<Option<EgoOdom>>>,
+
+    /// Wall-clock-ms when the LAST trajectory message arrived (0 = none
+    /// yet). Phase 4 subscription staleness — the fast loop checks this
+    /// against `SUBSCRIPTION_STALENESS_TIMEOUT_MS` and MRCs if exceeded.
+    pub last_trajectory_ms: Arc<AtomicU64>,
+    /// Wall-clock-ms when the LAST PredictedObjects message arrived.
+    pub last_objects_ms:    Arc<AtomicU64>,
+    /// Wall-clock-ms when the LAST nav_msgs::Odometry message arrived.
+    pub last_odom_ms:       Arc<AtomicU64>,
 }
 
 impl AdaptorState {
@@ -233,6 +254,9 @@ impl AdaptorState {
             objects_cache: Arc::new(RwLock::new(Vec::new())),
             config: Arc::new(VehicleConfig::default_urban()),
             latest_odom: Arc::new(RwLock::new(None)),
+            last_trajectory_ms: Arc::new(AtomicU64::new(0)),
+            last_objects_ms:    Arc::new(AtomicU64::new(0)),
+            last_odom_ms:       Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -245,6 +269,9 @@ impl AdaptorState {
             objects_cache: Arc::new(RwLock::new(Vec::new())),
             config: Arc::new(config),
             latest_odom: Arc::new(RwLock::new(None)),
+            last_trajectory_ms: Arc::new(AtomicU64::new(0)),
+            last_objects_ms:    Arc::new(AtomicU64::new(0)),
+            last_odom_ms:       Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -266,6 +293,43 @@ impl AdaptorState {
     /// available" and fall back conservatively.
     pub fn snapshot_odom(&self) -> Option<EgoOdom> {
         self.latest_odom.read().ok().and_then(|g| *g)
+    }
+
+    /// Subscription staleness check (SG9). Returns true if ANY of the
+    /// three required upstream subscriptions has not delivered a
+    /// message within `timeout_ms` of `now_ms` — including the
+    /// "never received" case (`last_*_ms == 0` is treated as stale
+    /// after `timeout_ms` of uptime, which is fail-closed: a freshly-
+    /// started adapter with no subscriptions yet MUST MRC).
+    ///
+    /// `saturating_sub` makes a clock-skew `now_ms < last_ms` read as
+    /// "no time elapsed" — the safe direction.
+    pub fn any_subscription_stale(&self, now_ms: u64, timeout_ms: u64) -> bool {
+        let t = self.last_trajectory_ms.load(Ordering::Relaxed);
+        let o = self.last_objects_ms.load(Ordering::Relaxed);
+        let d = self.last_odom_ms.load(Ordering::Relaxed);
+        // For each subscription: if it has never been touched (== 0),
+        // treat as stale immediately. Otherwise compare the lag.
+        t == 0 || o == 0 || d == 0
+            || now_ms.saturating_sub(t) > timeout_ms
+            || now_ms.saturating_sub(o) > timeout_ms
+            || now_ms.saturating_sub(d) > timeout_ms
+    }
+
+    /// Stamp the trajectory subscription as "fresh" (called by the
+    /// trajectory subscriber on each tick).
+    pub fn touch_trajectory(&self, now_ms: u64) {
+        self.last_trajectory_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Stamp the objects subscription as "fresh".
+    pub fn touch_objects(&self, now_ms: u64) {
+        self.last_objects_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Stamp the odometry subscription as "fresh".
+    pub fn touch_odom(&self, now_ms: u64) {
+        self.last_odom_ms.store(now_ms, Ordering::Relaxed);
     }
 
     /// Replaces the perception snapshot with a fresh one. Called by the

@@ -9,7 +9,10 @@
 
 use kirra_ros2_adapter::{
     config::VehicleConfig,
-    state::{AcceptedTrajectory, EgoOdom, Pose, TrajectoryPoint, TrajectoryVerdict, DEFAULT_MAX_AGE_MS},
+    state::{
+        AcceptedTrajectory, AdaptorState, EgoOdom, Pose, TrajectoryPoint,
+        TrajectoryVerdict, DEFAULT_MAX_AGE_MS, SUBSCRIPTION_STALENESS_TIMEOUT_MS,
+    },
     validation::{check_command_conforms, ConformanceVerdict, IncomingControl},
 };
 
@@ -97,8 +100,6 @@ fn test_stale_trajectory_mrcs() {
 
 #[test]
 fn test_no_trajectory_mrcs() {
-    use kirra_ros2_adapter::state::AdaptorState;
-
     // Build an AdaptorState with no trajectory for the asset. The fast
     // loop's "no trajectory installed" branch is the same as the
     // AdaptorState::snapshot returning None → caller emits MRC. We
@@ -114,4 +115,41 @@ fn test_no_trajectory_mrcs() {
     let verdict = state.current_verdict("ghost_av", now);
     assert_eq!(verdict, TrajectoryVerdict::MRCFallback,
         "AdaptorState::current_verdict on unknown asset must be MRCFallback; got {verdict:?}");
+}
+
+// ---------------------------------------------------------------------------
+// 5. Subscription staleness — Phase 4 SG9 fail-closed
+// ---------------------------------------------------------------------------
+
+/// SG9: if ANY of the three required upstream subscriptions
+/// (trajectory / objects / odometry) is stale, the fast loop must MRC
+/// regardless of the AcceptedTrajectory + command state. The freshly-
+/// constructed AdaptorState has all three `last_*_ms = 0` so it is
+/// stale immediately — the safe direction at cold start.
+#[test]
+fn test_stale_subscription_mrcs() {
+    let state = AdaptorState::new();
+    // Cold start: nothing has been touched. Even with `now_ms = 0`,
+    // the "0 sentinel = never seen" rule fires.
+    assert!(state.any_subscription_stale(0, SUBSCRIPTION_STALENESS_TIMEOUT_MS),
+        "cold-start AdaptorState (all last_*_ms = 0) must read as stale");
+
+    // Touch all three at t = 1_000. At t = 1_400 (400 ms later) nothing
+    // is stale yet (under the 500 ms default).
+    state.touch_trajectory(1_000);
+    state.touch_objects(1_000);
+    state.touch_odom(1_000);
+    assert!(!state.any_subscription_stale(1_400, SUBSCRIPTION_STALENESS_TIMEOUT_MS),
+        "subscriptions touched 400 ms ago must NOT be stale at 500 ms timeout");
+
+    // At t = 1_600 (600 ms later) the threshold is exceeded → stale.
+    assert!(state.any_subscription_stale(1_600, SUBSCRIPTION_STALENESS_TIMEOUT_MS),
+        "subscriptions touched 600 ms ago must be stale at 500 ms timeout");
+
+    // Asymmetric staleness: trajectory + objects fresh, odom stale.
+    state.touch_trajectory(2_000);
+    state.touch_objects(2_000);
+    // odom last touched at 1_000, now at 2_000 → 1_000 ms stale.
+    assert!(state.any_subscription_stale(2_000, SUBSCRIPTION_STALENESS_TIMEOUT_MS),
+        "any single stale subscription must surface stale=true");
 }
