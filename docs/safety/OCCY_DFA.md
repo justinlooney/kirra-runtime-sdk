@@ -32,15 +32,37 @@ integrity is concentrated in the simpler, deterministic, verifiable Governor.
   ISO 26262-9 voids the decomposition and *each* element would have to meet the
   full ASIL D.
 
-**Decision — planner rigor.** D(D)+QM(D) is the natural fit but an assessor will
-scrutinize the PO-1 completeness claim. Options:
-- (A) Strict QM planner — cheapest; leans entirely on PO-1/PO-2. *Recommended,
-  with (B) as hedge.*
-- (B) **Disciplined QM** — develop the QM planner with more process rigor than
-  QM requires (defense-in-depth) without claiming an ASIL for it. Low cost,
-  strengthens the assessment.
-- (C) Symmetric B(D)+B(D) — both to ASIL B; conventional but requires ML-to-B
-  (hard) and still needs the Governor. Not recommended.
+**Decision — planner rigor. SETTLED: DISCIPLINED-QM.**
+
+The planner is QM (no ASIL claim), but developed with **elevated process
+discipline as defense-in-depth**.
+
+*Rationale.* PO-1 coverage is never perfect (G1 / occlusion is a known gap), so
+a less fault-prone planner reduces residual risk in imperfectly-covered areas;
+it makes the D(D) + QM(D) decomposition far easier to defend to an assessor; it
+improves availability (fewer Governor vetoes / MRCs); and it is low-cost,
+riding on the Rust discipline + scenario testing already planned.
+
+*Disciplined-QM IS:*
+
+- Documented requirements for intended behavior, traceable to tests.
+- Coding standards + static analysis.
+- Systematic regression + scenario testing.
+- Controlled change management.
+- Deterministic / replayable behavior.
+
+*Disciplined-QM IS NOT:*
+
+- An ASIL claim on the planner.
+- MC/DC coverage on the planner.
+- A qualified toolchain for the planner.
+
+That integrity-grade rigor stays on the Governor (ASIL-D element).
+
+**All three #114 decisions are now resolved:**
+1. **Compute separation** → D3 / ADR-0003 (Governor + D1 on independent compute; separate SoC preferred).
+2. **(ii) detection channel scope** → #124 / ARCH-001 (D1 add-on, Tier-2).
+3. **Planner rigor** → disciplined-QM (this section).
 
 ---
 
