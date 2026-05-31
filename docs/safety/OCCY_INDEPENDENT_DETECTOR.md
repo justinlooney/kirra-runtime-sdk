@@ -1,11 +1,13 @@
-# Occy / KIRRA — Focused Independent Detection Channel (IDC)
+# Occy / KIRRA — D1 Independent Detection Channel (optional Tier-2 add-on)
 
-**Issue:** #124 — pull the independent detection channel forward (DFA C5/C7).
-**Doc ID (proposed):** KIRRA-OCCY-IDC-001.
-**Status:** Design spec for review. Closes the DFA's central common-cause hole
-(omission of safety-critical objects) with the *minimum sufficient* independent
-mechanism, not a full second world model. Sensor/algorithm choices are design
-proposals to confirm.
+**Issue:** #124 — D1 Independent Detection Channel as the Tier-2 add-on (closes DFA C5/C7 unilaterally).
+**Doc ID:** KIRRA-OCCY-IDC-001.
+**Status:** Design spec — D1–D3 settled. This is the **optional Tier-2 D1
+add-on** per ARCH-001 / ADR-0003 (supersedes the earlier "core IDC" framing).
+Integrators who run only the base tier (KIRRA Governor downstream of their own
+perception) operate at an envelope bounded by their delivered coverage; adding
+D1 closes the omission common-cause unilaterally and unlocks the premium
+envelope (night VRU, water, larger ODD, the unilateral ASIL-D omission claim).
 
 ---
 
@@ -79,17 +81,22 @@ Notes on the hard ones (be honest about residuals):
   tracking, prediction stay planner-side; the Governor does not need them to
   veto.
 
-## 6. Decisions to confirm
+## 6. Decisions (SETTLED for the D1 add-on)
 
-- **D1 — dedicated vs shared sensors.** Dedicated safety sensors give the
-  strongest independence (clears C7). Recommend dedicated radar (cheap) +
-  thermal (worth it for driverless-with-pedestrians); lidar may be shared but
-  processed independently.
-- **D2 — v1 scope.** For a driverless urban ODD *with pedestrians*, VRU cannot
-  be deferred. Recommend v1 = obstacle-in-path + VRU + water-surface; crossing
-  via map + G2 + signal-detector supplement.
-- **D3 — compute.** IDC on the Governor's independent compute — folds into the
-  #114 compute-separation decision (argues for separate compute).
+These were "to confirm" before ADR-0003 re-framed the IDC as the optional
+Tier-2 D1 add-on. As the add-on (not core), they are now **settled**:
+
+- **D1 — Dedicated sensors.** SETTLED: D1 ships with **dedicated radar +
+  thermal/IR + optical/polarization (water)** independent of integrator
+  perception. Lidar may still be shared but processed independently. Genuine
+  modality diversity is the point of the add-on; settling it any other way
+  would defeat the premium tier and the C7 independence claim.
+- **D2 — v1 scope.** SETTLED: **v1 = obstacle-in-path + VRU + water-surface**.
+  Crossing state covered via map + G2 (#123) + signal-detector supplement (v2).
+  VRU is non-deferrable for any driverless pedestrian-bearing ODD.
+- **D3 — Compute.** SETTLED: D1 runs on the **Governor's independent compute**
+  (folds into the #114 compute-separation decision: argues for separate
+  compute, not just an MPU-isolated partition on a shared SoC).
 
 ## 7. Validation (ties S8 / #120)
 

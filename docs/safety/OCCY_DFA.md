@@ -78,9 +78,9 @@ Coupling factors between doer (Occy) and checker (Governor), per ISO 26262-9 Cl.
 | C2 | Shared power | common power fault disables both | independent/monitored power to Governor; safe-state on loss | low |
 | C3 | Shared memory/state | planner corrupts Governor state | spatial FFI; immutable validated inputs; no shared mutable state | low |
 | C4 | Shared scheduling | planner starves Governor → missed deadline | temporal FFI / separate compute; WCET bound (S3) | low (fail-closed) |
-| **C5** | **Shared perception / world model (iii)** | **common-mode: a perception error corrupts BOTH plan and check → unsafe trajectory approved** | conservative re-derivation covers UNCERTAINTY only; OMISSION needs an independent (ii) detection channel | **HIGH — see §4** |
+| **C5** | **Shared perception / world model (iii)** | **common-mode: a perception error corrupts BOTH plan and check → unsafe trajectory approved** | tier-dependent — base: conservative re-derivation covers UNCERTAINTY only, OMISSION delegated to integrator perception (assumption-of-use, envelope-bounded); + D1 add-on: closes OMISSION unilaterally via independent catch-and-veto (ARCH-001 / ADR-0003) | **HIGH — see §4** |
 | **C6** | **Shared localization (G2)** | localization error misplaces map-anchored checks + plan | localization-confidence gating; combine perception+map; degrade on low confidence (#123) | med until G2 |
-| C7 | Shared sensors | sensor fault/spoof hits both | diverse/independent sensing for safety-critical detection (True-Redundancy analog); part of (ii) | high until (ii) |
+| C7 | Shared sensors | sensor fault/spoof hits both | tier-dependent — base: shared with integrator sensors (residual = assumption-of-use); + D1 add-on: dedicated diverse sensing (radar + thermal + optical), True-Redundancy analog, closes C7 unilaterally (ARCH-001) | base: high; + D1: low |
 | C8 | Shared software/libraries | bug in shared code (RSS/math/parser) defeats both | minimize shared code on the safety path; develop Governor path independently to ASIL D; diverse impl where feasible | med |
 | C9 | Shared systematic/design (same team/assumptions) | same wrong assumption in both | design/process diversity; independent review; **KIRRA vendor-independence** | low w/ independence |
 | C10 | Shared egress/comms | unchecked command bypasses Governor | Governor in-line on actuation egress; no bypass; verify (teleop lesson) | low |
@@ -115,6 +115,27 @@ first step is an independent **detection** channel (diverse sensor/algorithm,
 True-Redundancy style) for the few omission-critical classes, feeding the
 Governor's veto path only. Full (ii) world-state diversity can still mature
 later.
+
+### 4.1 Tier-dependent disposition (see ARCH-001 / ADR-0003)
+
+The omission gap above has **two valid dispositions**, captured by the two-tier
+architecture (KIRRA-OCCY-ARCH-001 / ADR-0003):
+
+- **Base (downstream Governor, no D1):** omission common-cause mitigated by
+  conservative checking + the Perception Input Contract (ARCH-001 §4) +
+  envelope-bounding to the integrator's delivered coverage. **Residual =
+  delegated** to the perception provider as an explicit assumption-of-use.
+  Standard SEooC disposition; ASIL-D claim is conditional on the contract.
+- **+ D1 add-on (Tier 2):** omission common-cause **closed unilaterally** by
+  KIRRA's own dedicated diverse sensing (radar + thermal + optical-for-water)
+  on the Governor's independent compute. Residual reduces to D1's own
+  characterized FP/FN, validated by S8 (#120). ASIL-D omission claim is
+  unilateral.
+
+The pull-forward narrative above ("independent (ii) detection channel … now")
+remains the **prescription for the D1 add-on**; ADR-0003 re-frames it from
+core-mandatory to optional Tier-2. Base-tier integrators who bring competent
+diverse perception keep the SEooC claim; D1 buys the unilateral close.
 
 ---
 

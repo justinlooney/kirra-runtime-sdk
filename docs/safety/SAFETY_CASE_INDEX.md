@@ -32,6 +32,8 @@ Date: 2026-05-23
 | KIRRA-OCCY-DFA-001 | Occy ASIL decomposition + Dependent Failure Analysis | 0.1 | Draft | docs/safety/OCCY_DFA.md | 2026-05-31 |
 | KIRRA-OCCY-IDC-001 | Occy focused Independent Detection Channel (IDC) design | 0.1 | Draft | docs/safety/OCCY_INDEPENDENT_DETECTOR.md | 2026-05-31 |
 | KIRRA-OCCY-ADR-002 | ADR-0002: Condition-dependent speed cap + sub-ODD partition | 1.0 | Accepted | docs/adr/0002-condition-dependent-cap-subodds.md | 2026-05-31 |
+| KIRRA-OCCY-ARCH-001 | Occy two-tier architecture (base Governor SEooC + optional D1 add-on) | 0.1 | Draft | docs/safety/OCCY_ARCHITECTURE_TIERS.md | 2026-05-31 |
+| KIRRA-OCCY-ADR-003 | ADR-0003: Two-tier KIRRA architecture — base + optional D1 | 1.0 | Accepted | docs/adr/0003-two-tier-base-and-d1-addon.md | 2026-05-31 |
 
 ---
 
