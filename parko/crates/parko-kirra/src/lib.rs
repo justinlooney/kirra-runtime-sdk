@@ -23,6 +23,7 @@
 use kirra_runtime_sdk::gateway::kinematics_contract::{
     validate_vehicle_command, EnforceAction, ProposedVehicleCommand, VehicleKinematicsContract,
 };
+// `DenyCode` is reached via `EnforceAction::DenyBreach` — see line 165 below.
 use kirra_runtime_sdk::verifier::FleetPosture;
 
 use parko_core::commands::ControlCommand;
@@ -162,7 +163,13 @@ impl SafetyGovernor for KirraGovernor {
                         EnforcementAction::ClampLinearVelocity(safe_value)
                     }
                     EnforceAction::ClampSteering(_) => EnforcementAction::Allow,
-                    EnforceAction::DenyBreach(reason) => EnforcementAction::Deny { reason },
+                    // `DenyCode -> String` here is the single per-deny allocation
+                    // permitted at this cross-crate adapter boundary: `EnforcementAction::Deny`
+                    // owns a `String` reason field by its public contract. The Governor
+                    // hot path itself stayed alloc-free (S3 / #115).
+                    EnforceAction::DenyBreach(code) => EnforcementAction::Deny {
+                        reason: code.reason().to_string(),
+                    },
                 }
             }
         }

@@ -1,6 +1,7 @@
 use crate::fabric::asset::KinematicProfileType;
 use crate::gateway::kinematics_contract::{
-    validate_vehicle_command, EnforceAction, ProposedVehicleCommand, VehicleKinematicsContract,
+    validate_vehicle_command, DenyCode, EnforceAction, ProposedVehicleCommand,
+    VehicleKinematicsContract,
 };
 use crate::verifier::FleetPosture;
 
@@ -75,7 +76,7 @@ impl AssetGovernor {
     ) -> EnforceAction {
         match current_posture {
             FleetPosture::LockedOut => {
-                EnforceAction::DenyBreach("ASSET_LOCKED_OUT".to_string())
+                EnforceAction::DenyBreach(DenyCode::AssetLockedOut)
             }
             FleetPosture::Degraded => {
                 let contract = self.profile.mrc_contract();
@@ -150,7 +151,7 @@ mod tests {
     fn test_locked_out_denies_all_commands() {
         let g = AssetGovernor::new("av01".to_string(), KinematicProfileType::AutomotiveNominal);
         let result = g.evaluate_command(&nominal_cmd(), &FleetPosture::LockedOut);
-        assert_eq!(result, EnforceAction::DenyBreach("ASSET_LOCKED_OUT".to_string()));
+        assert_eq!(result, EnforceAction::DenyBreach(DenyCode::AssetLockedOut));
     }
 
     #[test]

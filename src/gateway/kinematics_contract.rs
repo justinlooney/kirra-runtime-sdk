@@ -119,7 +119,61 @@ pub enum EnforceAction {
     Allow,
     ClampLinear(f64),
     ClampSteering(f64),
-    DenyBreach(String),
+    DenyBreach(DenyCode),
+}
+
+/// Reason codes for [`EnforceAction::DenyBreach`].
+///
+/// Each variant maps to a fixed `&'static str` rendering (via [`DenyCode::reason`]
+/// and the `Display` impl) and serializes to the same `SCREAMING_SNAKE_CASE`
+/// token the previous `DenyBreach(String)` form carried — audit-chain hashes
+/// and JSON deny-reason fields are byte-identical across this refactor.
+///
+/// Per-variant `Safety:` tags link the breach to the safety goal it enforces.
+/// The enum is `Copy + 'static` so a per-verdict deny carries no heap
+/// allocation on the Governor check path (S3 / #115).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DenyCode {
+    /// Safety: SG-004 (AEGIS-SG-001) ≅ SG9 (OCCY_SAFETY_GOALS).
+    /// Linear velocity (`linear_velocity_mps`) is NaN or Inf.
+    NanInfLinearVelocity,
+    /// Safety: SG-004 ≅ SG9. Current velocity is NaN or Inf.
+    NanInfCurrentVelocity,
+    /// Safety: SG-004 ≅ SG9. Steering angle is NaN or Inf.
+    NanInfSteeringAngle,
+    /// Safety: SG-004 ≅ SG9. Current steering angle is NaN or Inf.
+    NanInfCurrentSteering,
+    /// Safety: SG-004 ≅ SG9. Time delta (`delta_time_s`) is NaN or Inf.
+    NanInfDeltaTime,
+    /// Safety: SG-003 ≅ SG3. Zero or negative dt makes rate-of-change undefined.
+    InvalidTimeDelta,
+    /// Safety: SG-007 ≅ SG8. Asset is under LockedOut fleet posture in the fabric.
+    AssetLockedOut,
+}
+
+impl DenyCode {
+    /// Returns the audit/log token for this code (e.g. `"NAN_INF_LINEAR_VELOCITY"`).
+    ///
+    /// The text is byte-identical to the previous `DenyBreach(String)` rendering,
+    /// preserving audit-chain hash stability across this refactor.
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::NanInfLinearVelocity  => "NAN_INF_LINEAR_VELOCITY",
+            Self::NanInfCurrentVelocity => "NAN_INF_CURRENT_VELOCITY",
+            Self::NanInfSteeringAngle   => "NAN_INF_STEERING_ANGLE",
+            Self::NanInfCurrentSteering => "NAN_INF_CURRENT_STEERING",
+            Self::NanInfDeltaTime       => "NAN_INF_DELTA_TIME",
+            Self::InvalidTimeDelta      => "INVALID_TIME_DELTA",
+            Self::AssetLockedOut        => "ASSET_LOCKED_OUT",
+        }
+    }
+}
+
+impl std::fmt::Display for DenyCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,19 +207,19 @@ pub fn validate_vehicle_command(
     // linear_velocity_mps. Infinity is rejected alongside NaN.
     // ------------------------------------------------------------------
     if !cmd.linear_velocity_mps.is_finite() {
-        return EnforceAction::DenyBreach("NAN_INF_LINEAR_VELOCITY".to_string());
+        return EnforceAction::DenyBreach(DenyCode::NanInfLinearVelocity);
     }
     if !cmd.current_velocity_mps.is_finite() {
-        return EnforceAction::DenyBreach("NAN_INF_CURRENT_VELOCITY".to_string());
+        return EnforceAction::DenyBreach(DenyCode::NanInfCurrentVelocity);
     }
     if !cmd.steering_angle_deg.is_finite() {
-        return EnforceAction::DenyBreach("NAN_INF_STEERING_ANGLE".to_string());
+        return EnforceAction::DenyBreach(DenyCode::NanInfSteeringAngle);
     }
     if !cmd.current_steering_angle_deg.is_finite() {
-        return EnforceAction::DenyBreach("NAN_INF_CURRENT_STEERING".to_string());
+        return EnforceAction::DenyBreach(DenyCode::NanInfCurrentSteering);
     }
     if !cmd.delta_time_s.is_finite() {
-        return EnforceAction::DenyBreach("NAN_INF_DELTA_TIME".to_string());
+        return EnforceAction::DenyBreach(DenyCode::NanInfDeltaTime);
     }
 
     // ------------------------------------------------------------------
@@ -173,7 +227,7 @@ pub fn validate_vehicle_command(
     // Zero or negative dt makes rate-of-change calculations undefined.
     // ------------------------------------------------------------------
     if cmd.delta_time_s <= 0.0 {
-        return EnforceAction::DenyBreach("INVALID_TIME_DELTA".to_string());
+        return EnforceAction::DenyBreach(DenyCode::InvalidTimeDelta);
     }
 
     // ------------------------------------------------------------------
@@ -352,7 +406,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("INVALID_TIME_DELTA".to_string())
+            EnforceAction::DenyBreach(DenyCode::InvalidTimeDelta)
         );
     }
 
@@ -368,7 +422,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("INVALID_TIME_DELTA".to_string())
+            EnforceAction::DenyBreach(DenyCode::InvalidTimeDelta)
         );
     }
 
@@ -549,7 +603,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("INVALID_TIME_DELTA".to_string())
+            EnforceAction::DenyBreach(DenyCode::InvalidTimeDelta)
         );
     }
 
@@ -583,7 +637,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("NAN_INF_LINEAR_VELOCITY".to_string())
+            EnforceAction::DenyBreach(DenyCode::NanInfLinearVelocity)
         );
     }
 
@@ -599,7 +653,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("NAN_INF_LINEAR_VELOCITY".to_string())
+            EnforceAction::DenyBreach(DenyCode::NanInfLinearVelocity)
         );
     }
 
@@ -615,7 +669,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("NAN_INF_LINEAR_VELOCITY".to_string())
+            EnforceAction::DenyBreach(DenyCode::NanInfLinearVelocity)
         );
     }
 
@@ -634,7 +688,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("NAN_INF_CURRENT_VELOCITY".to_string())
+            EnforceAction::DenyBreach(DenyCode::NanInfCurrentVelocity)
         );
     }
 
@@ -652,7 +706,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("NAN_INF_STEERING_ANGLE".to_string())
+            EnforceAction::DenyBreach(DenyCode::NanInfSteeringAngle)
         );
     }
 
@@ -671,7 +725,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("NAN_INF_CURRENT_STEERING".to_string())
+            EnforceAction::DenyBreach(DenyCode::NanInfCurrentSteering)
         );
     }
 
@@ -689,7 +743,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("NAN_INF_DELTA_TIME".to_string())
+            EnforceAction::DenyBreach(DenyCode::NanInfDeltaTime)
         );
     }
 
@@ -707,7 +761,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("NAN_INF_DELTA_TIME".to_string())
+            EnforceAction::DenyBreach(DenyCode::NanInfDeltaTime)
         );
     }
 
@@ -724,7 +778,7 @@ mod kinematics_contract_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("NAN_INF_LINEAR_VELOCITY".to_string()),
+            EnforceAction::DenyBreach(DenyCode::NanInfLinearVelocity),
             "NaN guard (priority 0) must fire before zero-dt check (priority 1)"
         );
     }

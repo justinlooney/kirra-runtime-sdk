@@ -221,13 +221,17 @@ pub async fn enforce_posture_routing(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let path = req.uri().path().to_string();
-    if is_posture_exempt(&path) {
+    // Borrow path + method as `&str` directly from the request. The `.to_string()`
+    // calls these replaced allocated a `String` per request on the posture-routing
+    // hot path. Borrows end at the last use below, before `next.run(req)` moves
+    // the request, so NLL keeps the function well-formed (S3 / #115).
+    let path = req.uri().path();
+    if is_posture_exempt(path) {
         return Ok(next.run(req).await);
     }
 
-    let method = req.method().as_str().to_string();
-    let cmd = classify_http_command(&method, &path);
+    let method = req.method().as_str();
+    let cmd = classify_http_command(method, path);
 
     // HA epoch fence (durable split-brain guard).
     //
@@ -392,7 +396,7 @@ mod actuator_middleware_tests {
         };
         assert_eq!(
             validate_vehicle_command(&cmd, &contract),
-            EnforceAction::DenyBreach("INVALID_TIME_DELTA".to_string())
+            EnforceAction::DenyBreach(crate::gateway::kinematics_contract::DenyCode::InvalidTimeDelta)
         );
     }
 

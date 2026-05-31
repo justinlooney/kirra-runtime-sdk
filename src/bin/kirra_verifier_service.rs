@@ -1412,7 +1412,12 @@ async fn handle_fabric_command(
 
             let now = now_ms();
             if !allowed {
-                let denial_reason = if let kirra_runtime_sdk::gateway::kinematics_contract::EnforceAction::DenyBreach(ref r) = action { r.clone() } else { String::new() };
+                // `DenyCode -> &'static str` keeps this path alloc-free; the previous
+                // `r.clone()` of a `String` allocated per denial (S3 / #115).
+                let denial_reason: &'static str = match action {
+                    kirra_runtime_sdk::gateway::kinematics_contract::EnforceAction::DenyBreach(c) => c.reason(),
+                    _ => "",
+                };
                 svc.fabric_causal_log.record(
                     &asset_id,
                     "COMMAND_DENIED",

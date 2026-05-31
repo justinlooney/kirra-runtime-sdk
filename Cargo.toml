@@ -13,6 +13,17 @@ categories = ["embedded", "safety-critical"]
 name = "kirra_runtime_sdk"
 crate-type = ["rlib", "cdylib"]
 
+# Release builds use `panic = "abort"` so an unrecoverable panic on the
+# Governor check path terminates the process deterministically rather than
+# unwinding through safety code. Process death is fail-closed by construction:
+# the planner cannot get an Accept verdict with no Governor running (no HTTP
+# response), DDS actuator topics use Volatile durability (no stale-command
+# replay to reconnecting subscribers), and HA standby detects via heartbeat
+# absence within `PROMOTION_TIMEOUT_MS`. Dev/test profile is intentionally left
+# on unwind so `#[should_panic]` tests keep working. Tied to S3 / #115.
+[profile.release]
+panic = "abort"
+
 [features]
 ros2 = []
 tpm = ["dep:tss-esapi"]
