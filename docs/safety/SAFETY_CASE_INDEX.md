@@ -45,6 +45,7 @@ Date: 2026-05-23
 | KIRRA-OCCY-OPTIONB-001 | Occy #131 Option-B per-trajectory wiring on Autoware (two-rate check; SG2 live; ROS 2 adapter) | 0.1 | Draft | docs/safety/OCCY_131_OPTIONB_DESIGN.md | 2026-05-31 |
 | KIRRA-OCCY-SG2-MARGIN-001 | Occy SG2 lateral margin derivation (S8 #120 Item A; PRIMARY 0.40 m + 0.75 m fallback; G2 AoU #123) | 0.1 | Draft | docs/safety/OCCY_SG2_MARGIN.md | 2026-05-31 |
 | KIRRA-OCCY-SPEED-VAL-001 | Occy speed-cap validation matrix (S8 #120 Item C; PROVEN/OK-ANALYTICAL/AoU-GAP dispositions for each ADR-0001 assumption; cap unchanged at 50 mph) | 0.1 | Draft | docs/safety/OCCY_SPEED_CAP_VALIDATION.md | 2026-05-31 |
+| KIRRA-OCCY-IDC-RANGES-001 | Occy D1 IDC detection-range specification (S8 #120 Item B; per-sensor spec table + SSD-derate cap-impact + vendor-RFP requirements; closes Item C AoU rows 1+4 in the D1 tier) | 0.1 | Draft | docs/safety/OCCY_IDC_DETECTION_RANGES.md | 2026-05-31 |
 
 ---
 
