@@ -255,29 +255,30 @@ pub async fn enforce_posture_routing(
     );
     if is_mutation {
         let held = svc.app.held_epoch.load(std::sync::atomic::Ordering::SeqCst);
-        let db_epoch = match svc.app.store.lock() {
-            Ok(s) => s.current_epoch().ok(),
-            Err(_) => None,
-        };
-        if let Some(db) = db_epoch {
-            // held == 0 means we never claimed an epoch (configured-passive
-            // never promoted): fall through to the posture / mode checks
-            // already in place, which fail closed for mutations on non-Active.
-            if held != 0 && held != db {
-                svc.app
-                    .mode_active
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                tracing::error!(
-                    method = %method,
-                    path   = %path,
-                    held   = held,
-                    db     = db,
-                    "FENCED — held epoch stale; self-demoting and rejecting mutation (HA split-brain prevention)"
-                );
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
-            }
+        // Pass B1 (S3 / #115): read the cached DB epoch atomically instead of
+        // taking `store.lock()` + `current_epoch()` per request. Cache is
+        // re-stamped by `perform_promotion` after a successful CAS and by the
+        // heartbeat writer on every HEARTBEAT_INTERVAL_MS tick — both with
+        // Release. Acquire here pairs with both Releases. A 0 value means
+        // "not yet observed" (cold start before the first heartbeat); fall
+        // through to the existing held==0 / non-Active checks for fail-closed.
+        // The gate + self-demote decision MUST stay on the request path,
+        // before any downstream hand-off.
+        let db = svc.app.cached_db_epoch.load(std::sync::atomic::Ordering::Acquire);
+        if db != 0 && held != 0 && held != db {
+            svc.app
+                .mode_active
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            tracing::error!(
+                method = %method,
+                path   = %path,
+                held   = held,
+                db     = db,
+                "FENCED — held epoch stale; self-demoting and rejecting mutation (HA split-brain prevention)"
+            );
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
-        // db_epoch unreadable -> fall through. Existing mode/posture
+        // cached_db_epoch == 0 -> fall through. Existing mode/posture
         // checks below remain fail-closed for mutations on non-Active.
     }
 

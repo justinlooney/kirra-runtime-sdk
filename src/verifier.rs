@@ -190,6 +190,16 @@ pub struct AppState {
     /// every state-mutating request; if they diverge this node has been
     /// fenced (another instance promoted) and must self-demote.
     pub held_epoch: Arc<AtomicU64>,
+    /// Pass B1 cache (S3 / #115): the most recently observed durable `ha_state`
+    /// epoch. The mutation gate (`policy_layer.rs::enforce_posture_routing`)
+    /// reads this atomically instead of taking `store.lock()` + `current_epoch()`
+    /// per request. Re-stamped by `perform_promotion` after a successful
+    /// `try_claim_epoch` (Release) and by the heartbeat writer on every
+    /// `HEARTBEAT_INTERVAL_MS` tick (Release). 0 = "not yet observed";
+    /// the gate treats 0 the same way the previous DB-read path treated
+    /// an unreadable epoch — fall through and rely on the existing
+    /// `held == 0` / non-Active checks for fail-closed.
+    pub cached_db_epoch: Arc<AtomicU64>,
     /// Bounded broadcast channel for real-time posture stream subscribers.
     pub posture_tx: broadcast::Sender<PostureStreamEvent>,
     /// Transport identity enforcement config — reads from env at startup.
@@ -203,6 +213,10 @@ pub struct AppState {
 impl AppState {
     pub fn new(store: VerifierStore, mode: VerifierOperationMode) -> Self {
         let (posture_tx, _) = broadcast::channel(POSTURE_BROADCAST_CAPACITY);
+        // Pass B1 cache seed (S3 / #115): read the current durable epoch
+        // before wrapping the store in the Mutex so the gate has a fresh
+        // value before any request lands. Unreadable → 0 (gate falls through).
+        let initial_db_epoch = store.current_epoch().unwrap_or(0);
         Self {
             nodes: DashMap::new(),
             dependency_graph: DashMap::new(),
@@ -210,6 +224,7 @@ impl AppState {
             store: Arc::new(Mutex::new(store)),
             mode_active: Arc::new(AtomicBool::new(mode == VerifierOperationMode::Active)),
             held_epoch: Arc::new(AtomicU64::new(0)),
+            cached_db_epoch: Arc::new(AtomicU64::new(initial_db_epoch)),
             posture_tx,
             transport_identity: TransportIdentityConfig::from_env(),
             rss_active_violation: Arc::new(AtomicBool::new(false)),

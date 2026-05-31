@@ -169,17 +169,28 @@ pub fn spawn_heartbeat_writer(app: Arc<AppState>) {
                     // the next request-time epoch check).
                     let held = app.held_epoch.load(std::sync::atomic::Ordering::SeqCst);
                     match store.current_epoch() {
-                        Ok(db_epoch) if held != 0 && db_epoch != held => {
-                            app.mode_active.store(false, std::sync::atomic::Ordering::SeqCst);
-                            tracing::error!(
-                                instance_id = %id,
-                                held        = held,
-                                db_epoch    = db_epoch,
-                                "FENCED — durable epoch advanced past held value; self-demoting and stopping heartbeat"
+                        Ok(db_epoch) => {
+                            // Pass B1 (S3 / #115): cache the freshly observed
+                            // DB epoch so the gate can read it lock-free.
+                            // Release pairs with the gate's Acquire load.
+                            // This runs every HEARTBEAT_INTERVAL_MS (~2000 ms)
+                            // and is the cache repopulation path that bounds
+                            // the gate's staleness.
+                            app.cached_db_epoch.store(
+                                db_epoch,
+                                std::sync::atomic::Ordering::Release,
                             );
-                            break;
+                            if held != 0 && db_epoch != held {
+                                app.mode_active.store(false, std::sync::atomic::Ordering::SeqCst);
+                                tracing::error!(
+                                    instance_id = %id,
+                                    held        = held,
+                                    db_epoch    = db_epoch,
+                                    "FENCED — durable epoch advanced past held value; self-demoting and stopping heartbeat"
+                                );
+                                break;
+                            }
                         }
-                        Ok(_) => {}
                         Err(e) => {
                             tracing::warn!(error = %e, instance_id = %id,
                                 "Heartbeat writer: epoch read failed");
@@ -389,6 +400,10 @@ async fn perform_promotion(
     // promotion fences us, gate-level checks will detect held != db and
     // self-demote.
     app.held_epoch.store(new_epoch, std::sync::atomic::Ordering::SeqCst);
+    // Pass B1 (S3 / #115): re-stamp the cached DB epoch atomically so the
+    // gate sees this promotion without taking the store lock. Release pairs
+    // with the gate's Acquire load at `policy_layer.rs::enforce_posture_routing`.
+    app.cached_db_epoch.store(new_epoch, std::sync::atomic::Ordering::Release);
 
     // Step 3: Flip the local mode atomic. By this point the durable
     // claim already succeeded, so this is a per-process bookkeeping
