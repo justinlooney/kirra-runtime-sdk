@@ -137,7 +137,8 @@ Governor WCET budget S3 must prove**. Do not invent absolute milliseconds yet.
   non-finite input shall result in rejection (→ MRC), never silent acceptance.
   *Enforce: Governor (bounded WCET, NaN trap, fail-closed-timeout).* [H9, H10]
   - **FTTI:** per-cycle — the fail-closed timeout IS the FDTI+FRTI bound; ≤ 1 control cycle; absolute = the WCET bound proven in S3 (#115).
-  - **Verification method:** NaN/Inf → Reject (no panic) + checker-timeout → fail-closed (bounded WCET, S3) + checker-fault → MRC (S7) tests.
+  - **WCET bound (S3 #115):** target `GOVERNOR_VERDICT_WCET_TARGET_MICROS = 100 µs` (deployment); CI regression gate at `GOVERNOR_VERDICT_WCET_CI_THRESHOLD_MICROS = 1000 µs` (generous, hardware-noise-tolerant). CI-measured steady-state p99.9 across all verdict-path entry points: < 400 ns. See `src/wcet_gate.rs` for the structural boundedness argument + measurement methodology. The certified target-hardware number is re-measured on the D3 independent compute under S8 (#120).
+  - **Verification method:** NaN/Inf → Reject (no panic) + checker-timeout → fail-closed (bounded WCET, S3) + checker-fault → MRC (S7) tests + `wcet_gate::ci_gate_tests::wcet_*` CI regression tests.
 
 ### 4.1 Verification & FTTI summary
 

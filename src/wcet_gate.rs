@@ -1,0 +1,303 @@
+// src/wcet_gate.rs
+//
+// S3 WCET measurement + CI regression gate (issue #115).
+//
+// FRAMING (important — read this once):
+//
+// This module characterizes the Governor verdict-path WCET on CI / dev
+// hardware and provides a regression gate. It is NOT the certified target-
+// hardware WCET. The certified bound is re-measured on the D3 independent
+// compute under S8 (#120) — this establishes the method, the structural
+// boundedness argument, and a relative bound suitable for catching gross
+// regressions in CI.
+//
+// SAFETY GOAL: SG9 (OCCY_SAFETY_GOALS) / SG-004 + SG-006 + SG-008 + SG-015
+// (AEGIS-SG-001) — the safety check fails closed within a proven bound.
+// The bound proven here gates CI; re-validated on target by S8 sets the
+// SG9 fail-closed timeout for deployment.
+//
+// LOOP CLOSURE (from SPEED_ENVELOPE.md + ADR-0001):
+//   verdict_WCET  +  actuation_latency  <  control_cycle  <  0.5 s reaction
+// On any reasonable target (≤ ms-scale control cycle, tens-of-ms actuation
+// latency), a sub-100µs verdict WCET fits with multiple orders of magnitude
+// of headroom.
+
+use std::time::Instant;
+
+// ---------------------------------------------------------------------------
+// Structural boundedness argument (Pass A + B1 + B2 + B3 evidence)
+// ---------------------------------------------------------------------------
+//
+// 1. NO HEAP ALLOCATION ON THE VERDICT PATH.
+//    Pass A swapped `DenyBreach(String)` -> `DenyBreach(DenyCode)` (Copy,
+//    `&'static str` reason), dropped two per-request `.to_string()` on
+//    path+method in policy_layer.rs:224/229, and pinned the audit payload
+//    types so the producer captures owned-Copy fields only. Pass B2 moved
+//    the payload `serde_json::to_string` into the writer task (off the
+//    verdict path). See src/audit_writer.rs::write_one for the only
+//    serialization site.
+//
+// 2. EVERY LOOP IS BOUNDED.
+//    - validate_vehicle_command (src/gateway/kinematics_contract.rs): no
+//      loops. Linear pipeline of P0..P6 guards on a single command. O(1).
+//    - validate_cmd_vel (src/gateway/cmd_vel.rs): scalar checks. O(1).
+//    - parko-core::rss::lateral_safe_distance + longitudinal_safe_distance:
+//      one closure called twice (ego + obj). O(1).
+//    - should_route_command (src/posture_cache.rs): pattern match + bool
+//      returns. O(1).
+//    - resolve_posture (src/gateway/policy_layer.rs): one RwLock read +
+//      enum match. O(1).
+//    Per-command trajectory horizon length and per-evaluation agent count
+//    are bounded by the CALLER's planning loop, not by code within the
+//    Governor verdict path. The verdict path itself evaluates ONE command
+//    per call.
+//
+// 3. NO UNBOUNDED RECURSION.
+//    No recursion of any kind on the verdict path.
+//
+// 4. PANIC = ABORT (release).
+//    Cargo.toml [profile.release] panic = "abort" (Pass A). Eliminates
+//    unwind overhead and ensures any residual panic terminates the process
+//    deterministically — caught fail-closed by the watchdog/peer detection.
+//
+// 5. LOCK-FREE VERDICT PATH (production).
+//    - Pass B1: gate (`enforce_posture_routing`) reads `cached_db_epoch:
+//      AtomicU64` (Acquire) instead of `store.lock()` + `current_epoch()`.
+//    - Pass A: Allow + Clamp arms allocate nothing and never lock.
+//    - Pass B2: Deny arm calls `audit_writer_tx.try_send(job)` —
+//      tokio mpsc try_send is wait-free on the producer side under
+//      bounded backpressure (Full = `Err`, not block).
+//    The only `store.lock()` reachable from `policy_layer.rs` is the
+//    test-fallback branch executed when `audit_writer_tx` is not
+//    installed — unreachable in production main.
+//
+// 6. TRY_SEND IS O(1) BOUNDED.
+//    tokio::sync::mpsc::Sender::try_send is documented as non-blocking
+//    and returns immediately on Full / Closed. The queue itself is
+//    bounded (AUDIT_QUEUE_BOUND = 2048) so production cannot grow the
+//    queue beyond a fixed size.
+//
+// CONCLUSION: a finite WCET for the verdict path exists by construction.
+// This module measures it and gates CI against regressions.
+
+// ---------------------------------------------------------------------------
+// Budgets
+// ---------------------------------------------------------------------------
+
+/// SG9 fail-closed timeout TARGET (microseconds) for deployment hardware.
+///
+/// This is the verdict-path WCET budget the Governor must stay under on the
+/// target SoC. It must fit inside the control-cycle period minus the
+/// actuation latency (loop closure: WCET + actuation < cycle < 0.5 s
+/// reaction budget per SPEED_ENVELOPE.md). 100 µs is conservative for the
+/// O(1) scalar-math kernel proven above; S8 (#120) re-measures on target.
+pub const GOVERNOR_VERDICT_WCET_TARGET_MICROS: u64 = 100;
+
+/// CI regression-gate threshold (microseconds).
+///
+/// Generous (10× the target budget) to tolerate CI-hardware variance —
+/// shared CI runners are typically virtualized, noisier than the target
+/// SoC, and may share cores with other jobs. The gate's job is to catch
+/// GROSS regressions (e.g. an accidentally re-introduced heap alloc on
+/// the hot path, a `Mutex::lock()` slipping back into a verdict arm) —
+/// not to prove certifiable timing. The certified number is re-measured
+/// on target hardware under S8.
+pub const GOVERNOR_VERDICT_WCET_CI_THRESHOLD_MICROS: u64 = 1000;
+
+// ---------------------------------------------------------------------------
+// Measurement helpers
+// ---------------------------------------------------------------------------
+
+/// Measure elapsed-time stats across `iterations` invocations of `f`.
+/// Returns `(max_ns, p99_9_ns)`.
+///
+/// Single-threaded, no warmup, `std::time::Instant` — adequate for a
+/// gross-regression CI gate. The gate asserts on max (any single sample
+/// exceeding the threshold trips the regression check); p99.9 is reported
+/// alongside as a stability indicator (a max that's far above p99.9
+/// usually indicates a transient OS / scheduler stall, not a real
+/// code-path regression).
+#[cfg(test)]
+fn measure_stats<F: FnMut()>(iterations: u32, mut f: F) -> (u128, u128) {
+    let mut samples: Vec<u128> = Vec::with_capacity(iterations as usize);
+    for _ in 0..iterations {
+        let t0 = Instant::now();
+        f();
+        samples.push(t0.elapsed().as_nanos());
+    }
+    samples.sort_unstable();
+    let n = samples.len();
+    let max = samples[n - 1];
+    let p999_idx = (n * 999 / 1000).min(n - 1);
+    let p999 = samples[p999_idx];
+    (max, p999)
+}
+
+// ---------------------------------------------------------------------------
+// CI regression-gate tests
+// ---------------------------------------------------------------------------
+//
+// Each test exercises one verdict-path entry point at a representative
+// worst-case input + asserts the per-call max latency stays under
+// `GOVERNOR_VERDICT_WCET_CI_THRESHOLD_MICROS`. The measured max is printed
+// for diagnostic / trend-tracking. A failure here means either the
+// verdict path took >1ms (gross regression) or CI hardware is severely
+// degraded — both warrant investigation.
+//
+// Timing gates are hardware-sensitive. Numbers here are CI-relative;
+// re-validated on the target SoC under S8 (#120) for the actual
+// SG9 timeout setting.
+#[cfg(test)]
+mod ci_gate_tests {
+    use super::*;
+    use crate::gateway::kinematics_contract::{
+        validate_vehicle_command, ProposedVehicleCommand, VehicleKinematicsContract,
+    };
+    use crate::gateway::policy::OperationalCommand;
+    use crate::posture_cache::{should_route_command, CachedFleetPosture};
+    use crate::verifier::FleetPosture;
+
+    const ITERS: u32 = 100_000;
+
+    fn assert_under_budget(name: &str, max_ns: u128, p999_ns: u128) {
+        let max_us = max_ns / 1000;
+        let p999_us = p999_ns / 1000;
+        println!(
+            "WCET-GATE {name}: max={max_ns}ns ({max_us}us)  p99.9={p999_ns}ns ({p999_us}us) \
+             over {ITERS} iterations  vs CI-threshold {}us  (target {}us)",
+            GOVERNOR_VERDICT_WCET_CI_THRESHOLD_MICROS,
+            GOVERNOR_VERDICT_WCET_TARGET_MICROS,
+        );
+        assert!(
+            max_us < GOVERNOR_VERDICT_WCET_CI_THRESHOLD_MICROS as u128,
+            "WCET REGRESSION on {name}: max {max_us}us exceeds CI threshold {}us \
+             — a verdict-path latency this large indicates an accidental heap alloc, \
+             Mutex acquisition, or I/O on the hot path. Investigate before merging.",
+            GOVERNOR_VERDICT_WCET_CI_THRESHOLD_MICROS,
+        );
+    }
+
+    fn nominal_cmd() -> ProposedVehicleCommand {
+        // Worst-case Allow path: all P0..P6 guards run to completion
+        // without returning early. This is the full pipeline depth.
+        ProposedVehicleCommand {
+            linear_velocity_mps: 10.0,
+            current_velocity_mps: 9.0,
+            delta_time_s: 0.05,
+            steering_angle_deg: 5.0,
+            current_steering_angle_deg: 0.0,
+        }
+    }
+
+    #[test]
+    fn wcet_validate_vehicle_command_allow_path() {
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = nominal_cmd();
+        let (max_ns, p999_ns) = measure_stats(ITERS, || {
+            let _ = std::hint::black_box(validate_vehicle_command(
+                std::hint::black_box(&cmd),
+                std::hint::black_box(&contract),
+            ));
+        });
+        assert_under_budget("validate_vehicle_command::Allow", max_ns, p999_ns);
+    }
+
+    #[test]
+    fn wcet_validate_vehicle_command_p0_nan_deny() {
+        // P0 NaN/Inf guard — first check, returns DenyBreach early.
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: f64::NAN,
+            current_velocity_mps: 0.0,
+            delta_time_s: 0.05,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        let (max_ns, p999_ns) = measure_stats(ITERS, || {
+            let _ = std::hint::black_box(validate_vehicle_command(
+                std::hint::black_box(&cmd),
+                std::hint::black_box(&contract),
+            ));
+        });
+        assert_under_budget("validate_vehicle_command::P0_NaN_Deny", max_ns, p999_ns);
+    }
+
+    #[test]
+    fn wcet_validate_vehicle_command_p2_velocity_clamp() {
+        // P2 velocity hard ceiling — returns ClampLinear early.
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 100.0, // > 35.0 nominal max
+            current_velocity_mps: 10.0,
+            delta_time_s: 0.05,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        let (max_ns, p999_ns) = measure_stats(ITERS, || {
+            let _ = std::hint::black_box(validate_vehicle_command(
+                std::hint::black_box(&cmd),
+                std::hint::black_box(&contract),
+            ));
+        });
+        assert_under_budget("validate_vehicle_command::P2_ClampLinear", max_ns, p999_ns);
+    }
+
+    #[test]
+    fn wcet_validate_vehicle_command_p6_lateral_clamp() {
+        // P6 lateral-accel envelope — runs the full pipeline including
+        // the bicycle-model calculation, then returns ClampSteering.
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 30.0,
+            current_velocity_mps: 30.0,
+            delta_time_s: 1.0,
+            steering_angle_deg: 20.0,
+            current_steering_angle_deg: 0.0,
+        };
+        let (max_ns, p999_ns) = measure_stats(ITERS, || {
+            let _ = std::hint::black_box(validate_vehicle_command(
+                std::hint::black_box(&cmd),
+                std::hint::black_box(&contract),
+            ));
+        });
+        assert_under_budget("validate_vehicle_command::P6_ClampSteering", max_ns, p999_ns);
+    }
+
+    #[test]
+    fn wcet_should_route_command_nominal() {
+        // Posture gate hot path: cache fresh + Nominal -> route true.
+        let cache = Some(CachedFleetPosture::new(FleetPosture::Nominal));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let (max_ns, p999_ns) = measure_stats(ITERS, || {
+            let _ = std::hint::black_box(should_route_command(
+                std::hint::black_box(&cache),
+                std::hint::black_box(now),
+                std::hint::black_box(OperationalCommand::WriteState),
+            ));
+        });
+        assert_under_budget("should_route_command::Nominal", max_ns, p999_ns);
+    }
+
+    #[test]
+    fn wcet_should_route_command_stale_fail_closed() {
+        // Stale cache -> SG9 fail-closed Deny. This is the path SG9 most
+        // directly governs; verifies it stays under the budget.
+        let cache = Some(CachedFleetPosture::new(FleetPosture::Nominal));
+        let stale_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 10_000_000_000; // ~115 days in ms; orders of magnitude past any TTL
+        let (max_ns, p999_ns) = measure_stats(ITERS, || {
+            let _ = std::hint::black_box(should_route_command(
+                std::hint::black_box(&cache),
+                std::hint::black_box(stale_now),
+                std::hint::black_box(OperationalCommand::WriteState),
+            ));
+        });
+        assert_under_budget("should_route_command::Stale_FailClosed", max_ns, p999_ns);
+    }
+}
