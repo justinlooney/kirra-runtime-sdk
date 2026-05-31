@@ -42,6 +42,13 @@ dashmap = "6"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 
+# Safety kernel — pulled in Phase 2A so the slow-loop validator can call
+# `validate_trajectory_containment` (SG2) and `validate_vehicle_command`
+# (per-pose kinematics). NOT feature-gated: the algorithm is needed in
+# `cargo test` runs that don't enable the ros2 feature.
+kirra-runtime-sdk = { path = "../.." }
+parko-core        = { path = "../../parko/crates/parko-core" }
+
 # ROS 2 bindings — feature-gated. Pinned (`=`) because r2r explicitly does
 # not guarantee API stability; a deliberate bump is a separate maintenance
 # action. Runtime-agnostic + async-from-the-ground-up.

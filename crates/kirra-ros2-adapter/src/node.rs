@@ -39,7 +39,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::corridor::CorridorSource;
-use crate::state::AdaptorState;
+use crate::state::{AdaptorState, TrajectoryPoint};
+use crate::validation::validate_trajectory_slow;
 
 /// Capacity of the trajectory channel between the ROS subscription side
 /// and the slow-loop validator. 4 is generous: the slow loop processes
@@ -53,12 +54,16 @@ pub const TRAJECTORY_CHANNEL_CAPACITY: usize = 4;
 /// conformance check defaults to MRC via the staleness path).
 pub const CONTROL_CHANNEL_CAPACITY: usize = 16;
 
-/// Stub payload for trajectory ingress. Phase 2 replaces this with a
-/// typed `autoware_planning_msgs::Trajectory` map.
+/// Trajectory ingress payload. The subscription callback (Phase 2B —
+/// when Lanelet2 wiring lands) deserializes
+/// `autoware_planning_msgs::Trajectory` into this shape. Carries the
+/// planner-published TrajectoryPoint sequence so the slow loop has
+/// everything it needs without going back to the kernel for the bytes.
 #[derive(Debug, Clone)]
 pub struct IngressTrajectory {
     pub asset_id: String,
     pub trajectory_id: u64,
+    pub points: Vec<TrajectoryPoint>,
 }
 
 /// Stub payload for control-command ingress. Phase 2 replaces with a
@@ -128,27 +133,55 @@ pub async fn run_adapter(
         "kirra-ros2-adapter: subscriptions registered (Phase 1 skeleton)"
     );
 
-    // ----- Slow loop ----------------------------------------------------
+    // ----- Slow loop (Phase 2A) ----------------------------------------
     //
-    // Receives candidate trajectories, runs (in Phase 2) the full
-    // validate_trajectory_containment + per-pose kinematics + RSS
-    // pipeline, then on Accept calls state.install(...). Phase 1: log
-    // receipt only.
+    // For each candidate trajectory:
+    //   1) Snapshot the perception cache (read-and-clone; do NOT hold
+    //      the RwLock across the validation).
+    //   2) Run validate_trajectory_slow.
+    //   3) update_trajectory(asset_id, ..., verdict, now_ms) — installs
+    //      on Accept/Clamp, removes on MRC.
+    //   4) Log WCET for the cycle (warns if > 10 ms — the per-trajectory
+    //      budget from the design §3).
     let slow_state = Arc::clone(&state);
     let slow_corridor = Arc::clone(&corridor);
     tokio::spawn(async move {
-        let _ = slow_corridor.left_boundary(); // touch to avoid Phase-1
-                                               // unused warnings
         let mut rx = trajectory_rx;
         while let Some(traj) = rx.recv().await {
-            tracing::debug!(
+            let start = std::time::Instant::now();
+            let objects = slow_state.snapshot_objects();
+            let verdict = validate_trajectory_slow(
+                &traj.points,
+                slow_corridor.as_ref(),
+                &objects,
+                &slow_state.config,
+            );
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            slow_state.update_trajectory(
+                traj.asset_id.clone(),
+                traj.trajectory_id,
+                traj.points.clone(),
+                verdict,
+                now_ms,
+            );
+            let elapsed_us = start.elapsed().as_micros();
+            tracing::info!(
                 asset_id = %traj.asset_id,
                 trajectory_id = traj.trajectory_id,
-                "slow-loop received candidate trajectory (Phase 1 stub: no validation)"
+                verdict = ?verdict,
+                elapsed_us = elapsed_us,
+                "trajectory_verdict"
             );
-            // Phase 2: validate_trajectory_containment, validate_vehicle_command,
-            // RSS over horizon, then slow_state.install(...) on Accept.
-            let _ = slow_state.len();
+            if elapsed_us > 10_000 {
+                tracing::warn!(
+                    asset_id = %traj.asset_id,
+                    elapsed_us = elapsed_us,
+                    "trajectory_validation_wcet_exceeded"
+                );
+            }
         }
     });
 

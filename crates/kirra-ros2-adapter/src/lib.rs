@@ -16,15 +16,20 @@
 // Design tie-in: see `docs/safety/OCCY_131_OPTIONB_DESIGN.md`
 // (KIRRA-OCCY-OPTIONB-001) for the architecture this skeleton instantiates.
 
-pub mod state;
+pub mod config;
 pub mod corridor;
+pub mod state;
+pub mod validation;
 
 #[cfg(feature = "ros2")]
 pub mod node;
 
 // Re-exports for downstream consumers (Phase 2 will be the verifier service
 // binary; for now these are the public surface).
+pub use crate::config::VehicleConfig;
 pub use crate::corridor::{CorridorSource, MockCorridorSource, Point};
 pub use crate::state::{
-    AcceptedTrajectory, AdaptorState, Pose, TrajectoryPoint, TrajectoryVerdict,
+    AcceptedTrajectory, AdaptorState, PerceivedObject, Pose, TrajectoryPoint,
+    TrajectoryVerdict,
 };
+pub use crate::validation::validate_trajectory_slow;

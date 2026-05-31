@@ -17,7 +17,10 @@
 // `kirra-runtime-sdk` (added as a dep in that phase) and the slow loop in.
 
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+use crate::config::VehicleConfig;
+use crate::corridor::Point;
 
 /// One pose along a trajectory, in world frame. The shape matches
 /// `kirra_runtime_sdk::gateway::containment::Pose` so a Phase 2 conversion
@@ -46,6 +49,13 @@ pub enum TrajectoryVerdict {
     /// Promoted — the per-asset slot now holds this trajectory; the fast
     /// loop will conform commands to it.
     Accept,
+    /// Clamp-only path: per-pose kinematics requested a Clamp (linear or
+    /// steering) on at least one pose, but containment + RSS both passed.
+    /// The caller's policy is "promote a speed-derated variant" — see
+    /// design §3. Fast loop treats this as a special Accept where the
+    /// permissible-velocity envelope is below the planner's commanded
+    /// velocity; safe to drive but not at the planned speed.
+    Clamp,
     /// Refused — the slow loop rejected the candidate (or no candidate
     /// has ever been validated). Fast loop must MRC.
     MRCFallback,
@@ -99,6 +109,27 @@ impl AcceptedTrajectory {
         }
     }
 
+    /// Constructs a record with a specific verdict (Accept / Clamp /
+    /// MRCFallback / Pending). Slow loop uses this to record the
+    /// derate-only path (`Clamp`) without losing the trajectory bytes
+    /// the audit chain needs.
+    pub fn with_verdict(
+        asset_id: impl Into<String>,
+        trajectory_id: u64,
+        points: Vec<TrajectoryPoint>,
+        verdict: TrajectoryVerdict,
+        promoted_at_ms: u64,
+    ) -> Self {
+        Self {
+            asset_id: asset_id.into(),
+            trajectory_id,
+            points,
+            verdict,
+            promoted_at_ms,
+            max_age_ms: DEFAULT_MAX_AGE_MS,
+        }
+    }
+
     /// Wall-clock staleness check. Uses `saturating_sub` so a clock skew
     /// that puts `now_ms` behind `promoted_at_ms` reads as "not yet
     /// stale" (the only safe disposition; the fail-closed direction would
@@ -108,35 +139,108 @@ impl AcceptedTrajectory {
         now_ms.saturating_sub(self.promoted_at_ms) >= self.max_age_ms
     }
 
-    /// The fail-closed collapse: anything other than a fresh Accept
-    /// returns `MRCFallback`. Used by the fast loop when reading the
-    /// slot; isolates the policy in one place so we never silently leak
-    /// a stale Accept into a verdict.
+    /// The fail-closed collapse: anything other than a fresh Accept or
+    /// fresh Clamp returns `MRCFallback`. Used by the fast loop when
+    /// reading the slot; isolates the policy in one place so we never
+    /// silently leak a stale Accept into a verdict.
+    ///
+    /// Clamp is permitted because the slow loop only emits Clamp on a
+    /// trajectory that PASSED containment + RSS — the caller's per-pose
+    /// velocity is derated, but staying on the corridor + collision-free
+    /// at any speed ≤ derate is still safe. Phase 3 conformance enforces
+    /// the derate.
     #[must_use]
     pub fn fail_closed(&self, now_ms: u64) -> TrajectoryVerdict {
+        if self.is_stale(now_ms) {
+            return TrajectoryVerdict::MRCFallback;
+        }
         match self.verdict {
-            TrajectoryVerdict::Accept if !self.is_stale(now_ms) => TrajectoryVerdict::Accept,
+            TrajectoryVerdict::Accept => TrajectoryVerdict::Accept,
+            TrajectoryVerdict::Clamp  => TrajectoryVerdict::Clamp,
             _ => TrajectoryVerdict::MRCFallback,
         }
     }
 }
 
-/// Per-asset accepted-trajectory store. DashMap fits the existing AppState
-/// concurrency model: the slow loop installs / updates entries; the fast
-/// loop reads them per cycle without contention.
+/// A perceived object reported by the integrator's perception stack.
+/// The fields are the minimal set RSS needs (the slow loop runs
+/// `longitudinal_safe_distance` + `lateral_safe_distance` per object × per
+/// pose). Position is the centroid in world frame; heading is the object's
+/// motion direction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerceivedObject {
+    pub id: u64,
+    pub pos: Point,
+    pub velocity_mps: f64,
+    pub heading_rad: f64,
+}
+
+/// Per-asset accepted-trajectory store + perception cache + vehicle config.
+/// DashMap on the trajectory side fits the existing AppState concurrency
+/// model: the slow loop installs / updates entries; the fast loop reads
+/// them per cycle without contention. The objects cache is an
+/// `Arc<RwLock<Vec<_>>>` because perception ticks REPLACE the snapshot
+/// rather than mutate in place — write contention is the perception
+/// publisher only.
 ///
 /// The Arc-wrapped public newtype keeps the trait object form `Send + Sync`
 /// for the async tasks the adapter spawns.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AdaptorState {
     by_asset: DashMap<String, AcceptedTrajectory>,
+    /// Latest perception snapshot. Reads take a read lock at the start of
+    /// validation and CLONE; the slow loop does NOT hold the lock across
+    /// the computation. Writes replace the whole vector.
+    pub objects_cache: Arc<RwLock<Vec<PerceivedObject>>>,
+    /// Per-asset vehicle config (Phase 2A: single config, shared). Phase
+    /// 4 may make this per-asset.
+    pub config: Arc<VehicleConfig>,
 }
 
 impl AdaptorState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             by_asset: DashMap::new(),
+            objects_cache: Arc::new(RwLock::new(Vec::new())),
+            config: Arc::new(VehicleConfig::default_urban()),
         })
+    }
+
+    /// Constructs an `AdaptorState` with a specific vehicle config. Used
+    /// when the integrator's vehicle profile diverges from
+    /// `default_urban()` (e.g. shuttle, light truck).
+    pub fn with_config(config: VehicleConfig) -> Arc<Self> {
+        Arc::new(Self {
+            by_asset: DashMap::new(),
+            objects_cache: Arc::new(RwLock::new(Vec::new())),
+            config: Arc::new(config),
+        })
+    }
+
+    /// Replaces the perception snapshot with a fresh one. Called by the
+    /// adapter's PredictedObjects subscriber on each tick.
+    pub fn update_objects(&self, objects: Vec<PerceivedObject>) {
+        if let Ok(mut guard) = self.objects_cache.write() {
+            *guard = objects;
+        } else {
+            // RwLock poisoning is fail-closed-by-extension: a poisoned
+            // cache reads as an empty Vec next cycle (no objects → RSS is
+            // trivially safe, but containment + posture cache failures
+            // catch the bigger picture). Log loudly.
+            tracing::error!(
+                "objects_cache RwLock POISONED — perception snapshot dropped"
+            );
+        }
+    }
+
+    /// Read-and-clone of the latest perception snapshot. The slow loop
+    /// uses this exactly once per validation; never holds the lock
+    /// across the computation.
+    pub fn snapshot_objects(&self) -> Vec<PerceivedObject> {
+        self.objects_cache
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Installs (or replaces) the accepted trajectory for `asset_id`.
@@ -145,6 +249,39 @@ impl AdaptorState {
     pub fn install(&self, traj: AcceptedTrajectory) -> Option<AcceptedTrajectory> {
         let key = traj.asset_id.clone();
         self.by_asset.insert(key, traj)
+    }
+
+    /// Slow-loop verdict-driven update. Wraps the candidate trajectory in
+    /// an `AcceptedTrajectory` with the slow loop's verdict, then
+    /// installs it. On `MRCFallback`, this REMOVES any existing entry
+    /// so the fast loop sees the absence (which collapses to MRC via
+    /// `current_verdict`) rather than a stale prior Accept. On
+    /// `Pending` (initial / transitional), removes too — Pending is
+    /// reserved for absence.
+    pub fn update_trajectory(
+        &self,
+        asset_id: impl Into<String>,
+        trajectory_id: u64,
+        points: Vec<TrajectoryPoint>,
+        verdict: TrajectoryVerdict,
+        now_ms: u64,
+    ) {
+        let asset_id = asset_id.into();
+        match verdict {
+            TrajectoryVerdict::Accept | TrajectoryVerdict::Clamp => {
+                let record = AcceptedTrajectory::with_verdict(
+                    asset_id,
+                    trajectory_id,
+                    points,
+                    verdict,
+                    now_ms,
+                );
+                self.install(record);
+            }
+            TrajectoryVerdict::MRCFallback | TrajectoryVerdict::Pending => {
+                self.by_asset.remove(&asset_id);
+            }
+        }
     }
 
     /// Reads the current per-asset verdict, collapsed through
