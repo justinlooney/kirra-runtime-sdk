@@ -791,4 +791,72 @@ mod kinematics_contract_tests {
             "NaN guard (priority 0) must fire before zero-dt check (priority 1)"
         );
     }
+
+    /// SG3 / GAP 6: Priority-3 implied-acceleration guard at the zero boundary.
+    /// Exercises the FALSE arm of `implied_accel > 0.0` (l.279). When
+    /// commanded == current velocity, implied_accel = 0.0, so neither P3 nor
+    /// P4 should clamp; the command should Allow.
+    #[test]
+    fn test_implied_accel_at_zero_boundary_treated_as_no_clamp() {
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 10.0,
+            current_velocity_mps: 10.0,
+            delta_time_s: 0.1,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::Allow,
+            "implied_accel == 0.0 must NOT trigger the P3 acceleration clamp"
+        );
+    }
+
+    /// SG3 / GAP 7: Priority-4 implied-deceleration guard at the zero boundary.
+    /// Exercises the FALSE arm of `implied_accel < 0.0` (l.288). A negligible
+    /// positive accel (just below the max-accel threshold) keeps implied_accel
+    /// strictly above zero so P4 does not consider it; the command must Allow.
+    #[test]
+    fn test_implied_decel_at_zero_boundary_treated_as_no_clamp() {
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        // implied_accel = (10.0 - 10.000001) / 0.1 = -1e-5 m/s² — well below
+        // max_brake_mps2 (4.5), exercises the P4 false arm where the
+        // computed |implied_accel| is non-zero but below the brake ceiling.
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 10.0,
+            current_velocity_mps: 10.000_001,
+            delta_time_s: 0.1,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::Allow,
+            "tiny negative implied_accel must NOT trigger the P4 brake clamp"
+        );
+    }
+
+    /// SG9 / GAP 8: `Display for DenyCode` must render byte-identical to
+    /// `DenyCode::reason()`. Audit-chain hash stability depends on this
+    /// (every variant must match its SCREAMING_SNAKE_CASE token).
+    #[test]
+    fn test_deny_code_display_matches_reason() {
+        let all = [
+            DenyCode::NanInfLinearVelocity,
+            DenyCode::NanInfCurrentVelocity,
+            DenyCode::NanInfSteeringAngle,
+            DenyCode::NanInfCurrentSteering,
+            DenyCode::NanInfDeltaTime,
+            DenyCode::InvalidTimeDelta,
+            DenyCode::AssetLockedOut,
+        ];
+        for code in all {
+            assert_eq!(
+                format!("{code}"),
+                code.reason(),
+                "Display for {code:?} must equal reason() token"
+            );
+        }
+    }
 }
