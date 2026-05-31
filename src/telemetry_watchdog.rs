@@ -178,17 +178,34 @@ pub(crate) fn watchdog_sweep_once(
     // ----------------------------------------------------------------------
     // Periodically refresh the registered node list from SQLite.
     // This picks up nodes registered after the watchdog started.
+    //
+    // LOCK SCOPING (S3 / #115 — fixed self-deadlock):
+    // `app.store` is a non-reentrant `std::sync::Mutex`. Previously the load
+    // call was the match scrutinee, which held the guard for the entire
+    // Ok arm — including the `or_insert_with` closure that tries to re-lock
+    // the same mutex to read each node's last-telemetry timestamp.
+    // Non-reentrant + nested lock = self-deadlock. We now acquire the lock
+    // only long enough to collect the node IDs into a local, drop the
+    // guard, then iterate. Each `get_last_telemetry_timestamp` re-locks
+    // briefly (released at the end of its own expression). Same operations
+    // in the same order — only the lock scope changes.
     // ----------------------------------------------------------------------
     if now.saturating_sub(*last_node_refresh_ms) >= AV_WATCHDOG_NODE_REFRESH_MS
         || *last_node_refresh_ms == 0
     {
-        match app.store.lock().unwrap().load_all_registered_av_node_ids() {
+        let load_result = {
+            let store = app.store.lock().unwrap();
+            store.load_all_registered_av_node_ids()
+        }; // outer guard released here — before any per-node re-lock below
+
+        match load_result {
             Ok(node_ids) => {
                 for node_id in node_ids {
                     // Insert new nodes; don't overwrite existing entries
                     // (that would reset their last_seen_ms).
                     node_health.entry(node_id.clone()).or_insert_with(|| {
                         // Load initial last_seen from persistent store.
+                        // Safe: outer guard already released above.
                         let last_seen = app.store.lock().unwrap()
                             .get_last_telemetry_timestamp(&node_id)
                             .unwrap_or(0);
@@ -371,29 +388,22 @@ mod watchdog_tests {
 
 #[cfg(test)]
 mod watchdog_di_tests {
-    //! GAP 17 — telemetry-watchdog dead-man's switch tests.
+    //! GAP 17 — telemetry-watchdog dead-man's switch tests + cold-refresh
+    //! deadlock regression.
     //!
-    //! ## Why these tests bypass the SQLite refresh arm
+    //! The cold-refresh path used to hold `app.store.lock()` open across
+    //! the match scrutinee while the `or_insert_with` closure re-locked
+    //! the same non-reentrant `std::sync::Mutex` → self-deadlock. That
+    //! bug was fixed by tightening the lock scope (collect node_ids
+    //! under the first lock, drop the guard, then iterate). The
+    //! `test_watchdog_cold_refresh_completes_without_deadlock` test in
+    //! this module is the regression test for that fix — it drives the
+    //! cold-refresh arm directly under a 5-second timeout so any
+    //! reintroduction fails LOUDLY instead of hanging CI.
     //!
-    //! `watchdog_sweep_once` has a refresh path that, on a cold sweep
-    //! (`last_node_refresh_ms == 0`), holds `app.store.lock()` open across
-    //! the entire match expression while calling `node_health.entry(...)
-    //! .or_insert_with(|| { app.store.lock()... })`. The closure tries to
-    //! re-acquire the same `std::sync::Mutex` → self-deadlock.
-    //!
-    //! This deadlock pre-dates the S3 testability-seams pass — it existed
-    //! in the spawned-task body before the `watchdog_sweep_once` extraction.
-    //! It hasn't fired in deployment because `spawn_telemetry_watchdog`
-    //! has no production callers today (the watchdog is exported but not
-    //! yet wired into `kirra_verifier_service`). When wiring happens, this
-    //! must be fixed (release the outer guard before the inner lock, e.g.
-    //! by collecting `node_ids` first and dropping the guard).
-    //!
-    //! Reported as an S3 finding; the GAP 17 tests here pre-populate
-    //! `node_health` and set `last_node_refresh_ms = now` so the refresh
-    //! arm is skipped, exercising the sweep logic that the dead-man's
-    //! switch actually rides on (silence detection + mutation + trigger
-    //! emission). This is the SG9 path the gap-list asked us to cover.
+    //! The other tests (fire/no-fire/idempotency) target the sweep loop
+    //! directly via `watchdog_sweep_once` to keep them fast and
+    //! independent of the SQLite refresh arm.
 
     use super::*;
     use crate::clock::VirtualClock;
@@ -540,23 +550,24 @@ mod watchdog_di_tests {
             "second sweep on the same ongoing silence must NOT re-fire");
     }
 
-    /// Production-behavior pin: a sweep with `last_node_refresh_ms = 0`
-    /// (cold start) and av_subsystem_meta entries enters the refresh arm
-    /// where the original spawned-task body had a nested `app.store.lock()`
-    /// inside `or_insert_with`. The seam's `watchdog_sweep_once` preserves
-    /// that exact sequence (this is the documented pre-existing deadlock).
-    /// Locking it out from the regular test run keeps CI green; toggle
-    /// `KIRRA_RUN_WATCHDOG_DEADLOCK_REPRO` to demonstrate the deadlock for
-    /// the fix branch.
-    #[test]
-    fn test_watchdog_cold_refresh_deadlock_finding_documented() {
-        if std::env::var_os("KIRRA_RUN_WATCHDOG_DEADLOCK_REPRO").is_none() {
-            // Diagnostic-only — see module note above. Skipped by default
-            // so CI stays green pending the production fix.
-            return;
-        }
-        // (Repro path retained for the fix-branch; intentionally not
-        // executed under the default test run.)
+    /// SG9 / regression — cold-refresh path COMPLETES without deadlock.
+    ///
+    /// Drives the cold-refresh arm (`last_node_refresh_ms == 0` + at
+    /// least one registered av_subsystem_meta row not yet in
+    /// `node_health`) under a 5 s tokio timeout so any regression of
+    /// the previous self-deadlock fails LOUDLY instead of hanging CI.
+    /// Asserts the refresh completes its three observable contracts:
+    ///   (1) `node_health` is populated from the registered rows,
+    ///   (2) each entry's `last_seen_ms` is loaded from
+    ///        `av_subsystem_meta.last_telemetry_ms`, and
+    ///   (3) `*last_node_refresh_ms` is advanced to `now`.
+    ///
+    /// Replaces the prior `KIRRA_RUN_WATCHDOG_DEADLOCK_REPRO`-gated
+    /// diagnostic. This test now runs unconditionally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_watchdog_cold_refresh_completes_without_deadlock() {
+        use std::time::Duration;
+
         let store = VerifierStore::new(":memory:").expect("memory store");
         let app = Arc::new(AppState::new(store, VerifierOperationMode::Active));
         {
@@ -564,18 +575,58 @@ mod watchdog_di_tests {
             store.register_av_subsystem_meta(
                 "lidar_front", "LIDAR", "hw-0001", 0.7, 1_000_000,
             ).expect("register av subsystem");
+            store.register_av_subsystem_meta(
+                "imu_main", "IMU", "hw-0002", 0.7, 1_000_500,
+            ).expect("register av subsystem");
         }
         insert_trusted_node(&app, "lidar_front", 1_000_000);
+        insert_trusted_node(&app, "imu_main", 1_000_500);
 
-        let clock = VirtualClock::starting_at(2_000_000);
+        // Choose a `now` in the warn band for lidar_front but NOT yet
+        // past the timeout — so no fire arm is taken; we're only
+        // measuring that the refresh path itself terminates.
+        let now: u64 = 1_001_500;
+        let clock = VirtualClock::starting_at(now);
+
         let (tx, _rx) = mpsc::channel::<PostureRecalcTrigger>(128);
         let mut node_health: HashMap<String, WatchdogNodeEntry> = HashMap::new();
-        let mut last_node_refresh_ms: u64 = 0;
+        let mut last_node_refresh_ms: u64 = 0; // <- cold refresh
 
-        // DEADLOCK here on the cold-refresh path (production bug, S3 finding).
-        watchdog_sweep_once(
-            &app, &tx, clock.as_ref(),
-            &mut node_health, &mut last_node_refresh_ms,
-        );
+        // Run on a blocking worker so a regression in the std::sync::Mutex
+        // scoping deadlocks the *worker*, not the test runtime. The
+        // 5-second timeout then fires and we get a clean failure instead
+        // of a 60-second cargo "running for over N seconds" hang.
+        let app_for_task = Arc::clone(&app);
+        let clock_for_task: Arc<dyn Clock> = clock.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            watchdog_sweep_once(
+                &app_for_task,
+                &tx,
+                clock_for_task.as_ref(),
+                &mut node_health,
+                &mut last_node_refresh_ms,
+            );
+            (node_health, last_node_refresh_ms)
+        });
+
+        let (node_health, observed_last_refresh) =
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("cold-refresh path must complete within 5s (no deadlock)")
+                .expect("watchdog_sweep_once must not panic");
+
+        // (1) node_health populated from the registered rows.
+        assert_eq!(node_health.len(), 2,
+            "cold refresh must seed node_health from av_subsystem_meta");
+        assert!(node_health.contains_key("lidar_front"));
+        assert!(node_health.contains_key("imu_main"));
+
+        // (2) last_seen_ms loaded from each row's last_telemetry_ms.
+        assert_eq!(node_health.get("lidar_front").unwrap().last_seen_ms, 1_000_000);
+        assert_eq!(node_health.get("imu_main").unwrap().last_seen_ms, 1_000_500);
+
+        // (3) refresh stamp advanced to `now`.
+        assert_eq!(observed_last_refresh, now,
+            "*last_node_refresh_ms must be set to clock.now_ms() after a refresh");
     }
 }
