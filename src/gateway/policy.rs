@@ -84,4 +84,49 @@ mod tests {
         assert_eq!(classify_http_command("PATCH",  "/unknown"), OperationalCommand::Unknown);
         assert_eq!(classify_http_command("FROBNI", "/x"),       OperationalCommand::Unknown);
     }
+
+    // -------------------------------------------------------------------------
+    // MC/DC pair-completion tests (S3 / #115 — KIRRA-OCCY-MCDC-001).
+    //
+    // The POST/PUT OR-chain at l.29 has three alternates
+    //   (a) path.starts_with("/actuator")
+    //   (b) path == "/cmd_vel"
+    //   (c) path.starts_with("/cmd_vel/")
+    // and the SystemMutation OR-chain at l.31–34 has four alternates with the
+    // same shape. The existing tests cover (a), (b), and "/firmware",
+    // "/reboot" exact, "/config" prefix. The two undemonstrated independent
+    // effects are (c) — a sub-path of /cmd_vel/ — and the "/reboot/" prefix.
+    // -------------------------------------------------------------------------
+
+    /// MC/DC: independent-effect of `path.starts_with("/cmd_vel/")`
+    /// (l.29 third OR clause). All prior clauses are false; this one
+    /// decides the verdict.
+    #[test]
+    fn test_cmd_vel_sub_path_classifies_as_write_state() {
+        assert_eq!(
+            classify_http_command("POST", "/cmd_vel/replay"),
+            OperationalCommand::WriteState,
+            "/cmd_vel/* sub-path must classify as WriteState (third OR clause)"
+        );
+        assert_eq!(
+            classify_http_command("PUT", "/cmd_vel/buffer"),
+            OperationalCommand::WriteState
+        );
+    }
+
+    /// MC/DC: independent-effect of `path.starts_with("/reboot/")`
+    /// (l.33 third OR clause in the SystemMutation chain). /firmware
+    /// prefix false, exact /reboot false, prefix /reboot/ decides.
+    #[test]
+    fn test_reboot_sub_path_classifies_as_system_mutation() {
+        assert_eq!(
+            classify_http_command("POST", "/reboot/now"),
+            OperationalCommand::SystemMutation,
+            "/reboot/* sub-path must classify as SystemMutation (third OR clause)"
+        );
+        assert_eq!(
+            classify_http_command("POST", "/reboot/scheduled/15s"),
+            OperationalCommand::SystemMutation
+        );
+    }
 }

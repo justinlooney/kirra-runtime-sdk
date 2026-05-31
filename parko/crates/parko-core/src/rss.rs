@@ -380,4 +380,83 @@ mod tests {
             "post-arithmetic overflow must fail safe, got {r}"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // MC/DC pair-completion tests (S3 / #115 — KIRRA-OCCY-MCDC-001).
+    //
+    // The RSS entry guards in `lateral_safe_distance` (l.63–66) and
+    // `longitudinal_safe_distance` (l.120–125) are AND-chains of
+    // `is_finite()` predicates. The pre-existing tests cover the full
+    // pass case and the `finite_positive` (accel/brake) clauses. The
+    // remaining independent-effect demonstrations are for each velocity /
+    // reaction-time / accel_max `is_finite()` clause taken in isolation —
+    // each test below leaves every other clause true and only the named
+    // clause becomes false, so the entire decision flips on that clause.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// MC/DC: lateral guard — `ego_lat_vel.is_finite()` (l.64).
+    /// Independent-effect: NaN ego_lat_vel with all others valid.
+    #[test]
+    fn test_lat_nan_ego_lat_vel_is_failsafe() {
+        let r = lateral_safe_distance(f64::NAN, 0.0, 4.0, 0.5);
+        assert!(r >= RSS_FAILSAFE_DISTANCE_M, "NaN ego_lat_vel must fail safe, got {r}");
+    }
+
+    /// MC/DC: lateral guard — `obj_lat_vel.is_finite()` (l.65).
+    /// Independent-effect: Inf obj_lat_vel with all others valid.
+    #[test]
+    fn test_lat_inf_obj_lat_vel_is_failsafe() {
+        let r = lateral_safe_distance(0.0, f64::INFINITY, 4.0, 0.5);
+        assert!(r >= RSS_FAILSAFE_DISTANCE_M, "Inf obj_lat_vel must fail safe, got {r}");
+    }
+
+    /// MC/DC: longitudinal guard — `ego_vel.is_finite()` (l.123).
+    /// Independent-effect: Inf ego_vel with all others valid.
+    #[test]
+    fn test_long_inf_ego_vel_is_failsafe() {
+        let r = longitudinal_safe_distance(f64::INFINITY, 5.0, 0.5, 3.0, 6.0, 8.0);
+        assert!(r >= RSS_FAILSAFE_DISTANCE_M, "Inf ego_vel must fail safe, got {r}");
+    }
+
+    /// MC/DC: longitudinal guard — `lead_vel.is_finite()` (l.124).
+    /// Independent-effect: NaN lead_vel with all others valid.
+    #[test]
+    fn test_long_nan_lead_vel_is_failsafe() {
+        let r = longitudinal_safe_distance(10.0, f64::NAN, 0.5, 3.0, 6.0, 8.0);
+        assert!(r >= RSS_FAILSAFE_DISTANCE_M, "NaN lead_vel must fail safe, got {r}");
+    }
+
+    /// MC/DC: longitudinal guard — `reaction_time.is_finite()` (l.125).
+    /// Independent-effect: NaN reaction_time with all others valid.
+    #[test]
+    fn test_long_nan_reaction_time_is_failsafe() {
+        let r = longitudinal_safe_distance(10.0, 5.0, f64::NAN, 3.0, 6.0, 8.0);
+        assert!(r >= RSS_FAILSAFE_DISTANCE_M, "NaN reaction_time must fail safe, got {r}");
+    }
+
+    /// MC/DC: longitudinal guard — `accel_max.is_finite()` (l.125 / accel_max).
+    /// Independent-effect: NaN accel_max with all others valid (and the
+    /// `finite_positive` checks for brake_min/brake_max already true so
+    /// this is the sole determinant).
+    #[test]
+    fn test_long_nan_accel_max_is_failsafe() {
+        let r = longitudinal_safe_distance(10.0, 5.0, 0.5, f64::NAN, 6.0, 8.0);
+        assert!(r >= RSS_FAILSAFE_DISTANCE_M, "NaN accel_max must fail safe, got {r}");
+    }
+
+    /// MC/DC: `finite_positive(x)` second clause — `x > 0.0` false arm
+    /// while `x.is_finite()` remains true. Already covered by
+    /// `test_long_zero_brake_min_is_failsafe_not_zero` (brake_min=0.0) and
+    /// `test_long_negative_brake_min_is_failsafe` (brake_min<0). This
+    /// explicit pair anchor pins the predicate's independent effect at
+    /// the smallest finite positive boundary against a tiny negative.
+    #[test]
+    fn test_finite_positive_independent_effect_at_zero_boundary() {
+        // Tiny positive — finite_positive returns true.
+        let r1 = longitudinal_safe_distance(0.0, 0.0, 0.0, 0.0, f64::MIN_POSITIVE, 1.0);
+        // Tiny non-positive — finite_positive returns false → failsafe.
+        let r2 = longitudinal_safe_distance(0.0, 0.0, 0.0, 0.0, -f64::MIN_POSITIVE, 1.0);
+        assert!(r1 < RSS_FAILSAFE_DISTANCE_M, "tiny positive brake_min passes the guard, got {r1}");
+        assert!(r2 >= RSS_FAILSAFE_DISTANCE_M, "tiny negative brake_min must fail safe, got {r2}");
+    }
 }
