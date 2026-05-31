@@ -29,6 +29,7 @@ Date: 2026-05-23
 | KIRRA-OCCY-ODD-001 | Occy ODD + SOTIF triggering-condition catalog (ISO 21448) | 0.1 | Draft | docs/safety/OCCY_SOTIF.md | 2026-05-31 |
 | KIRRA-OCCY-SPEED-001 | Occy speed-envelope analysis (SSD / breaking-point / derate) | 0.1 | Draft | docs/safety/SPEED_ENVELOPE.md | 2026-05-31 |
 | KIRRA-OCCY-ADR-001 | ADR-0001: Occy ODD speed cap = 50 mph / 80 km/h | 1.0 | Accepted | docs/adr/0001-occy-odd-speed-cap.md | 2026-05-31 |
+| KIRRA-OCCY-DFA-001 | Occy ASIL decomposition + Dependent Failure Analysis | 0.1 | Draft | docs/safety/OCCY_DFA.md | 2026-05-31 |
 
 ---
 
