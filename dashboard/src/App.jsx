@@ -391,7 +391,7 @@ function fmtTime(ms) {
 }
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
-export default function AegisDashboard() {
+export default function KirraDashboard() {
   const [config, setConfig]       = useState({ url: "http://localhost:8090", token: "" });
   const [connected, setConnected] = useState(false);
   const [page, setPage]           = useState("overview");
@@ -465,7 +465,7 @@ export default function AegisDashboard() {
     return () => clearInterval(interval);
   }, [connected, loadFabricState]);
 
-  // SSE posture stream (best-effort; requires x-aegis-client-id header via server config)
+  // SSE posture stream (best-effort; requires x-kirra-client-id header via server config)
   useEffect(() => {
     if (!connected) return;
     const url = `${config.url.replace(/\/$/, "")}/system/posture/stream`;
@@ -496,7 +496,7 @@ export default function AegisDashboard() {
           </div>
           <div className="connect-screen">
             <div className="connect-card">
-              <div className="connect-title">Connect to Aegis</div>
+              <div className="connect-title">Connect to Kirra</div>
               <div className="connect-sub">Enter your verifier URL and admin token to get started.</div>
               {error && <div className="alert error">{error}</div>}
               <div className="field">
@@ -508,7 +508,7 @@ export default function AegisDashboard() {
                 <label>Admin Token</label>
                 <input type="password" value={config.token}
                   onChange={e => setConfig(c => ({ ...c, token: e.target.value }))}
-                  placeholder="Bearer token from /etc/aegis/aegis.env"
+                  placeholder="Bearer token from /etc/kirra/kirra.env"
                   onKeyDown={e => e.key === "Enter" && connect()} />
               </div>
               <button className="btn btn-primary btn-full" onClick={connect} disabled={loading}>

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Aegis + LangChain: Safety-filtered robot control via LangChain tools.
-The AI decides what to do. Aegis decides if it's physically safe to do it.
+Kirra + LangChain: Safety-filtered robot control via LangChain tools.
+The AI decides what to do. Kirra decides if it's physically safe to do it.
 
 This example demonstrates:
-  - Wrapping robot actions as LangChain tools with Aegis safety filtering
+  - Wrapping robot actions as LangChain tools with Kirra safety filtering
   - Handling Allow, Deny (posture), and Deny (kinematic breach) responses
   - Mocked agent output to demonstrate the safety filter without LangChain/OpenAI
 
@@ -12,7 +12,7 @@ Dependencies:
   pip install requests
   pip install langchain langchain-openai  # optional — for real agent
 
-The key architectural point: the @tool function body calls Aegis BEFORE
+The key architectural point: the @tool function body calls Kirra BEFORE
 sending any command to hardware. The LangChain agent sees only the tool's
 return value — it never has direct hardware access.
 """
@@ -20,31 +20,31 @@ return value — it never has direct hardware access.
 import json
 import requests
 
-AEGIS_URL = "http://localhost:8090"
-AEGIS_TOKEN = "your-admin-token"
-AEGIS_CLIENT_ID = "langchain-agent-001"
+KIRRA_URL = "http://localhost:8090"
+KIRRA_TOKEN = "your-admin-token"
+KIRRA_CLIENT_ID = "langchain-agent-001"
 
 # ---------------------------------------------------------------------------
-# Aegis client helper
+# Kirra client helper
 # ---------------------------------------------------------------------------
 
-def _aegis_evaluate(
+def _kirra_evaluate(
     action_type: str,
     target_node: str,
     risk_class: str,
     payload: dict,
 ) -> dict:
-    """Send an action claim to Aegis for posture-aware safety evaluation.
+    """Send an action claim to Kirra for posture-aware safety evaluation.
 
-    Returns the Aegis decision dict. Raises requests.HTTPError on HTTP errors.
+    Returns the Kirra decision dict. Raises requests.HTTPError on HTTP errors.
     Raises requests.ConnectionError / requests.Timeout on network failures.
     Callers must treat any exception from this function as a DENY.
     """
     resp = requests.post(
-        f"{AEGIS_URL}/action_filter/evaluate",
+        f"{KIRRA_URL}/action_filter/evaluate",
         headers={
-            "Authorization": f"Bearer {AEGIS_TOKEN}",
-            "x-aegis-client-id": AEGIS_CLIENT_ID,
+            "Authorization": f"Bearer {KIRRA_TOKEN}",
+            "x-kirra-client-id": KIRRA_CLIENT_ID,
             "Content-Type": "application/json",
         },
         json={
@@ -60,10 +60,10 @@ def _aegis_evaluate(
 
 
 # ---------------------------------------------------------------------------
-# LangChain tool definitions with Aegis safety filtering
+# LangChain tool definitions with Kirra safety filtering
 #
 # Each @tool function:
-#   1. Calls Aegis to get a safety decision
+#   1. Calls Kirra to get a safety decision
 #   2. Only proceeds with hardware interaction if allowed=True
 #   3. Returns a human-readable result (which the agent sees as tool output)
 #
@@ -109,20 +109,20 @@ def move_robot(target_node: str, linear_x: float, angular_z: float) -> str:
           f"linear_x={linear_x}, angular_z={angular_z}")
 
     try:
-        decision = _aegis_evaluate(
+        decision = _kirra_evaluate(
             action_type="cmd_vel",
             target_node=target_node,
             risk_class="kinetic_write",
             payload=payload,
         )
     except requests.exceptions.RequestException as exc:
-        print(f"  [AEGIS] Unreachable: {exc}. Halting action.")
+        print(f"  [KIRRA] Unreachable: {exc}. Halting action.")
         return (
-            "Motion command denied: Aegis safety filter is unreachable. "
+            "Motion command denied: Kirra safety filter is unreachable. "
             "No hardware command was sent."
         )
 
-    print(f"  [AEGIS] allowed={decision['allowed']}, "
+    print(f"  [KIRRA] allowed={decision['allowed']}, "
           f"reason={decision['reason']}, "
           f"posture={decision['posture_at_evaluation']}, "
           f"request_id={decision['request_id']}")
@@ -159,7 +159,7 @@ def move_robot(target_node: str, linear_x: float, angular_z: float) -> str:
         )
     else:
         return (
-            f"Motion denied by Aegis safety filter. "
+            f"Motion denied by Kirra safety filter. "
             f"Reason: {reason}. Fleet posture: {posture}."
         )
 
@@ -181,17 +181,17 @@ def read_sensor(target_node: str) -> str:
     print(f"\n[TOOL] read_sensor called: target={target_node}")
 
     try:
-        decision = _aegis_evaluate(
+        decision = _kirra_evaluate(
             action_type="read_telemetry",
             target_node=target_node,
             risk_class="read",
             payload={},
         )
     except requests.exceptions.RequestException as exc:
-        print(f"  [AEGIS] Unreachable: {exc}. Halting read.")
-        return "Telemetry read denied: Aegis safety filter is unreachable."
+        print(f"  [KIRRA] Unreachable: {exc}. Halting read.")
+        return "Telemetry read denied: Kirra safety filter is unreachable."
 
-    print(f"  [AEGIS] allowed={decision['allowed']}, "
+    print(f"  [KIRRA] allowed={decision['allowed']}, "
           f"reason={decision['reason']}, "
           f"posture={decision['posture_at_evaluation']}")
 
@@ -208,14 +208,14 @@ def read_sensor(target_node: str) -> str:
 @langchain_tool
 def get_fleet_health() -> str:
     """
-    Query the current fleet posture from Aegis (public, unauthenticated endpoint).
+    Query the current fleet posture from Kirra (public, unauthenticated endpoint).
 
     Returns a summary of the current fleet-wide posture state.
     This does not go through the action filter — it reads public posture state.
     """
     print("\n[TOOL] get_fleet_health called")
     try:
-        resp = requests.get(f"{AEGIS_URL}/fleet/posture", timeout=5)
+        resp = requests.get(f"{KIRRA_URL}/fleet/posture", timeout=5)
         resp.raise_for_status()
         data = resp.json()
         fleet = data.get("fleet", [])
@@ -257,7 +257,7 @@ def _read_hardware_telemetry(target_node: str) -> dict:
 
 def run_langchain_agent(user_prompt: str) -> None:
     """
-    Run a LangChain ReAct agent with Aegis-filtered robot tools.
+    Run a LangChain ReAct agent with Kirra-filtered robot tools.
     Requires: pip install langchain langchain-openai, and OPENAI_API_KEY env var.
     """
     if not LANGCHAIN_AVAILABLE:
@@ -311,7 +311,7 @@ Question: {input}
 
 def demo_mocked_agent_output():
     """
-    Demonstrates Aegis safety filtering with mocked agent tool invocations.
+    Demonstrates Kirra safety filtering with mocked agent tool invocations.
 
     Simulates four scenarios that a LangChain agent might generate:
       1. Valid motion command in nominal posture
@@ -319,13 +319,13 @@ def demo_mocked_agent_output():
       3. Read telemetry (allowed even in degraded posture)
       4. A scenario where the agent checks fleet health before moving
 
-    NOTE: This demo connects to a live Aegis instance at AEGIS_URL.
-    If Aegis is not running, each call will raise a connection error
+    NOTE: This demo connects to a live Kirra instance at KIRRA_URL.
+    If Kirra is not running, each call will raise a connection error
     which is caught and printed as a graceful denial.
     """
     print("=" * 60)
-    print("Aegis Action Filter Demo — LangChain-style Tool Invocations")
-    print(f"Aegis URL: {AEGIS_URL}")
+    print("Kirra Action Filter Demo — LangChain-style Tool Invocations")
+    print(f"Kirra URL: {KIRRA_URL}")
     print("=" * 60)
 
     scenarios = [
@@ -375,7 +375,7 @@ def demo_mocked_agent_output():
     print("\n" + "=" * 60)
     print("Demo complete.")
     print("In a real LangChain agent, these tool calls are generated by the LLM.")
-    print("Aegis evaluates each one against live fleet posture before any")
+    print("Kirra evaluates each one against live fleet posture before any")
     print("hardware interaction occurs. The agent only sees the tool's return value.")
     print("=" * 60)
 

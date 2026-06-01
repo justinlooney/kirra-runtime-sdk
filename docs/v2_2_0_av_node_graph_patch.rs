@@ -1,5 +1,5 @@
 // ============================================================================
-// PATCH: src/verifier.rs + src/bin/aegis_verifier_service.rs
+// PATCH: src/verifier.rs + src/bin/kirra_verifier_service.rs
 //
 // v2.2.0 — AV sensor fault handling and MRC posture transitions
 //
@@ -72,11 +72,11 @@ pub struct AvSubsystemRegistration {
 */
 
 // ----------------------------------------------------------------------------
-// SECTION B: Handler — append to src/bin/aegis_verifier_service.rs
+// SECTION B: Handler — append to src/bin/kirra_verifier_service.rs
 // ----------------------------------------------------------------------------
 
 /*
-// Append to src/bin/aegis_verifier_service.rs imports:
+// Append to src/bin/kirra_verifier_service.rs imports:
 use crate::verifier::{
     AvSubsystemRegistration,
     AV_DEFAULT_CONFIDENCE_FLOOR,

@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# install.sh — Aegis Safety Kernel Installer
+# install.sh — Kirra Safety Kernel Installer
 #
-# Installs the Aegis Safety Kernel Verifier Service on Debian/Ubuntu systems.
+# Installs the Kirra Safety Kernel Verifier Service on Debian/Ubuntu systems.
 # Supports x86_64, aarch64 (NVIDIA Jetson, Raspberry Pi), and armv7.
 #
 # Usage (recommended — pulls latest release from GitHub):
-#   curl -fsSL https://raw.githubusercontent.com/justinlooney/aegis/master/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/justinlooney/kirra-runtime-sdk/master/install.sh | sudo bash
 #
 # Usage (from downloaded release archive):
 #   sudo bash install.sh
 #
 # Usage (non-interactive with environment variables pre-set):
-#   AEGIS_ADMIN_TOKEN=mytoken AEGIS_PORT=8090 sudo bash install.sh --non-interactive
+#   KIRRA_ADMIN_TOKEN=mytoken KIRRA_PORT=8090 sudo bash install.sh --non-interactive
 #
 # What this script does:
 #   1. Detects system architecture
-#   2. Downloads the correct Aegis binary (or uses bundled binary if present)
-#   3. Creates a dedicated 'aegis' system user and required directories
+#   2. Downloads the correct Kirra binary (or uses bundled binary if present)
+#   3. Creates a dedicated 'kirra' system user and required directories
 #   4. Prompts for configuration (port, token, database location)
-#   5. Writes /etc/aegis/aegis.env with your configuration
+#   5. Writes /etc/kirra/kirra.env with your configuration
 #   6. Installs and starts the systemd service
 #   7. Verifies the service is running correctly
 #
@@ -28,7 +28,7 @@
 #   - sudo / root access
 #   - Internet access (if downloading binary from GitHub)
 #
-# Support: https://github.com/justinlooney/aegis/issues
+# Support: https://github.com/justinlooney/kirra-runtime-sdk/issues
 
 set -euo pipefail
 
@@ -36,17 +36,17 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 
-AEGIS_USER="aegis"
-AEGIS_GROUP="aegis"
+KIRRA_USER="kirra"
+KIRRA_GROUP="kirra"
 INSTALL_DIR="/usr/local/bin"
-CONFIG_DIR="/etc/aegis"
-DATA_DIR="/var/lib/aegis"
-LOG_DIR="/var/log/aegis"
-SERVICE_NAME="aegis-verifier"
+CONFIG_DIR="/etc/kirra"
+DATA_DIR="/var/lib/kirra"
+LOG_DIR="/var/log/kirra"
+SERVICE_NAME="kirra-verifier"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-ENV_FILE="${CONFIG_DIR}/aegis.env"
-BINARY_NAME="aegis_verifier_service"
-GITHUB_REPO="justinlooney/aegis"
+ENV_FILE="${CONFIG_DIR}/kirra.env"
+BINARY_NAME="kirra_verifier_service"
+GITHUB_REPO="justinlooney/kirra-runtime-sdk"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 
 # Minimum supported OS versions
@@ -116,15 +116,15 @@ for arg in "$@"; do
             echo "Options:"
             echo "  --non-interactive  Skip prompts, use env vars or defaults"
             echo "  --force            Reinstall even if already installed"
-            echo "  --uninstall        Remove Aegis and all its files"
+            echo "  --uninstall        Remove Kirra and all its files"
             echo "  --no-start         Install but don't start the service"
             echo "  --help             Show this help"
             echo ""
             echo "Environment variables (for --non-interactive):"
-            echo "  AEGIS_ADMIN_TOKEN  Admin bearer token (required)"
-            echo "  AEGIS_PORT         Listen port (default: 8090)"
-            echo "  AEGIS_DB_PATH      Database path (default: /var/lib/aegis/aegis.db)"
-            echo "  AEGIS_VERIFIER_MODE active or passive_standby (default: active)"
+            echo "  KIRRA_ADMIN_TOKEN  Admin bearer token (required)"
+            echo "  KIRRA_PORT         Listen port (default: 8090)"
+            echo "  KIRRA_DB_PATH      Database path (default: /var/lib/kirra/kirra.db)"
+            echo "  KIRRA_VERIFIER_MODE active or passive_standby (default: active)"
             exit 0
             ;;
         *)
@@ -138,7 +138,7 @@ done
 # ---------------------------------------------------------------------------
 
 do_uninstall() {
-    section "Uninstalling Aegis"
+    section "Uninstalling Kirra"
 
     if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
         info "Stopping service..."
@@ -163,9 +163,9 @@ do_uninstall() {
     echo ""
     echo "To remove everything including data:"
     echo "  sudo rm -rf ${CONFIG_DIR} ${DATA_DIR} ${LOG_DIR}"
-    echo "  sudo userdel -r ${AEGIS_USER} 2>/dev/null || true"
+    echo "  sudo userdel -r ${KIRRA_USER} 2>/dev/null || true"
     echo ""
-    success "Aegis service uninstalled."
+    success "Kirra service uninstalled."
     exit 0
 }
 
@@ -198,7 +198,7 @@ fi
 
 # systemd check
 if ! command -v systemctl &>/dev/null; then
-    fatal "systemd is required but not found. Aegis uses systemd for service management."
+    fatal "systemd is required but not found. Kirra uses systemd for service management."
 fi
 success "systemd detected"
 
@@ -210,7 +210,7 @@ case "${ARCH}" in
     armv7l|armv7)        BINARY_ARCH="armv7-linux"    ;;
     *)
         fatal "Unsupported architecture: ${ARCH}
-Aegis supports: x86_64 (Intel/AMD), aarch64 (Jetson/Pi/Graviton), armv7 (embedded ARM)
+Kirra supports: x86_64 (Intel/AMD), aarch64 (Jetson/Pi/Graviton), armv7 (embedded ARM)
 Please open an issue at https://github.com/${GITHUB_REPO}/issues"
         ;;
 esac
@@ -219,7 +219,7 @@ success "Architecture: ${ARCH} → using ${BINARY_ARCH} binary"
 # Check for existing installation
 if [ -f "${INSTALL_DIR}/${BINARY_NAME}" ] && [ "${FORCE_REINSTALL}" = false ]; then
     EXISTING_VERSION=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null || echo "unknown")
-    warn "Aegis is already installed (${EXISTING_VERSION})"
+    warn "Kirra is already installed (${EXISTING_VERSION})"
     warn "Run with --force to reinstall, or --uninstall to remove"
     echo ""
     echo "Current service status:"
@@ -237,11 +237,11 @@ success "Required tools available"
 # Binary acquisition
 # ---------------------------------------------------------------------------
 
-section "Installing Aegis Binary"
+section "Installing Kirra Binary"
 
 # Check if binary is bundled (running from release archive)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUNDLED_BINARY="${SCRIPT_DIR}/aegis/${BINARY_NAME}"
+BUNDLED_BINARY="${SCRIPT_DIR}/kirra/${BINARY_NAME}"
 
 if [ -f "${BUNDLED_BINARY}" ]; then
     info "Using bundled binary"
@@ -250,7 +250,7 @@ else
     info "Downloading from GitHub releases..."
 
     if ! command -v curl &>/dev/null; then
-        fatal "curl is required to download Aegis. Run: sudo apt-get install -y curl"
+        fatal "curl is required to download Kirra. Run: sudo apt-get install -y curl"
     fi
 
     # Get latest release URL
@@ -282,7 +282,7 @@ else
     TMPDIR=$(mktemp -d)
     trap 'rm -rf "${TMPDIR}"' EXIT
 
-    ARCHIVE="${TMPDIR}/aegis.tar.gz"
+    ARCHIVE="${TMPDIR}/kirra.tar.gz"
     curl -fsSL --progress-bar "${DOWNLOAD_URL}" -o "${ARCHIVE}" || \
         fatal "Download failed. URL: ${DOWNLOAD_URL}"
 
@@ -298,7 +298,7 @@ else
             if grep -q "${ARCHIVE_NAME}" "${CHECKSUMS}"; then
                 (cd "${TMPDIR}" && \
                     grep "${ARCHIVE_NAME}" SHA256SUMS | \
-                    sed "s|${ARCHIVE_NAME}|aegis.tar.gz|" | \
+                    sed "s|${ARCHIVE_NAME}|kirra.tar.gz|" | \
                     sha256sum -c --quiet) || \
                     fatal "Checksum verification FAILED — download may be corrupt or tampered"
                 success "Checksum verified"
@@ -309,7 +309,7 @@ else
     # Extract
     info "Extracting..."
     tar -xzf "${ARCHIVE}" -C "${TMPDIR}"
-    BINARY_PATH="${TMPDIR}/aegis/${BINARY_NAME}"
+    BINARY_PATH="${TMPDIR}/kirra/${BINARY_NAME}"
 
     if [ ! -f "${BINARY_PATH}" ]; then
         fatal "Binary not found in archive. Archive contents:"
@@ -333,17 +333,17 @@ success "Binary installed to ${INSTALL_DIR}/${BINARY_NAME}"
 section "Creating System User and Directories"
 
 # Create system user (no login shell, no home directory in /home)
-if ! id "${AEGIS_USER}" &>/dev/null; then
+if ! id "${KIRRA_USER}" &>/dev/null; then
     useradd \
         --system \
         --no-create-home \
         --home-dir "${DATA_DIR}" \
         --shell /usr/sbin/nologin \
-        --comment "Aegis Safety Kernel Service" \
-        "${AEGIS_USER}"
-    success "Created system user: ${AEGIS_USER}"
+        --comment "Kirra Safety Kernel Service" \
+        "${KIRRA_USER}"
+    success "Created system user: ${KIRRA_USER}"
 else
-    info "System user ${AEGIS_USER} already exists"
+    info "System user ${KIRRA_USER} already exists"
 fi
 
 # Create directories with correct ownership
@@ -351,16 +351,16 @@ for dir in "${CONFIG_DIR}" "${DATA_DIR}" "${LOG_DIR}"; do
     mkdir -p "${dir}"
 done
 
-# Config: root-owned, aegis-readable (contains admin token)
-chown root:${AEGIS_GROUP} "${CONFIG_DIR}"
+# Config: root-owned, kirra-readable (contains admin token)
+chown root:${KIRRA_GROUP} "${CONFIG_DIR}"
 chmod 750 "${CONFIG_DIR}"
 
-# Data: aegis-owned (database writes)
-chown ${AEGIS_USER}:${AEGIS_GROUP} "${DATA_DIR}"
+# Data: kirra-owned (database writes)
+chown ${KIRRA_USER}:${KIRRA_GROUP} "${DATA_DIR}"
 chmod 750 "${DATA_DIR}"
 
-# Logs: aegis-owned
-chown ${AEGIS_USER}:${AEGIS_GROUP} "${LOG_DIR}"
+# Logs: kirra-owned
+chown ${KIRRA_USER}:${KIRRA_GROUP} "${LOG_DIR}"
 chmod 750 "${LOG_DIR}"
 
 success "Directories created"
@@ -375,7 +375,7 @@ info "  Logs:     ${LOG_DIR}"
 section "Configuration"
 
 echo ""
-echo "Aegis requires a few configuration values."
+echo "Kirra requires a few configuration values."
 echo "Press Enter to accept the default shown in [brackets]."
 echo ""
 
@@ -387,15 +387,15 @@ echo "  submitting federation reports). Keep this secure."
 echo "  It must be provided in API calls as: Authorization: Bearer <token>"
 echo ""
 
-if [ -n "${AEGIS_ADMIN_TOKEN:-}" ]; then
-    ADMIN_TOKEN="${AEGIS_ADMIN_TOKEN}"
-    info "Using AEGIS_ADMIN_TOKEN from environment"
+if [ -n "${KIRRA_ADMIN_TOKEN:-}" ]; then
+    ADMIN_TOKEN="${KIRRA_ADMIN_TOKEN}"
+    info "Using KIRRA_ADMIN_TOKEN from environment"
 elif [ "${NON_INTERACTIVE}" = true ]; then
-    fatal "AEGIS_ADMIN_TOKEN must be set in non-interactive mode"
+    fatal "KIRRA_ADMIN_TOKEN must be set in non-interactive mode"
 else
     # Check if upgrading and token already exists
-    if [ -f "${ENV_FILE}" ] && grep -q "^AEGIS_ADMIN_TOKEN=" "${ENV_FILE}"; then
-        EXISTING_TOKEN=$(grep "^AEGIS_ADMIN_TOKEN=" "${ENV_FILE}" | cut -d= -f2-)
+    if [ -f "${ENV_FILE}" ] && grep -q "^KIRRA_ADMIN_TOKEN=" "${ENV_FILE}"; then
+        EXISTING_TOKEN=$(grep "^KIRRA_ADMIN_TOKEN=" "${ENV_FILE}" | cut -d= -f2-)
         echo -n "  Keep existing token? [Y/n]: "
         read -r KEEP_TOKEN
         if [[ "${KEEP_TOKEN:-Y}" =~ ^[Yy]$ ]]; then
@@ -426,13 +426,13 @@ fi
 # --- Port ---
 echo ""
 echo -e "${BOLD}Listen Port${NC}"
-echo "  The port Aegis listens on for HTTP API requests."
+echo "  The port Kirra listens on for HTTP API requests."
 echo "  Default 8090 is recommended unless it conflicts with other services."
 echo ""
 
 DEFAULT_PORT="8090"
 if [ "${NON_INTERACTIVE}" = true ]; then
-    PORT="${AEGIS_PORT:-${DEFAULT_PORT}}"
+    PORT="${KIRRA_PORT:-${DEFAULT_PORT}}"
 else
     echo -n "  Port [${DEFAULT_PORT}]: "
     read -r PORT
@@ -449,14 +449,14 @@ info "Listen address: 0.0.0.0:${PORT}"
 # --- Database path ---
 echo ""
 echo -e "${BOLD}Database Location${NC}"
-echo "  Aegis stores its fleet registry, audit chain, and posture history"
+echo "  Kirra stores its fleet registry, audit chain, and posture history"
 echo "  in a SQLite database. This file should be on a persistent volume."
 echo "  For production deployments, consider a dedicated disk or volume."
 echo ""
 
-DEFAULT_DB="${DATA_DIR}/aegis.db"
+DEFAULT_DB="${DATA_DIR}/kirra.db"
 if [ "${NON_INTERACTIVE}" = true ]; then
-    DB_PATH="${AEGIS_DB_PATH:-${DEFAULT_DB}}"
+    DB_PATH="${KIRRA_DB_PATH:-${DEFAULT_DB}}"
 else
     echo -n "  Database path [${DEFAULT_DB}]: "
     read -r DB_PATH
@@ -464,15 +464,15 @@ else
 fi
 info "Database: ${DB_PATH}"
 
-# Ensure database directory exists and is writable by aegis user
+# Ensure database directory exists and is writable by kirra user
 DB_DIR=$(dirname "${DB_PATH}")
 mkdir -p "${DB_DIR}"
-chown ${AEGIS_USER}:${AEGIS_GROUP} "${DB_DIR}"
+chown ${KIRRA_USER}:${KIRRA_GROUP} "${DB_DIR}"
 
 # --- Verifier mode ---
 echo ""
 echo -e "${BOLD}Verifier Mode${NC}"
-echo "  active          — This is the primary Aegis instance. It enforces"
+echo "  active          — This is the primary Kirra instance. It enforces"
 echo "                    posture and writes to the cache. Use this for"
 echo "                    single-instance or primary HA deployments."
 echo ""
@@ -483,7 +483,7 @@ echo ""
 
 DEFAULT_MODE="active"
 if [ "${NON_INTERACTIVE}" = true ]; then
-    VERIFIER_MODE="${AEGIS_VERIFIER_MODE:-${DEFAULT_MODE}}"
+    VERIFIER_MODE="${KIRRA_VERIFIER_MODE:-${DEFAULT_MODE}}"
 else
     echo -n "  Mode - active or passive_standby [${DEFAULT_MODE}]: "
     read -r VERIFIER_MODE
@@ -513,67 +513,67 @@ if [ -f "${ENV_FILE}" ]; then
 fi
 
 cat > "${ENV_FILE}" << EOF
-# Aegis Safety Kernel — Environment Configuration
+# Kirra Safety Kernel — Environment Configuration
 # Generated by installer on $(date -u '+%Y-%m-%dT%H:%M:%SZ')
 # Edit this file to change configuration, then run:
-#   sudo systemctl restart aegis-verifier
+#   sudo systemctl restart kirra-verifier
 
 # ── Security ──────────────────────────────────────────────────────────────
 # Admin bearer token — required for all administrative API calls.
 # Keep this secret. Rotate by editing this file and restarting the service.
 # API usage: Authorization: Bearer <value>
-AEGIS_ADMIN_TOKEN=${ADMIN_TOKEN}
+KIRRA_ADMIN_TOKEN=${ADMIN_TOKEN}
 
 # Log signing key — Ed25519 private key (base64). Leave blank to disable signing.
 # Generate: openssl genpkey -algorithm ed25519 2>/dev/null | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64
-# AEGIS_LOG_SIGNING_KEY=
+# KIRRA_LOG_SIGNING_KEY=
 
 # ── Network ───────────────────────────────────────────────────────────────
 # Address and port to listen on.
 # Use 127.0.0.1:${PORT} to restrict to localhost (if behind a reverse proxy).
 # Use 0.0.0.0:${PORT} to listen on all interfaces (default).
-AEGIS_VERIFIER_ADDR=0.0.0.0:${PORT}
+KIRRA_VERIFIER_ADDR=0.0.0.0:${PORT}
 
 # ── Storage ───────────────────────────────────────────────────────────────
 # Path to the SQLite database file.
 # This file contains the fleet registry, audit chain, and posture history.
 # Back this up regularly in production deployments.
-AEGIS_DB_PATH=${DB_PATH}
+KIRRA_DB_PATH=${DB_PATH}
 
 # ── Operation Mode ────────────────────────────────────────────────────────
 # active          = Primary instance. Enforces posture. Writes to cache.
 # passive_standby = HA standby. Observes only. Auto-promotes if primary fails.
-AEGIS_VERIFIER_MODE=${VERIFIER_MODE}
+KIRRA_VERIFIER_MODE=${VERIFIER_MODE}
 
 # ── Identity and Ingress (advanced) ───────────────────────────────────────
-# Set to true to require x-aegis-client-id header on identity-gated routes.
+# Set to true to require x-kirra-client-id header on identity-gated routes.
 # Leave false for standard deployments.
-AEGIS_TRUSTED_INGRESS_MODE=false
+KIRRA_TRUSTED_INGRESS_MODE=false
 
-# Header name used for client identity (when AEGIS_TRUSTED_INGRESS_MODE=true)
-AEGIS_CLIENT_ID_HEADER=x-aegis-client-id
+# Header name used for client identity (when KIRRA_TRUSTED_INGRESS_MODE=true)
+KIRRA_CLIENT_ID_HEADER=x-kirra-client-id
 
 # ── High Availability (optional) ──────────────────────────────────────────
-# Unique identifier for this Aegis instance (used in HA deployments).
+# Unique identifier for this Kirra instance (used in HA deployments).
 # Leave blank to use hostname automatically.
-# AEGIS_INSTANCE_ID=
+# KIRRA_INSTANCE_ID=
 
 # Heartbeat interval for primary → standby signaling (milliseconds).
 # Default: 2000 (2 seconds)
-# AEGIS_HEARTBEAT_INTERVAL=2000
+# KIRRA_HEARTBEAT_INTERVAL=2000
 
 # Promotion timeout — standby promotes if primary silent for this long (ms).
 # Default: 10000 (10 seconds)
-# AEGIS_PROMOTION_TIMEOUT=10000
+# KIRRA_PROMOTION_TIMEOUT=10000
 
 # ── Supervisor Reset Key (optional) ───────────────────────────────────────
 # Required only if using supervisor reset operations.
 # Must be non-empty and ≤ 64 bytes if set.
-# AEGIS_SUPERVISOR_RESET_KEY=
+# KIRRA_SUPERVISOR_RESET_KEY=
 EOF
 
 # Secure the config file — contains the admin token
-chown root:${AEGIS_GROUP} "${ENV_FILE}"
+chown root:${KIRRA_GROUP} "${ENV_FILE}"
 chmod 640 "${ENV_FILE}"
 
 success "Configuration written to ${ENV_FILE}"
@@ -585,21 +585,21 @@ success "Configuration written to ${ENV_FILE}"
 section "Installing systemd Service"
 
 # Write service file (use bundled version or generate inline)
-BUNDLED_SERVICE="${SCRIPT_DIR}/systemd/aegis-verifier.service"
+BUNDLED_SERVICE="${SCRIPT_DIR}/systemd/kirra-verifier.service"
 
 if [ -f "${BUNDLED_SERVICE}" ]; then
     cp "${BUNDLED_SERVICE}" "${SERVICE_FILE}"
 else
     cat > "${SERVICE_FILE}" << EOF
 [Unit]
-Description=Aegis Safety Kernel Verifier Service
+Description=Kirra Safety Kernel Verifier Service
 Documentation=https://github.com/${GITHUB_REPO}
 After=network.target
 Wants=network.target
 
 [Service]
-User=${AEGIS_USER}
-Group=${AEGIS_GROUP}
+User=${KIRRA_USER}
+Group=${KIRRA_GROUP}
 ExecStart=${INSTALL_DIR}/${BINARY_NAME}
 WorkingDirectory=${DATA_DIR}
 EnvironmentFile=${ENV_FILE}
@@ -614,7 +614,7 @@ ProtectHome=true
 ReadWritePaths=${DATA_DIR} ${LOG_DIR}
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=aegis-verifier
+SyslogIdentifier=kirra-verifier
 MemoryMax=512M
 TasksMax=64
 
@@ -637,13 +637,13 @@ if [ "${SKIP_SERVICE_START}" = false ]; then
 
     # Validate token is present before starting — empty token causes 503 fail-closed
     if [ -z "${ADMIN_TOKEN:-}" ]; then
-        fatal "AEGIS_ADMIN_TOKEN is empty — cannot start service (service would return 503 on all requests)"
+        fatal "KIRRA_ADMIN_TOKEN is empty — cannot start service (service would return 503 on all requests)"
     fi
 
     systemctl start "${SERVICE_NAME}"
 
     # Wait for service to become healthy
-    info "Waiting for Aegis to start..."
+    info "Waiting for Kirra to start..."
     MAX_WAIT=30
     WAITED=0
     while [ ${WAITED} -lt ${MAX_WAIT} ]; do
@@ -659,7 +659,7 @@ if [ "${SKIP_SERVICE_START}" = false ]; then
 
     if curl -fsSL --max-time 2 \
         "http://127.0.0.1:${PORT}/health" &>/dev/null; then
-        success "Aegis is running and healthy"
+        success "Kirra is running and healthy"
     else
         warn "Service started but health check did not respond within ${MAX_WAIT}s"
         warn "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 50"
@@ -677,39 +677,39 @@ DASHBOARD_PORT=8091
 if [ -d "${BUNDLED_DASHBOARD}" ]; then
     section "Web Dashboard"
     echo ""
-    echo "  A web dashboard is included for monitoring the Aegis fleet."
+    echo "  A web dashboard is included for monitoring the Kirra fleet."
     echo "  It will be served on port ${DASHBOARD_PORT} using Python's built-in HTTP server."
     echo ""
 
     if [ "${NON_INTERACTIVE}" = true ]; then
-        _install_dash="${AEGIS_INSTALL_DASHBOARD:-Y}"
+        _install_dash="${KIRRA_INSTALL_DASHBOARD:-Y}"
     else
         echo -n "  Install web dashboard? [Y/n]: "
         read -r _install_dash
     fi
 
     if [[ "${_install_dash:-Y}" =~ ^[Yy]$ ]]; then
-        DASHBOARD_SHARE_DIR="/usr/local/share/aegis/dashboard"
+        DASHBOARD_SHARE_DIR="/usr/local/share/kirra/dashboard"
         mkdir -p "${DASHBOARD_SHARE_DIR}"
         cp -r "${BUNDLED_DASHBOARD}/." "${DASHBOARD_SHARE_DIR}/"
-        chown -R root:${AEGIS_GROUP} "${DASHBOARD_SHARE_DIR}"
+        chown -R root:${KIRRA_GROUP} "${DASHBOARD_SHARE_DIR}"
         chmod -R 755 "${DASHBOARD_SHARE_DIR}"
 
-        DASHBOARD_SERVICE_FILE="/etc/systemd/system/aegis-dashboard.service"
-        BUNDLED_DASH_SVC="${SCRIPT_DIR}/systemd/aegis-dashboard.service"
+        DASHBOARD_SERVICE_FILE="/etc/systemd/system/kirra-dashboard.service"
+        BUNDLED_DASH_SVC="${SCRIPT_DIR}/systemd/kirra-dashboard.service"
 
         if [ -f "${BUNDLED_DASH_SVC}" ]; then
             cp "${BUNDLED_DASH_SVC}" "${DASHBOARD_SERVICE_FILE}"
         else
             cat > "${DASHBOARD_SERVICE_FILE}" << EOF
 [Unit]
-Description=Aegis Safety Kernel Web Dashboard
-After=network.target aegis-verifier.service
-Wants=aegis-verifier.service
+Description=Kirra Safety Kernel Web Dashboard
+After=network.target kirra-verifier.service
+Wants=kirra-verifier.service
 
 [Service]
-User=${AEGIS_USER}
-Group=${AEGIS_GROUP}
+User=${KIRRA_USER}
+Group=${KIRRA_GROUP}
 ExecStart=/usr/bin/python3 -m http.server ${DASHBOARD_PORT} --directory ${DASHBOARD_SHARE_DIR}
 WorkingDirectory=${DASHBOARD_SHARE_DIR}
 Restart=on-failure
@@ -724,10 +724,10 @@ EOF
 
         chmod 644 "${DASHBOARD_SERVICE_FILE}"
         systemctl daemon-reload
-        systemctl enable aegis-dashboard
+        systemctl enable kirra-dashboard
 
         if [ "${SKIP_SERVICE_START}" = false ]; then
-            systemctl start aegis-dashboard
+            systemctl start kirra-dashboard
             success "Dashboard installed and running on port ${DASHBOARD_PORT}"
         else
             success "Dashboard installed (not started)"
@@ -744,7 +744,7 @@ fi
 section "Installation Complete"
 
 echo ""
-success "Aegis Safety Kernel installed successfully"
+success "Kirra Safety Kernel installed successfully"
 echo ""
 bold "Service Management:"
 echo "  Status:   sudo systemctl status ${SERVICE_NAME}"
@@ -776,14 +776,14 @@ if [ "${GENERATED_TOKEN}" = true ]; then
     echo -e "  Admin Token: ${BOLD}${ADMIN_TOKEN}${NC}"
     echo ""
     echo "  This token is also stored in ${ENV_FILE}"
-    echo "  (readable by root and the aegis group only)"
+    echo "  (readable by root and the kirra group only)"
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 fi
 
 echo ""
 bold "Quick API Test:"
 echo "  curl http://localhost:${PORT}/health"
-echo "  curl -H 'Authorization: Bearer \${AEGIS_ADMIN_TOKEN}' \\"
+echo "  curl -H 'Authorization: Bearer \${KIRRA_ADMIN_TOKEN}' \\"
 echo "       http://localhost:${PORT}/fleet/posture"
 echo ""
 bold "Documentation:"

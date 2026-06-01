@@ -1,14 +1,14 @@
-# Aegis v1.0.0 — Dependency DAG Cycle and Depth Protection Report
+# Kirra v1.0.0 — Dependency DAG Cycle and Depth Protection Report
 
-This document establishes the definitive mathematical, algorithmic, and defensive specification for the Aegis v1.0.0 Directed Acyclic Graph (DAG) topology evaluation engine. It formally proves how the control plane shields itself against recursive processing exploitation, stack-exhaustion denial of service (DoS), graph poisoning, and adversarial topology manipulation.
+This document establishes the definitive mathematical, algorithmic, and defensive specification for the Kirra v1.0.0 Directed Acyclic Graph (DAG) topology evaluation engine. It formally proves how the control plane shields itself against recursive processing exploitation, stack-exhaustion denial of service (DoS), graph poisoning, and adversarial topology manipulation.
 
 ---
 
 ## 1. DAG Security Model
 
-The structural stability of the Aegis trust propagation engine depends on deterministic execution boundaries. Because trust states are inherited recursively through an asset dependency tree, the evaluation surface represents a high-leverage target for malicious inputs.
+The structural stability of the Kirra trust propagation engine depends on deterministic execution boundaries. Because trust states are inherited recursively through an asset dependency tree, the evaluation surface represents a high-leverage target for malicious inputs.
 
-> **Core Performance Invariant**: Aegis topology evaluation must always terminate in bounded time.
+> **Core Performance Invariant**: Kirra topology evaluation must always terminate in bounded time.
 
 ### Threat Modeling & Mitigation Target Matrix
 

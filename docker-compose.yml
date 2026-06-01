@@ -1,17 +1,17 @@
 services:
-  aegis-verifier:
+  kirra-verifier:
     build: .
-    container_name: aegis-verifier
+    container_name: kirra-verifier
     ports:
-      - "${AEGIS_PORT:-8090}:8090"
+      - "${KIRRA_PORT:-8090}:8090"
     env_file:
       - .env
     environment:
-      AEGIS_VERIFIER_ADDR: "0.0.0.0:8090"
-      AEGIS_DB_PATH: "/var/lib/aegis/aegis.db"
-      AEGIS_VERIFIER_MODE: "${AEGIS_VERIFIER_MODE:-active}"
+      KIRRA_VERIFIER_ADDR: "0.0.0.0:8090"
+      KIRRA_DB_PATH: "/var/lib/kirra/kirra.db"
+      KIRRA_VERIFIER_MODE: "${KIRRA_VERIFIER_MODE:-active}"
     volumes:
-      - aegis-data:/var/lib/aegis
+      - kirra-data:/var/lib/kirra
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsSL", "http://localhost:8090/health"]
@@ -20,33 +20,33 @@ services:
       start_period: 5s
       retries: 3
 
-  aegis-dashboard:
+  kirra-dashboard:
     build:
       context: dashboard
       dockerfile: Dockerfile
-    container_name: aegis-dashboard
+    container_name: kirra-dashboard
     ports:
       - "${DASHBOARD_PORT:-8091}:80"
     restart: unless-stopped
     depends_on:
-      aegis-verifier:
+      kirra-verifier:
         condition: service_healthy
 
   # Optional HA standby — enable with: docker compose --profile ha up
-  aegis-standby:
+  kirra-standby:
     profiles: [ha]
     build: .
-    container_name: aegis-standby
+    container_name: kirra-standby
     ports:
-      - "${AEGIS_STANDBY_PORT:-8092}:8090"
+      - "${KIRRA_STANDBY_PORT:-8092}:8090"
     env_file:
       - .env
     environment:
-      AEGIS_VERIFIER_ADDR: "0.0.0.0:8090"
-      AEGIS_DB_PATH: "/var/lib/aegis/aegis.db"
-      AEGIS_VERIFIER_MODE: "passive_standby"
+      KIRRA_VERIFIER_ADDR: "0.0.0.0:8090"
+      KIRRA_DB_PATH: "/var/lib/kirra/kirra.db"
+      KIRRA_VERIFIER_MODE: "passive_standby"
     volumes:
-      - aegis-data-standby:/var/lib/aegis
+      - kirra-data-standby:/var/lib/kirra
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsSL", "http://localhost:8090/health"]
@@ -56,5 +56,5 @@ services:
       retries: 3
 
 volumes:
-  aegis-data:
-  aegis-data-standby:
+  kirra-data:
+  kirra-data-standby:

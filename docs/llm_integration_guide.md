@@ -1,6 +1,6 @@
-# Aegis LLM Integration Guide
+# Kirra LLM Integration Guide
 
-Practical guide for connecting AI agents and language model pipelines to the Aegis Action Filter safety enforcement layer.
+Practical guide for connecting AI agents and language model pipelines to the Kirra Action Filter safety enforcement layer.
 
 ---
 
@@ -8,11 +8,11 @@ Practical guide for connecting AI agents and language model pipelines to the Aeg
 
 The fastest path to LLM-safe actuator control: intercept every AI-generated action with a single HTTP call before sending it to hardware.
 
-**Step 1.** Start Aegis with an admin token:
+**Step 1.** Start Kirra with an admin token:
 ```bash
-export AEGIS_ADMIN_TOKEN="your-secret-token"
-export AEGIS_SUPERVISOR_RESET_KEY="your-reset-key"
-./aegis_verifier_service
+export KIRRA_ADMIN_TOKEN="your-secret-token"
+export KIRRA_SUPERVISOR_RESET_KEY="your-reset-key"
+./kirra_verifier_service
 # Listening on 0.0.0.0:8090
 ```
 
@@ -20,7 +20,7 @@ export AEGIS_SUPERVISOR_RESET_KEY="your-reset-key"
 ```bash
 curl -s -X POST http://localhost:8090/action_filter/evaluate \
   -H "Authorization: Bearer your-secret-token" \
-  -H "x-aegis-client-id: my-llm-agent" \
+  -H "x-kirra-client-id: my-llm-agent" \
   -H "Content-Type: application/json" \
   -d '{
     "action_type": "cmd_vel",
@@ -55,17 +55,17 @@ That's the entire integration. The rest of this guide covers authentication, han
 
 ## Authentication
 
-Aegis uses two authentication mechanisms for the action filter endpoint:
+Kirra uses two authentication mechanisms for the action filter endpoint:
 
 ### Bearer Token (Required on all protected routes)
 
 All calls to `/action_filter/evaluate` require an `Authorization` header with the admin bearer token:
 
 ```
-Authorization: Bearer <AEGIS_ADMIN_TOKEN>
+Authorization: Bearer <KIRRA_ADMIN_TOKEN>
 ```
 
-The token is read from the `AEGIS_ADMIN_TOKEN` environment variable at startup. If the variable is absent or empty, the service returns `503 Service Unavailable` on all protected routes (fail-closed, not fail-open). There are no hardcoded fallback tokens.
+The token is read from the `KIRRA_ADMIN_TOKEN` environment variable at startup. If the variable is absent or empty, the service returns `503 Service Unavailable` on all protected routes (fail-closed, not fail-open). There are no hardcoded fallback tokens.
 
 Token comparison uses constant-time comparison to prevent timing attacks. Never use standard string equality for token comparison in your own code that wraps this API.
 
@@ -74,23 +74,23 @@ Token comparison uses constant-time comparison to prevent timing attacks. Never 
 The `/action_filter/evaluate` endpoint is in the identity-gated tier, which requires a client identity header in addition to the bearer token:
 
 ```
-x-aegis-client-id: <your-agent-identifier>
+x-kirra-client-id: <your-agent-identifier>
 ```
 
-The header name defaults to `x-aegis-client-id` and can be configured via the `AEGIS_CLIENT_ID_HEADER` environment variable. The value is a free-form string identifying the AI agent or orchestration system making the request (e.g., `"openai-agent-001"`, `"langchain-robot-controller"`, `"my-custom-planner"`).
+The header name defaults to `x-kirra-client-id` and can be configured via the `KIRRA_CLIENT_ID_HEADER` environment variable. The value is a free-form string identifying the AI agent or orchestration system making the request (e.g., `"openai-agent-001"`, `"langchain-robot-controller"`, `"my-custom-planner"`).
 
-This header is required when `AEGIS_TRUSTED_INGRESS_MODE=true`. In default configuration (`AEGIS_TRUSTED_INGRESS_MODE=false`), the header is accepted but not strictly required. For production deployments, enable trusted ingress mode to enforce strict client identity.
+This header is required when `KIRRA_TRUSTED_INGRESS_MODE=true`. In default configuration (`KIRRA_TRUSTED_INGRESS_MODE=false`), the header is accepted but not strictly required. For production deployments, enable trusted ingress mode to enforce strict client identity.
 
 **Complete authenticated request headers:**
 ```
-Authorization: Bearer <AEGIS_ADMIN_TOKEN>
-x-aegis-client-id: <client-identifier>
+Authorization: Bearer <KIRRA_ADMIN_TOKEN>
+x-kirra-client-id: <client-identifier>
 Content-Type: application/json
 ```
 
 ### Token Security Recommendations
 
-- Store `AEGIS_ADMIN_TOKEN` in a secrets manager (AWS Secrets Manager, HashiCorp Vault, Kubernetes Secrets). Never put it in code or version control.
+- Store `KIRRA_ADMIN_TOKEN` in a secrets manager (AWS Secrets Manager, HashiCorp Vault, Kubernetes Secrets). Never put it in code or version control.
 - Rotate tokens regularly. The `/system/audit/rotate-signing-key` endpoint supports key rotation for the audit chain signing key.
 - Use separate client IDs per agent or deployment (e.g., `"gpt4-prod-001"`, `"claude-staging-002"`). This allows per-agent audit filtering.
 - In Kubernetes deployments, inject the token as an environment variable from a Secret, not a ConfigMap.
@@ -190,7 +190,7 @@ The action filter returns one of three effective outcomes:
 The action is approved. Your agent loop should proceed with hardware execution.
 
 ```python
-result = check_with_aegis(action)
+result = check_with_kirra(action)
 if result["allowed"]:
     hardware_client.execute(action)
     log.info(f"Executed: {action['action_type']} on {action['target_node']}")
@@ -223,7 +223,7 @@ The action itself is invalid, regardless of posture. The model generated an out-
         # Model hallucinated an unsafe velocity — inform and retry with clamped value
         log.error(f"Kinematic envelope breach: {action['payload']}")
         clamped = clamp_to_safe_envelope(action["payload"])
-        retry_with_aegis(action["action_type"], action["target_node"], clamped)
+        retry_with_kirra(action["action_type"], action["target_node"], clamped)
         
     elif reason == "UNKNOWN_ACTION_TYPE":
         # Model invented a non-existent action — this is a hallucination
@@ -236,13 +236,13 @@ The action itself is invalid, regardless of posture. The model generated an out-
         # Add retry with forced JSON schema validation at the model layer
 ```
 
-The key principle: `allowed: false` means **stop**. Do not retry with the same parameters without understanding and addressing the reason code. Do not try to route around Aegis. The audit trail records every attempt.
+The key principle: `allowed: false` means **stop**. Do not retry with the same parameters without understanding and addressing the reason code. Do not try to route around Kirra. The audit trail records every attempt.
 
 ---
 
 ## Registering the AI Model as a Fleet Node
 
-An AI model or agent can be registered as a fleet node. This allows Aegis to track its trust state and, critically, mark it `Untrusted` if it begins exhibiting anomalous behavior (repeated hallucinated commands, out-of-envelope requests, unexpected action types).
+An AI model or agent can be registered as a fleet node. This allows Kirra to track its trust state and, critically, mark it `Untrusted` if it begins exhibiting anomalous behavior (repeated hallucinated commands, out-of-envelope requests, unexpected action types).
 
 **Step 1. Register the model as a node:**
 
@@ -289,7 +289,7 @@ The posture stream lets your agent proactively know when the fleet state changes
 ```bash
 curl -N http://localhost:8090/system/posture/stream \
   -H "Authorization: Bearer your-admin-token" \
-  -H "x-aegis-client-id: my-llm-agent" \
+  -H "x-kirra-client-id: my-llm-agent" \
   -H "Accept: text/event-stream"
 ```
 
@@ -305,12 +305,12 @@ data: {"event_type":"NODE_STATUS_CHANGED","node_id":"sensor_01","emitted_at_ms":
 import sseclient
 import requests
 
-def subscribe_posture_stream(aegis_url, token, client_id):
+def subscribe_posture_stream(kirra_url, token, client_id):
     resp = requests.get(
-        f"{aegis_url}/system/posture/stream",
+        f"{kirra_url}/system/posture/stream",
         headers={
             "Authorization": f"Bearer {token}",
-            "x-aegis-client-id": client_id,
+            "x-kirra-client-id": client_id,
             "Accept": "text/event-stream",
         },
         stream=True,
@@ -342,7 +342,7 @@ Subscribe to the posture stream in a background thread at agent startup. This el
 
 **1. Subscribe to the SSE stream at startup.** Don't wait for a denied action to discover that the fleet is degraded. A background thread subscribed to `/system/posture/stream` gives you real-time visibility into fleet health changes and lets your agent switch modes proactively.
 
-**2. Always check `allowed` before any hardware call.** There should be no code path in your agent loop that sends a command to hardware without first receiving `allowed: true` from Aegis. Treat the Aegis response as a gate, not a suggestion.
+**2. Always check `allowed` before any hardware call.** There should be no code path in your agent loop that sends a command to hardware without first receiving `allowed: true` from Kirra. Treat the Kirra response as a gate, not a suggestion.
 
 **3. Use structured reason codes for agent behavior.** The `reason` field is a stable, machine-readable code. Build your agent loop to branch on reason codes rather than parsing free-text messages. `KINEMATIC_ENVELOPE_BREACH` should trigger a different response than `UNKNOWN_ACTION_TYPE` — the first suggests a clamp-and-retry, the second suggests a hallucination that needs to be logged for model evaluation.
 
@@ -350,9 +350,9 @@ Subscribe to the posture stream in a background thread at agent startup. This el
 
 **5. Register your AI model as a fleet node.** This enables the dependency graph to propagate trust state from the model to its downstream actuators. A hallucinating model can be marked `Untrusted`, which cascades to `Degraded` posture for any actuator that depends on it for commands.
 
-**6. Enable trusted ingress mode in production.** Set `AEGIS_TRUSTED_INGRESS_MODE=true` and ensure every client sends a unique `x-aegis-client-id`. This enables per-agent audit filtering and prevents unauthenticated clients from reaching the action filter.
+**6. Enable trusted ingress mode in production.** Set `KIRRA_TRUSTED_INGRESS_MODE=true` and ensure every client sends a unique `x-kirra-client-id`. This enables per-agent audit filtering and prevents unauthenticated clients from reaching the action filter.
 
-**7. Set connection timeouts.** Aegis is a synchronous HTTP endpoint. Set a 5-second timeout on your HTTP client. If Aegis is unreachable, treat the failure as a deny and halt the action. Never default to executing hardware commands when the safety filter is unavailable.
+**7. Set connection timeouts.** Kirra is a synchronous HTTP endpoint. Set a 5-second timeout on your HTTP client. If Kirra is unreachable, treat the failure as a deny and halt the action. Never default to executing hardware commands when the safety filter is unavailable.
 
 **8. Use the audit export for compliance.** The `/system/audit/export` endpoint provides a paginated, hash-chained export of all action filter decisions. Export and archive this log periodically for incident investigation, regulatory compliance, and model evaluation data.
 

@@ -2,7 +2,7 @@ board:
   name: "Kirra Safety Runtime"
   description: >
     Solo lean-agile board for a hardware-neutral, safety-critical autonomy
-    runtime targeting ASIL-D. Tracks parko-core, parko-onnx, parko-aegis,
+    runtime targeting ASIL-D. Tracks parko-core, parko-onnx, parko-kirra,
     and kirra-runtime-sdk from deterministic tick grid through
     certification-ready packaging.
 
@@ -158,7 +158,7 @@ labels:
   - name: "backend-openvino"  ; color: "cfd3d7"
   - name: "backend-rocm"      ; color: "fef2c0"
   - name: "behavioral-safety" ; color: "d93f0b"
-  - name: "aegis-integration" ; color: "b60205"
+  - name: "kirra-integration" ; color: "b60205"
   - name: "posture-engine"    ; color: "e99695"
   - name: "packaging"         ; color: "c2e0c6"
   - name: "simulation"        ; color: "fbca04"

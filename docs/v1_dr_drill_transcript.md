@@ -1,6 +1,6 @@
-# Aegis v1.0.0 — Disaster Recovery Drill Transcript
+# Kirra v1.0.0 — Disaster Recovery Drill Transcript
 
-This transcript serves as the official cryptographic and operational validation record for the Aegis v1.0.0 Disaster Recovery (DR) pipeline. The operations recorded herein confirm that the system can survive an abrupt primary control plane failure, maintain zero-leak security invariants, and restore topological consistency onto a blank-slate instance without state drift.
+This transcript serves as the official cryptographic and operational validation record for the Kirra v1.0.0 Disaster Recovery (DR) pipeline. The operations recorded herein confirm that the system can survive an abrupt primary control plane failure, maintain zero-leak security invariants, and restore topological consistency onto a blank-slate instance without state drift.
 
 ---
 
@@ -32,7 +32,7 @@ With the primary verifier in a state of terminal stability, an administrative sn
 
 ```bash
 curl -i -X POST http://127.0.0.1:8088/system/backup/export \
-  -H "X-Aegis-Admin-Token: [REDACTED]" \
+  -H "X-Kirra-Admin-Token: [REDACTED]" \
   -o backup.json
 ```
 
@@ -50,7 +50,7 @@ A catastrophic local control plane disruption was induced by hard-terminating th
 ### Operational Sequence:
  1. **Primary Terminated**: `kill -9` sent directly to the process listening on port 8088.
  2. **Standby Promoted**: The orchestration controller intercepted the primary dropout signal.
- 3. **Runtime Reconfiguration**: The environment profile on the target secondary environment was updated to `AEGIS_VERIFIER_MODE=active`. The application reactor on port 8089 hot-reloaded the variable, lifting the passive-mode mutation shield.
+ 3. **Runtime Reconfiguration**: The environment profile on the target secondary environment was updated to `KIRRA_VERIFIER_MODE=active`. The application reactor on port 8089 hot-reloaded the variable, lifting the passive-mode mutation shield.
 
 ---
 
@@ -61,7 +61,7 @@ The serialized JSON state snapshot captured from the dead primary node was piped
 ```bash
 curl -i -X POST http://127.0.0.1:8089/system/backup/import \
   -H "Content-Type: application/json" \
-  -H "X-Aegis-Admin-Token: [REDACTED]" \
+  -H "X-Kirra-Admin-Token: [REDACTED]" \
   --data-binary @backup.json
 ```
 

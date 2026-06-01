@@ -1,12 +1,12 @@
-# Aegis v1.0.0 — Active / PassiveStandby Operations Runbook
+# Kirra v1.0.0 — Active / PassiveStandby Operations Runbook
 
-This document serves as the formal engineering handbook for running, promoting, and maintaining high-availability Aegis verifier node cluster infrastructure under standard and incident-response operational parameters.
+This document serves as the formal engineering handbook for running, promoting, and maintaining high-availability Kirra verifier node cluster infrastructure under standard and incident-response operational parameters.
 
 ---
 
 ## 1. Runtime Modes
 
-The verifier cluster utilizes the configuration environment flag `AEGIS_VERIFIER_MODE` to designate cluster topology and prevent data corruption.
+The verifier cluster utilizes the configuration environment flag `KIRRA_VERIFIER_MODE` to designate cluster topology and prevent data corruption.
 
 ### Capability Behavior Matrix
 
@@ -29,14 +29,14 @@ The verifier cluster utilizes the configuration environment flag `AEGIS_VERIFIER
 To stand up a node as the primary read-write control authority, instantiate the runtime environment as follows:
 
 ```bash
-export AEGIS_VERIFIER_MODE=active
-export AEGIS_ADMIN_TOKEN="your-secure-token-hash"
-cargo run --bin aegis_verifier_service
+export KIRRA_VERIFIER_MODE=active
+export KIRRA_ADMIN_TOKEN="your-secure-token-hash"
+cargo run --bin kirra_verifier_service
 ```
 
 #### Expected Log Signature:
 ```text
-[AEGIS VERIFIER] mode=Active
+[KIRRA VERIFIER] mode=Active
 ```
 
 ### Passive Standby Node Initialization
@@ -44,14 +44,14 @@ cargo run --bin aegis_verifier_service
 To stand up a node as a secure, high-performance read-only mirror capable of taking offloaded analytic queries, instantiate the runtime environment as follows:
 
 ```bash
-export AEGIS_VERIFIER_MODE=passive_standby
-export AEGIS_ADMIN_TOKEN="your-secure-token-hash"
-cargo run --bin aegis_verifier_service
+export KIRRA_VERIFIER_MODE=passive_standby
+export KIRRA_ADMIN_TOKEN="your-secure-token-hash"
+cargo run --bin kirra_verifier_service
 ```
 
 #### Expected Log Signature:
 ```text
-[AEGIS VERIFIER] mode=PassiveStandby
+[KIRRA VERIFIER] mode=PassiveStandby
 ```
 
 ---
@@ -74,7 +74,7 @@ To promote a running PassiveStandby instance into a fully mutable Active primary
 
  1. **Lift the Mutation Shield**: Update the running host process environment configurations to toggle the mode boundary:
     ```bash
-    export AEGIS_VERIFIER_MODE=active
+    export KIRRA_VERIFIER_MODE=active
     ```
  2. **Force Process Re-Initialization**: Restart or signal the service binary to boot under the `Active` context flag.
  3. **Validate Liveness & Connectivity**: Verify the node rehydrated its stored cache and can communicate with its underlying database by dispatching an unauthenticated local check:
@@ -100,7 +100,7 @@ Pipes the extracted JSON backup archive directly into the newly promoted control
 
 ```bash
 curl -i -X POST http://127.0.0.1:8089/system/backup/import \
-  -H "X-Aegis-Admin-Token: [REDACTED]" \
+  -H "X-Kirra-Admin-Token: [REDACTED]" \
   -H "Content-Type: application/json" \
   --data-binary @backup.json
 ```

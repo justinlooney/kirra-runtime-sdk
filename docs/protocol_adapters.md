@@ -1,8 +1,8 @@
-# Aegis Protocol Adapters — Industrial Safety Integration
+# Kirra Protocol Adapters — Industrial Safety Integration
 
 ## Overview
 
-Aegis functions as a universal safety kernel across the industrial automation stack. Protocol adapters translate protocol-specific messages into Aegis `OperationalCommand` types, which are then evaluated against the current fleet posture to determine whether a command is safe to execute.
+Kirra functions as a universal safety kernel across the industrial automation stack. Protocol adapters translate protocol-specific messages into Kirra `OperationalCommand` types, which are then evaluated against the current fleet posture to determine whether a command is safe to execute.
 
 The adapter layer is intentionally thin — no external protocol libraries are required. Each adapter implements the message classification logic directly in pure Rust, keeping the safety-critical path free of third-party dependencies.
 
@@ -56,8 +56,8 @@ Modbus is the oldest and most widely deployed industrial protocol. It uses a sim
 
 ```bash
 curl -X POST http://localhost:8090/industrial/evaluate \
-  -H "Authorization: Bearer $AEGIS_ADMIN_TOKEN" \
-  -H "x-aegis-client-id: modbus-gateway-01" \
+  -H "Authorization: Bearer $KIRRA_ADMIN_TOKEN" \
+  -H "x-kirra-client-id: modbus-gateway-01" \
   -H "Content-Type: application/json" \
   -d '{
     "protocol": "modbus",
@@ -122,8 +122,8 @@ The following CIP classes are flagged as `safety_relevant=true` and receive elev
 **Read a tag (allowed in any posture):**
 ```bash
 curl -X POST http://localhost:8090/industrial/ethernet-ip/evaluate \
-  -H "Authorization: Bearer $AEGIS_ADMIN_TOKEN" \
-  -H "x-aegis-client-id: eip-gateway-01" \
+  -H "Authorization: Bearer $KIRRA_ADMIN_TOKEN" \
+  -H "x-kirra-client-id: eip-gateway-01" \
   -H "Content-Type: application/json" \
   -d '{
     "command_code": 101,
@@ -159,8 +159,8 @@ curl -X POST http://localhost:8090/industrial/ethernet-ip/evaluate \
 **Unified endpoint:**
 ```bash
 curl -X POST http://localhost:8090/industrial/evaluate \
-  -H "Authorization: Bearer $AEGIS_ADMIN_TOKEN" \
-  -H "x-aegis-client-id: eip-gateway-01" \
+  -H "Authorization: Bearer $KIRRA_ADMIN_TOKEN" \
+  -H "x-kirra-client-id: eip-gateway-01" \
   -d '{
     "protocol": "ethernet_ip",
     "message": {
@@ -227,8 +227,8 @@ NMT commands that take a node offline set `triggers_recalculation=true`, signali
 
 ```bash
 curl -X POST http://localhost:8090/industrial/canopen/evaluate \
-  -H "Authorization: Bearer $AEGIS_ADMIN_TOKEN" \
-  -H "x-aegis-client-id: can-gateway-01" \
+  -H "Authorization: Bearer $KIRRA_ADMIN_TOKEN" \
+  -H "x-kirra-client-id: can-gateway-01" \
   -d '{
     "node_id": 5,
     "function_code": 3,
@@ -264,7 +264,7 @@ curl -X POST http://localhost:8090/industrial/canopen/evaluate \
 
 DNP3 (Distributed Network Protocol 3) is the dominant protocol for SCADA systems controlling critical infrastructure. It was designed for high-reliability, low-bandwidth environments with inherent support for data integrity and time synchronization.
 
-**Security Note:** DNP3 was designed before cybersecurity was a concern. Broadcast commands (destination address `0xFFFF`) are a significant attack vector — a single malicious packet can command every device on the network simultaneously. Aegis always creates an audit entry for broadcast commands regardless of posture.
+**Security Note:** DNP3 was designed before cybersecurity was a concern. Broadcast commands (destination address `0xFFFF`) are a significant attack vector — a single malicious packet can command every device on the network simultaneously. Kirra always creates an audit entry for broadcast commands regardless of posture.
 
 ### Function Code Mapping
 
@@ -292,15 +292,15 @@ DNP3 (Distributed Network Protocol 3) is the dominant protocol for SCADA systems
 
 ### Broadcast Detection
 
-Any message with `dest_address == 0xFFFF` is flagged as a broadcast. Aegis always creates an audit chain entry for broadcast commands with event type `DNP3_BROADCAST_COMMAND`, regardless of whether the command is allowed.
+Any message with `dest_address == 0xFFFF` is flagged as a broadcast. Kirra always creates an audit chain entry for broadcast commands with event type `DNP3_BROADCAST_COMMAND`, regardless of whether the command is allowed.
 
 ### Example Requests
 
 **Read (allowed in any posture):**
 ```bash
 curl -X POST http://localhost:8090/industrial/dnp3/evaluate \
-  -H "Authorization: Bearer $AEGIS_ADMIN_TOKEN" \
-  -H "x-aegis-client-id: dnp3-gateway-01" \
+  -H "Authorization: Bearer $KIRRA_ADMIN_TOKEN" \
+  -H "x-kirra-client-id: dnp3-gateway-01" \
   -d '{
     "source_address": 1,
     "dest_address": 10,
@@ -337,8 +337,8 @@ All five protocols can be evaluated through a single endpoint using the `protoco
 
 ```
 POST /industrial/evaluate
-Authorization: Bearer <AEGIS_ADMIN_TOKEN>
-x-aegis-client-id: <client-id>
+Authorization: Bearer <KIRRA_ADMIN_TOKEN>
+x-kirra-client-id: <client-id>
 Content-Type: application/json
 
 {
@@ -366,11 +366,11 @@ The `message` field schema varies by protocol. See the per-protocol sections abo
 
 ## Audit Trail
 
-Every industrial evaluation is subject to the Aegis audit chain:
+Every industrial evaluation is subject to the Kirra audit chain:
 
 - **Denials** always create an `INDUSTRIAL_ACTION_DENIED` entry
 - **DNP3 broadcast commands** always create a `DNP3_BROADCAST_COMMAND` entry
 - **CANOpen NMT node-offline transitions** create a `CANOPEN_NMT_NODE_OFFLINE` entry
 - **EtherNet/IP allowed broadcasts** on safety-relevant classes create an `INDUSTRIAL_ACTION_ALLOWED_BROADCAST` entry
 
-All entries are SHA-256 hash-chained and optionally Ed25519-signed (when `AEGIS_LOG_SIGNING_KEY` is set).
+All entries are SHA-256 hash-chained and optionally Ed25519-signed (when `KIRRA_LOG_SIGNING_KEY` is set).

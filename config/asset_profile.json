@@ -7,7 +7,7 @@
     "max_concurrent_connections": 32
   },
   "telemetry": {
-    "log_directory": "/var/log/aegis"
+    "log_directory": "/var/log/kirra"
   },
   "contract": {
     "asset_register_offset": 10,

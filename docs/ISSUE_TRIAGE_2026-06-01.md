@@ -60,7 +60,7 @@ spot checks vs `git log --oneline main -50`,
 
 | # | Title | Conf | Evidence | Why P0 |
 |---|---|---|---|---|
-| **43** | PARK-031 normalize Kirra naming | HIGH | `scripts/build_release.sh:17-92` + `scripts/setup_ros2_fleet.sh:6-97` pervasively `aegis-*` / `AEGIS_*` | Pilot integrator first-build hits these scripts and gets confusing artifacts. |
+| **43** | PARK-031 normalize Kirra naming | HIGH | `scripts/build_release.sh:17-92` + `scripts/setup_ros2_fleet.sh:6-97` pervasively `kirra-*` / `KIRRA_*` | Pilot integrator first-build hits these scripts and gets confusing artifacts. |
 | **69** | fix(gateway): unknown POST/PUT → WriteState | HIGH | `src/gateway/policy.rs:38-41` falls through to `WriteState` (comment: "All other POST/PUT: treat as WriteState") | SG-006 invariant: Unknown commands must DENY before posture check. This silently widens the WriteState surface. |
 | **73** | fix(verifier): attestation HMAC | HIGH | `src/bin/kirra_verifier_service.rs:299-360` still HMAC(`KIRRA_ADMIN_TOKEN`, nonce); `ak_public_pem` + PCR16 unread | Documented impersonation gap. |
 | **89** | [Occy 0.A] Scaffold kirra-planner crate | HIGH | no `kirra-planner` workspace member in `/Cargo.toml` or `parko/Cargo.toml`; `crates/` has only `kirra-ros2-adapter` | Blocks all Occy Phase 1 work (#90–#93). |
@@ -135,7 +135,7 @@ No issue was bucketed `NEEDS-TRIAGE` — all 77 had enough evidence to place. **
 
 **P0 (pilot-blocking) — 4**:
 1. **#89** Scaffold `kirra-planner` crate — blocks Occy Phase 1 entirely.
-2. **#43** Normalize aegis-* → kirra-* across `scripts/` + Docker — blocks integrator first-build.
+2. **#43** Normalize kirra-* → kirra-* across `scripts/` + Docker — blocks integrator first-build.
 3. **#69** Gateway POST/PUT classification — SG-006 invariant gap (unknown commands silently classified as WriteState).
 4. **#73** Per-node attestation key (not shared HMAC) — documented impersonation gap.
 

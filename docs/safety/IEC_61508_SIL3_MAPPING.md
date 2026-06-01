@@ -27,7 +27,7 @@ a notified body has not yet been performed.
 Relationship to the existing preliminary mapping in
 `docs/safety/IEC_61508_MAPPING.md` (AEGIS-61508-001 v1.0.0): that
 earlier document established the initial claim shape under the prior
-Aegis branding; this document (KIRRA-SIL3-001) is the up-to-date
+Kirra branding; this document (KIRRA-SIL3-001) is the up-to-date
 working mapping aligned with the current Kirra architecture and the
 CERT-track artifacts. The earlier document remains in the safety
 case index for historical traceability.

@@ -169,7 +169,7 @@ Apply exactly one type label + one or more domain labels + one status label.
 **Type:** `feat` `fix` `test` `docs` `chore` `safety`
 
 **Domain:** `control-loop` `backend-qnn` `backend-tidl` `backend-openvino`
-`backend-rocm` `behavioral-safety` `aegis-integration` `posture-engine`
+`backend-rocm` `behavioral-safety` `kirra-integration` `posture-engine`
 `packaging` `simulation` `certification`
 
 **Status:** `backlog` → `ready` → `in-progress` → `done`

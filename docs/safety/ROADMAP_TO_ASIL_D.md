@@ -1,4 +1,4 @@
-# Aegis Safety Kernel — ASIL-D Certification Roadmap
+# Kirra Safety Kernel — ASIL-D Certification Roadmap
 
 Document ID: AEGIS-ROAD-001
 Version: 1.0.0
@@ -10,10 +10,10 @@ Date: 2026-05-23
 
 ## 1. Overview
 
-This document defines the roadmap for achieving ISO 26262 ASIL-D certification for the Aegis Runtime Safety Kernel (`aegis-runtime-sdk` v1.5.0 and subsequent versions). The roadmap is organized into five phases, each with defined entry criteria, deliverables, exit criteria, and estimated duration.
+This document defines the roadmap for achieving ISO 26262 ASIL-D certification for the Kirra Runtime Safety Kernel (`kirra-runtime-sdk` v1.5.0 and subsequent versions). The roadmap is organized into five phases, each with defined entry criteria, deliverables, exit criteria, and estimated duration.
 
 The target certification scope is:
-- Item: Aegis Runtime Safety Kernel (software element)
+- Item: Kirra Runtime Safety Kernel (software element)
 - ASIL: ASIL D (highest integrity level, per AEGIS-HARA-001)
 - Standard: ISO 26262:2018 (second edition), Parts 1-9
 - Supplementary: IEC 62443 (industrial cybersecurity), ROS 2 Safety WG recommendations
@@ -181,7 +181,7 @@ Address open issues from AEGIS-SC-000 Section 4:
 
 ### 5.1 Objectives
 
-Qualify the target execution platform to a level commensurate with ASIL D requirements for the Aegis safety kernel deployment. The primary target platform is QNX Neutrino RTOS for automotive-grade deployments.
+Qualify the target execution platform to a level commensurate with ASIL D requirements for the Kirra safety kernel deployment. The primary target platform is QNX Neutrino RTOS for automotive-grade deployments.
 
 ### 5.2 Background
 
@@ -189,7 +189,7 @@ ISO 26262-6:2018 §5.4.3 requires that the operating environment (OS, RTOS, hard
 - Qualified as a Safety Element out of Context (SEooC) to the required ASIL, or
 - Assessed as a pre-existing element with sufficient evidence of fitness for purpose
 
-QNX Neutrino RTOS 7.1 is commercially available with TUV Rheinland ASIL D certification under ISO 26262. Aegis deployed on QNX can reference this existing certification.
+QNX Neutrino RTOS 7.1 is commercially available with TUV Rheinland ASIL D certification under ISO 26262. Kirra deployed on QNX can reference this existing certification.
 
 Linux-based deployments require a separate assessment. A Linux real-time kernel with PREEMPT_RT patch and appropriate hardening may achieve ASIL B; ASIL D on Linux requires additional mitigations (partitioning, hypervisor).
 
@@ -197,14 +197,14 @@ Linux-based deployments require a separate assessment. A Linux real-time kernel 
 
 | Deliverable | Description | Target |
 |-------------|-------------|--------|
-| Platform Assessment Report | Assessment of QNX 7.1 for Aegis deployment | Q3 2026 |
+| Platform Assessment Report | Assessment of QNX 7.1 for Kirra deployment | Q3 2026 |
 | Hardware Qualification Plan | Assessment of target ECU hardware | Q3 2026 |
 | Timing Analysis | WCET analysis for enforce path on target hardware | Q4 2026 |
 | Memory Footprint Analysis | Stack and heap usage for safety-critical tasks | Q4 2026 |
 
 ### 5.4 QNX-Specific Integration Requirements
 
-- Aegis posture engine worker shall be a dedicated QNX pulse-based thread at a fixed RT priority above the command handler threads
+- Kirra posture engine worker shall be a dedicated QNX pulse-based thread at a fixed RT priority above the command handler threads
 - The telemetry watchdog shall use QNX timer_create with CLOCK_MONOTONIC to guarantee sweep interval accuracy
 - Stack allocation for safety-critical threads shall be pre-allocated and guarded with stack canaries
 - The DDS bridge shall use the QNX DDS (OMG DDS for Embedded, or a QNX-certified DDS implementation)
@@ -225,7 +225,7 @@ Linux-based deployments require a separate assessment. A Linux real-time kernel 
 |-----------|-------------|
 | Target hardware selected | 2026-07-01 |
 | QNX platform assessment initiated | 2026-07-15 |
-| Aegis ported to QNX and building cleanly | 2026-08-15 |
+| Kirra ported to QNX and building cleanly | 2026-08-15 |
 | WCET measurement infrastructure deployed | 2026-09-01 |
 | WCET measurements complete and within bounds | 2026-10-15 |
 | Platform Assessment Report issued | 2026-11-01 |
@@ -314,7 +314,7 @@ The pre-assessment shall cover:
 
 ### 7.1 Objectives
 
-Achieve ISO 26262 ASIL D certification for the Aegis Runtime Safety Kernel from a recognized accreditation body. The certification covers the software item as defined in AEGIS-HARA-001 deployed on the qualified QNX platform.
+Achieve ISO 26262 ASIL D certification for the Kirra Runtime Safety Kernel from a recognized accreditation body. The certification covers the software item as defined in AEGIS-HARA-001 deployed on the qualified QNX platform.
 
 ### 7.2 Certification Process
 
@@ -324,7 +324,7 @@ Achieve ISO 26262 ASIL D certification for the Aegis Runtime Safety Kernel from 
 4. **Test Witness:** Assessor witnesses execution of the complete test suite (306+ tests) on target hardware; reviews MC/DC coverage reports.
 5. **Process Audit:** Assessor audits software development process artifacts: configuration management records, change requests, review records, defect tracking.
 6. **Assessment Report:** Assessor issues assessment report with findings.
-7. **Certificate Issuance:** Following resolution of assessment findings, certificate of conformance to ISO 26262 ASIL D is issued for aegis-runtime-sdk.
+7. **Certificate Issuance:** Following resolution of assessment findings, certificate of conformance to ISO 26262 ASIL D is issued for kirra-runtime-sdk.
 
 ### 7.3 Certification Maintenance
 
@@ -349,7 +349,7 @@ After initial certification, the following activities maintain certification val
 
 ### 7.5 Exit Criteria
 
-- Certificate of conformance to ISO 26262 ASIL D issued by accredited body for `aegis-runtime-sdk` as deployed on qualified QNX platform
+- Certificate of conformance to ISO 26262 ASIL D issued by accredited body for `kirra-runtime-sdk` as deployed on qualified QNX platform
 - No open blocking or major findings from assessment
 - Certification maintenance plan established and approved
 
@@ -404,7 +404,7 @@ Phase 1 (Foundation)
 
 | Field | Value |
 |-------|-------|
-| Prepared by | Aegis Engineering |
+| Prepared by | Kirra Engineering |
 | Review status | Pending TUV pre-assessment |
 | Next review | 2026-11-23 |
 | Supersedes | None |

@@ -1,4 +1,4 @@
-# Aegis Safety Kernel — Rust Safety Coding Guidelines
+# Kirra Safety Kernel — Rust Safety Coding Guidelines
 
 Document ID: AEGIS-CG-001
 Version: 1.0.0
@@ -12,9 +12,9 @@ Date: 2026-05-23
 
 ### 1.1 Purpose
 
-These guidelines define the Rust coding standard for safety-critical code paths in the `aegis-runtime-sdk` crate. They are derived from MISRA C:2012 principles adapted for the Rust programming language and aligned with the Ferrocene Language Specification (FLS), which defines the safe subset of Rust suitable for use in safety-critical systems under IEC 61508 and ISO 26262.
+These guidelines define the Rust coding standard for safety-critical code paths in the `kirra-runtime-sdk` crate. They are derived from MISRA C:2012 principles adapted for the Rust programming language and aligned with the Ferrocene Language Specification (FLS), which defines the safe subset of Rust suitable for use in safety-critical systems under IEC 61508 and ISO 26262.
 
-The guidelines are binding for all code in the `aegis-runtime-sdk` crate that implements or supports a safety goal in AEGIS-SG-001. They are advisory for non-safety-critical code (e.g., CARLA integration, dashboard tooling).
+The guidelines are binding for all code in the `kirra-runtime-sdk` crate that implements or supports a safety goal in AEGIS-SG-001. They are advisory for non-safety-critical code (e.g., CARLA integration, dashboard tooling).
 
 ### 1.2 Safety-Critical Paths
 
@@ -40,7 +40,7 @@ The following modules and files are classified as safety-critical and are subjec
 | `src/adapters/dnp3.rs` | SG-012 | ASIL B |
 | `src/federation_reconciliation.rs` | SG-014 | ASIL B |
 
-Non-safety-critical files (e.g., `src/bin/aegis_carla_client.rs`, `src/metrics.rs`, `examples/`) are subject to guidelines at the discretion of the code reviewer and are not held to ASIL compliance.
+Non-safety-critical files (e.g., `src/bin/kirra_carla_client.rs`, `src/metrics.rs`, `examples/`) are subject to guidelines at the discretion of the code reviewer and are not held to ASIL compliance.
 
 ### 1.3 Relationship to Standards
 
@@ -143,7 +143,7 @@ Casts that may silently truncate or lose precision (e.g., `f64 as f32`, `u64 as 
 
 ### Rule CONC-001: Lock Ordering Must Be Documented and Enforced (Mandatory)
 
-Any code that acquires multiple locks simultaneously shall document the lock acquisition order and shall always acquire locks in the documented order to prevent deadlock. In the Aegis codebase, the established lock ordering is:
+Any code that acquires multiple locks simultaneously shall document the lock acquisition order and shall always acquire locks in the documented order to prevent deadlock. In the Kirra codebase, the established lock ordering is:
 
 1. `AppState.store` (`Arc<Mutex<VerifierStore>>`) — innermost
 2. `SharedPostureCache` (`Arc<RwLock<...>>`) — outer
@@ -269,11 +269,11 @@ Even in these permitted uses, the RNG shall be seeded from `OsRng` and shall not
 
 ## 7. Security Invariants
 
-The following 13 security invariants, as defined in `CLAUDE.md`, are binding for all code in the `aegis-runtime-sdk` crate. Any pull request that violates these invariants shall be rejected without exception, regardless of other justifications.
+The following 13 security invariants, as defined in `CLAUDE.md`, are binding for all code in the `kirra-runtime-sdk` crate. Any pull request that violates these invariants shall be rejected without exception, regardless of other justifications.
 
 ### INV-01: require_admin_token Must Never Be Bypassed (Mandatory, ASIL B)
 
-`require_admin_token` must never be commented out, bypassed, or removed from any mutation route. It reads `AEGIS_ADMIN_TOKEN` from the environment; if absent or empty, it returns HTTP 503 (fail-closed), never fail-open. This implements SG-015 (TR-015, TR-015a).
+`require_admin_token` must never be commented out, bypassed, or removed from any mutation route. It reads `KIRRA_ADMIN_TOKEN` from the environment; if absent or empty, it returns HTTP 503 (fail-closed), never fail-open. This implements SG-015 (TR-015, TR-015a).
 
 ### INV-02: constant_time_compare for All Token Comparisons (Mandatory, ASIL B)
 
@@ -291,17 +291,17 @@ The following 13 security invariants, as defined in `CLAUDE.md`, are binding for
 
 `pending_challenges: DashMap<String, ChallengeEntry>` must never be removed. Nonces are volatile, in-memory only, and expire after `CHALLENGE_TTL_MS = 30000` ms. Persisting nonces to SQLite would allow replay attacks after process restart.
 
-### INV-06: AEGIS_ADMIN_TOKEN From Environment Only (Mandatory, ASIL B)
+### INV-06: KIRRA_ADMIN_TOKEN From Environment Only (Mandatory, ASIL B)
 
-`AEGIS_ADMIN_TOKEN` must come from `std::env::var("AEGIS_ADMIN_TOKEN")` only. No hardcoded fallback values, default strings, or configuration-file overrides for this variable are permitted. Absent or empty resolves to HTTP 503.
+`KIRRA_ADMIN_TOKEN` must come from `std::env::var("KIRRA_ADMIN_TOKEN")` only. No hardcoded fallback values, default strings, or configuration-file overrides for this variable are permitted. Absent or empty resolves to HTTP 503.
 
-### INV-07: AEGIS_SUPERVISOR_RESET_KEY From Environment Only (Mandatory, ASIL B)
+### INV-07: KIRRA_SUPERVISOR_RESET_KEY From Environment Only (Mandatory, ASIL B)
 
-`AEGIS_SUPERVISOR_RESET_KEY` must come from the environment variable only, with no hardcoded fallbacks. The value must be present, non-empty, and at most 64 bytes. Any value failing these constraints results in startup abort via `startup_sentinel`.
+`KIRRA_SUPERVISOR_RESET_KEY` must come from the environment variable only, with no hardcoded fallbacks. The value must be present, non-empty, and at most 64 bytes. Any value failing these constraints results in startup abort via `startup_sentinel`.
 
 ### INV-08: Hard Boundary Clamp Before Rate-of-Change Limiter (Mandatory, ASIL D)
 
-The velocity envelope cap (Priority 2 in `validate_vehicle_command`) must always be applied before the rate-of-change limiter in `AegisKernelGovernor`. The hard clamp to `max_speed_mps` takes absolute priority. No ordering inversion is permitted. This implements SG-001 and addresses H-015.
+The velocity envelope cap (Priority 2 in `validate_vehicle_command`) must always be applied before the rate-of-change limiter in `KirraKernelGovernor`. The hard clamp to `max_speed_mps` takes absolute priority. No ordering inversion is permitted. This implements SG-001 and addresses H-015.
 
 ### INV-09: OperationalCommand::Unknown Denied Before Posture Check (Mandatory, ASIL D)
 
@@ -355,7 +355,7 @@ The following function bodies are Protected Code Regions. Any modification requi
 | `src/posture_cache.rs:should_route_command` | SG-005, SG-006 | INV-09 |
 | `src/gateway/kinematics_contract.rs:validate_vehicle_command` | SG-001, SG-002, SG-004 | INV-08 |
 | `src/verifier.rs:AppState::recursive_calculate` | SG-003, SG-007 | INV-04 |
-| `src/bin/aegis_verifier_service.rs:require_admin_token` | SG-015 | INV-01, INV-02, INV-06 |
+| `src/bin/kirra_verifier_service.rs:require_admin_token` | SG-015 | INV-01, INV-02, INV-06 |
 | `src/recovery_hysteresis.rs:evaluate_recovery_report` | SG-013 | — |
 | `src/posture_engine_v2.rs:resolve_posture_with_reason` | SG-005 | — |
 | `src/standby_monitor.rs:spawn_promotion_monitor` | SG-009 | — |
@@ -413,7 +413,7 @@ The following static analysis tools shall be run as part of the CI pipeline for 
 
 | Field | Value |
 |-------|-------|
-| Prepared by | Aegis Engineering |
+| Prepared by | Kirra Engineering |
 | Review status | Pending TUV pre-assessment |
 | Next review | 2026-11-23 |
 | Supersedes | None |

@@ -1,6 +1,6 @@
-# Aegis v1.0.0 — Route Authorization Matrix
+# Kirra v1.0.0 — Route Authorization Matrix
 
-This document defines the authoritative access control matrix and operational boundary mappings for the Aegis v1.0.0 Stable Control Plane interface surface.
+This document defines the authoritative access control matrix and operational boundary mappings for the Kirra v1.0.0 Stable Control Plane interface surface.
 
 | Route | Method | Handler | Auth | Mode | Mutation? | Security Notes |
 |---|---|---|---|---|---|---|

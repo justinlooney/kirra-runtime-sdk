@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/build_release.sh
 #
-# Builds Aegis release binaries for all supported targets.
+# Builds Kirra release binaries for all supported targets.
 # Run this on your development machine before a GitHub release.
 #
 # Prerequisites (install once):
@@ -14,17 +14,17 @@
 #
 # Output:
 #   dist/
-#     aegis-v1.0.0-x86_64-linux.tar.gz
-#     aegis-v1.0.0-aarch64-linux.tar.gz
-#     aegis-v1.0.0-armv7-linux.tar.gz
+#     kirra-v1.0.0-x86_64-linux.tar.gz
+#     kirra-v1.0.0-aarch64-linux.tar.gz
+#     kirra-v1.0.0-armv7-linux.tar.gz
 #     SHA256SUMS
 
 set -euo pipefail
 
 VERSION="${1:-$(git describe --tags --exact-match 2>/dev/null || echo "dev")}"
 DIST_DIR="dist"
-BINARY="aegis_verifier_service"
-CARLA_BINARY="aegis_carla_client"
+BINARY="kirra_verifier_service"
+CARLA_BINARY="kirra_carla_client"
 
 TARGETS=(
     "x86_64-unknown-linux-musl"
@@ -38,7 +38,7 @@ TARGET_NAMES=(
     "armv7-linux"
 )
 
-echo "Building Aegis ${VERSION}"
+echo "Building Kirra ${VERSION}"
 echo "Targets: ${TARGETS[*]}"
 echo ""
 
@@ -56,7 +56,7 @@ fi
 for i in "${!TARGETS[@]}"; do
     TARGET="${TARGETS[$i]}"
     TARGET_NAME="${TARGET_NAMES[$i]}"
-    ARCHIVE_NAME="aegis-${VERSION}-${TARGET_NAME}.tar.gz"
+    ARCHIVE_NAME="kirra-${VERSION}-${TARGET_NAME}.tar.gz"
 
     echo "Building ${TARGET_NAME}..."
 
@@ -74,7 +74,7 @@ for i in "${!TARGETS[@]}"; do
 
     # Create staging directory
     STAGING="$(mktemp -d)"
-    STAGING_BIN="${STAGING}/aegis"
+    STAGING_BIN="${STAGING}/kirra"
     mkdir -p "${STAGING_BIN}"
 
     # Copy binaries
@@ -89,7 +89,7 @@ for i in "${!TARGETS[@]}"; do
 
     # Copy systemd unit template
     mkdir -p "${STAGING}/systemd"
-    cp scripts/aegis-verifier.service "${STAGING}/systemd/"
+    cp scripts/kirra-verifier.service "${STAGING}/systemd/"
 
     # Write version file
     echo "${VERSION}" > "${STAGING}/VERSION"
@@ -113,6 +113,6 @@ echo "Files in ${DIST_DIR}/:"
 ls -lh "${DIST_DIR}/"
 echo ""
 echo "Next steps:"
-echo "  1. Test an archive: tar -xzf ${DIST_DIR}/aegis-${VERSION}-x86_64-linux.tar.gz"
+echo "  1. Test an archive: tar -xzf ${DIST_DIR}/kirra-${VERSION}-x86_64-linux.tar.gz"
 echo "  2. Create GitHub release and upload contents of ${DIST_DIR}/"
 echo "  3. Or push a git tag to trigger automated release via GitHub Actions"

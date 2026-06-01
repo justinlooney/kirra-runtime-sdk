@@ -1,4 +1,4 @@
-# Aegis Safety Kernel — Safety Case Index
+# Kirra Safety Kernel — Safety Case Index
 
 Document ID: AEGIS-SC-000
 Version: 1.0.0
@@ -53,15 +53,15 @@ Date: 2026-05-23
 
 ## 2. Safety Case Argument Structure
 
-The Aegis safety case is structured using the Goal Structuring Notation (GSN) as defined in GSN Community Standard v3 and as recommended by ISO 26262-2:2018 Annex B. The top-level safety claim and supporting argument are described below.
+The Kirra safety case is structured using the Goal Structuring Notation (GSN) as defined in GSN Community Standard v3 and as recommended by ISO 26262-2:2018 Annex B. The top-level safety claim and supporting argument are described below.
 
 ### 2.1 Top-Level Safety Claim
 
-**G-TOP:** The Aegis Runtime Safety Kernel (aegis-runtime-sdk v1.5.0) is sufficiently safe for use as a real-time command enforcement layer in autonomous vehicle, robot, drone, and industrial control deployments operating under ISO 26262 Part 3 item definition AEGIS-HARA-001.
+**G-TOP:** The Kirra Runtime Safety Kernel (kirra-runtime-sdk v1.5.0) is sufficiently safe for use as a real-time command enforcement layer in autonomous vehicle, robot, drone, and industrial control deployments operating under ISO 26262 Part 3 item definition AEGIS-HARA-001.
 
 ### 2.2 Context
 
-**C-01:** The Aegis item is as defined in AEGIS-HARA-001 Section 1 (Item Definition): the `aegis-runtime-sdk` crate, the `aegis_verifier_service` binary, the ROS2 safety interlock nodes, the industrial protocol adapters, and the multi-asset safety fabric.
+**C-01:** The Kirra item is as defined in AEGIS-HARA-001 Section 1 (Item Definition): the `kirra-runtime-sdk` crate, the `kirra_verifier_service` binary, the ROS2 safety interlock nodes, the industrial protocol adapters, and the multi-asset safety fabric.
 
 **C-02:** "Sufficiently safe" means that all 17 hazards identified in AEGIS-HARA-001 Section 3 are mitigated to their required ASIL level through the implementation of safety goals SG-001 through SG-016 in AEGIS-SG-001.
 
@@ -118,11 +118,11 @@ Supporting evidence:
 
 The following claims are identified but not yet fully supported by evidence. They represent gaps to be addressed in the certification roadmap (AEGIS-ROAD-001):
 
-**G-PROCESS:** The Aegis software was developed in accordance with a qualified ISO 26262-compliant process, including: qualified tools, configuration management, change management, and systematic verification.
+**G-PROCESS:** The Kirra software was developed in accordance with a qualified ISO 26262-compliant process, including: qualified tools, configuration management, change management, and systematic verification.
 
 Status: Process documentation in progress. See AEGIS-ROAD-001 Phase 2.
 
-**G-PLATFORM:** The platform on which Aegis executes (OS, hardware, compiler) is qualified to a level commensurate with ASIL D.
+**G-PLATFORM:** The platform on which Kirra executes (OS, hardware, compiler) is qualified to a level commensurate with ASIL D.
 
 Status: Ferrocene compiler qualification in progress. QNX platform assessment pending. See AEGIS-ROAD-001 Phase 3.
 
@@ -172,7 +172,7 @@ AEGIS-SG-001 (Safety Goals)
 
 | Field | Value |
 |-------|-------|
-| Prepared by | Aegis Engineering |
+| Prepared by | Kirra Engineering |
 | Review status | Pending TUV pre-assessment |
 | Next review | 2026-11-23 |
 | Supersedes | None |

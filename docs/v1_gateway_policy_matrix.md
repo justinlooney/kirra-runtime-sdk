@@ -1,6 +1,6 @@
-# Aegis v1.0.0 — Gateway Policy Matrix
+# Kirra v1.0.0 — Gateway Policy Matrix
 
-This document defines the formal behavioral specifications and security invariants for the Aegis v1.0.0 edge gateway proxy interceptor. It serves as the definitive reference for proving how and why network payloads are validated, classified, and either routed or dropped at the cluster boundary.
+This document defines the formal behavioral specifications and security invariants for the Kirra v1.0.0 edge gateway proxy interceptor. It serves as the definitive reference for proving how and why network payloads are validated, classified, and either routed or dropped at the cluster boundary.
 
 ---
 
@@ -61,7 +61,7 @@ now_ms() - updated_at_epoch_ms > ttl_ms
   ```text
   HTTP/1.1 403 Forbidden
   Content-Type: text/plain
-  Body: AEGIS_POLICY_DENY
+  Body: KIRRA_POLICY_DENY
   ```
 
 ---

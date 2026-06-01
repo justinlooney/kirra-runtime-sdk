@@ -1,10 +1,10 @@
-# Aegis Action Filter — LLM to Actuator Safety Enforcement
+# Kirra Action Filter — LLM to Actuator Safety Enforcement
 
 ## What It Is
 
-The Aegis Action Filter is the enforcement layer between AI model output and physical actuators. When a large language model generates a command — whether via OpenAI function calling, a LangChain tool invocation, or raw JSON output from a custom agent — the Action Filter intercepts that command before it reaches any hardware and evaluates it against the live fleet posture.
+The Kirra Action Filter is the enforcement layer between AI model output and physical actuators. When a large language model generates a command — whether via OpenAI function calling, a LangChain tool invocation, or raw JSON output from a custom agent — the Action Filter intercepts that command before it reaches any hardware and evaluates it against the live fleet posture.
 
-The filter operates on the principle that AI models are not trusted to make physical safety decisions. They can reason about goals, choose strategies, and select appropriate actions — but the final determination of whether an action is physically safe to execute at this exact moment, given the current state of the fleet, belongs to Aegis. This separation of concerns is not optional. A model that hallucinates a velocity of 999 m/s must be stopped at the software layer with the same certainty that a hardware interlock would stop it.
+The filter operates on the principle that AI models are not trusted to make physical safety decisions. They can reason about goals, choose strategies, and select appropriate actions — but the final determination of whether an action is physically safe to execute at this exact moment, given the current state of the fleet, belongs to Kirra. This separation of concerns is not optional. A model that hallucinates a velocity of 999 m/s must be stopped at the software layer with the same certainty that a hardware interlock would stop it.
 
 The Action Filter combines three independent enforcement mechanisms: posture-aware policy (what is permitted in the current system state), kinematic contract validation (are the physical parameters within the safe operating envelope), and action-type whitelisting (is this a recognized, permitted action at all). All three must pass for a command to be allowed. Any single failure results in an unambiguous denial with a structured reason code that is logged to the SHA-256 hash-chained audit ledger.
 
@@ -21,7 +21,7 @@ The Action Filter combines three independent enforcement mechanisms: posture-awa
                           ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │              POST /action_filter/evaluate                           │
-│         (Bearer token + x-aegis-client-id required)                │
+│         (Bearer token + x-kirra-client-id required)                │
 │                                                                     │
 │  Stage 1: JSON Schema Validation                                    │
 │    Malformed JSON → 400 BAD_REQUEST (logged, never 422 or 500)      │
@@ -68,9 +68,9 @@ Each stage is independent and runs in sequence. A failure at any stage short-cir
 
 **The Hallucination Problem.** Language models generate text that is statistically plausible, not physically safe. A model instructed to "move the robot forward as fast as possible" may output a velocity command that exceeds the physical design limits of the platform. A model that has seen robotics tutorials in its training data may confidently emit a `deploy_payload_at_max_velocity` command that does not correspond to any registered action type on the actual fleet. Without a hard enforcement layer, these hallucinations become actuator commands.
 
-Aegis eliminates this failure mode at the transport layer. The model's output is treated as an *intent claim* — a request to perform an action — rather than an authorized instruction. The claim is evaluated against ground truth (live fleet posture, kinematic contracts, registered action whitelist) and either approved or denied. The model never touches hardware directly.
+Kirra eliminates this failure mode at the transport layer. The model's output is treated as an *intent claim* — a request to perform an action — rather than an authorized instruction. The claim is evaluated against ground truth (live fleet posture, kinematic contracts, registered action whitelist) and either approved or denied. The model never touches hardware directly.
 
-**Posture-Aware Restriction.** An action that would be safe under nominal conditions may be catastrophic when the fleet is in a degraded state. If a sensor fusion node has reported a hardware fault, the fleet posture transitions to `Degraded`. In Degraded posture, all kinetic writes are denied regardless of the model's confidence in its command. The model does not know — and cannot be expected to know — the real-time health state of every fleet component. Aegis enforces posture-appropriate restrictions automatically and transparently.
+**Posture-Aware Restriction.** An action that would be safe under nominal conditions may be catastrophic when the fleet is in a degraded state. If a sensor fusion node has reported a hardware fault, the fleet posture transitions to `Degraded`. In Degraded posture, all kinetic writes are denied regardless of the model's confidence in its command. The model does not know — and cannot be expected to know — the real-time health state of every fleet component. Kirra enforces posture-appropriate restrictions automatically and transparently.
 
 **The Audit Trail.** Every action evaluated by the filter is logged to a SHA-256 hash-chained audit ledger. The chain links each record to its predecessor via a cryptographic hash, making retroactive modification detectable. This means that every command an AI model attempted — whether allowed or denied — is permanently recorded with the fleet posture at evaluation time, the request identifier, and the reason for the decision. For regulated deployments (aerospace, medical robotics, autonomous vehicles), this ledger provides the evidence trail required for incident investigation and certification.
 
@@ -97,7 +97,7 @@ The design principle is explicit: anything not on the whitelist is denied. There
 
 ### POST /action_filter/evaluate
 
-**Authentication:** `Authorization: Bearer <AEGIS_ADMIN_TOKEN>` and `x-aegis-client-id: <client-id>` headers required.
+**Authentication:** `Authorization: Bearer <KIRRA_ADMIN_TOKEN>` and `x-kirra-client-id: <client-id>` headers required.
 
 **Request Schema:**
 
@@ -154,7 +154,7 @@ Allow (nominal, valid kinematics):
 ```bash
 curl -s -X POST http://localhost:8090/action_filter/evaluate \
   -H "Authorization: Bearer your-admin-token" \
-  -H "x-aegis-client-id: my-agent" \
+  -H "x-kirra-client-id: my-agent" \
   -H "Content-Type: application/json" \
   -d '{
     "action_type": "cmd_vel",
@@ -170,7 +170,7 @@ Deny (hallucinated velocity):
 ```bash
 curl -s -X POST http://localhost:8090/action_filter/evaluate \
   -H "Authorization: Bearer your-admin-token" \
-  -H "x-aegis-client-id: my-agent" \
+  -H "x-kirra-client-id: my-agent" \
   -H "Content-Type: application/json" \
   -d '{
     "action_type": "cmd_vel",
@@ -186,7 +186,7 @@ Deny (degraded posture):
 ```bash
 curl -s -X POST http://localhost:8090/action_filter/evaluate \
   -H "Authorization: Bearer your-admin-token" \
-  -H "x-aegis-client-id: my-agent" \
+  -H "x-kirra-client-id: my-agent" \
   -H "Content-Type: application/json" \
   -d '{
     "action_type": "cmd_vel",
@@ -202,7 +202,7 @@ Deny (malformed JSON):
 ```bash
 curl -s -X POST http://localhost:8090/action_filter/evaluate \
   -H "Authorization: Bearer your-admin-token" \
-  -H "x-aegis-client-id: my-agent" \
+  -H "x-kirra-client-id: my-agent" \
   -H "Content-Type: application/json" \
   -d 'not valid json'
 # Response: {"error":"MALFORMED_REQUEST","detail":"...","allowed":false}  HTTP 400
@@ -229,8 +229,8 @@ The Action Filter is specifically designed to contain three categories of AI mod
 ```python
 # Define the action as an OpenAI function
 check_action = {
-    "name": "check_action_with_aegis",
-    "description": "Validate a robot action through Aegis safety filter before execution",
+    "name": "check_action_with_kirra",
+    "description": "Validate a robot action through Kirra safety filter before execution",
     "parameters": {
         "type": "object",
         "properties": {
@@ -246,8 +246,8 @@ check_action = {
 # In the agent loop: always check before executing
 def execute_if_safe(action_type, target_node, risk_class, payload):
     result = requests.post(
-        "http://aegis:8090/action_filter/evaluate",
-        headers={"Authorization": "Bearer $TOKEN", "x-aegis-client-id": "gpt-agent"},
+        "http://kirra:8090/action_filter/evaluate",
+        headers={"Authorization": "Bearer $TOKEN", "x-kirra-client-id": "gpt-agent"},
         json={"action_type": action_type, "target_node": target_node,
               "risk_class": risk_class, "payload": payload}
     ).json()
@@ -267,8 +267,8 @@ from langchain.tools import tool
 
 @tool
 def move_robot(target_node: str, linear_x: float, angular_z: float) -> str:
-    """Move a robot at the specified velocity. Always filtered by Aegis."""
-    result = aegis_check("cmd_vel", target_node, "kinetic_write",
+    """Move a robot at the specified velocity. Always filtered by Kirra."""
+    result = kirra_check("cmd_vel", target_node, "kinetic_write",
                          {"linear_x": linear_x, "linear_y": 0.0, "linear_z": 0.0,
                           "angular_x": 0.0, "angular_y": 0.0, "angular_z": angular_z})
     if result["allowed"]:
@@ -281,16 +281,16 @@ def move_robot(target_node: str, linear_x: float, angular_z: float) -> str:
 **Direct JSON (any agent framework):**
 
 ```python
-# Universal pattern: every AI-generated action becomes an HTTP call to Aegis
+# Universal pattern: every AI-generated action becomes an HTTP call to Kirra
 # before touching any hardware interface.
 action = ai_model.generate_action(current_state)  # returns dict
-aegis_result = requests.post("http://aegis:8090/action_filter/evaluate",
+kirra_result = requests.post("http://kirra:8090/action_filter/evaluate",
                              headers=auth_headers, json=action).json()
-if aegis_result["allowed"]:
+if kirra_result["allowed"]:
     robot_interface.execute(action)
 ```
 
-The integration pattern is identical across frameworks: the AI model decides *what* to do; Aegis decides *whether* it is safe to do it right now.
+The integration pattern is identical across frameworks: the AI model decides *what* to do; Kirra decides *whether* it is safe to do it right now.
 
 ---
 

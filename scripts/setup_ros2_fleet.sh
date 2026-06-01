@@ -1,32 +1,32 @@
 #!/bin/bash
-# Register the Hiwonder ROSOrin fleet node graph in Aegis.
+# Register the Hiwonder ROSOrin fleet node graph in Kirra.
 # Run once before starting the robot.
 #
 # Usage:
-#   AEGIS_ADMIN_TOKEN=your-token bash scripts/setup_ros2_fleet.sh
+#   KIRRA_ADMIN_TOKEN=your-token bash scripts/setup_ros2_fleet.sh
 #   or:
-#   AEGIS_URL=http://192.168.1.100:8090 AEGIS_ADMIN_TOKEN=your-token bash scripts/setup_ros2_fleet.sh
+#   KIRRA_URL=http://192.168.1.100:8090 KIRRA_ADMIN_TOKEN=your-token bash scripts/setup_ros2_fleet.sh
 
 set -e
 
-AEGIS_URL="${AEGIS_URL:-http://localhost:8090}"
-AEGIS_TOKEN="${AEGIS_ADMIN_TOKEN}"
+KIRRA_URL="${KIRRA_URL:-http://localhost:8090}"
+KIRRA_TOKEN="${KIRRA_ADMIN_TOKEN}"
 
-if [ -z "$AEGIS_TOKEN" ]; then
-    echo "ERROR: AEGIS_ADMIN_TOKEN environment variable is not set." >&2
+if [ -z "$KIRRA_TOKEN" ]; then
+    echo "ERROR: KIRRA_ADMIN_TOKEN environment variable is not set." >&2
     exit 1
 fi
 
-AUTH_HEADER="Authorization: Bearer $AEGIS_TOKEN"
+AUTH_HEADER="Authorization: Bearer $KIRRA_TOKEN"
 CONTENT_TYPE="Content-Type: application/json"
 
-echo "Registering Hiwonder ROSOrin fleet nodes in Aegis at $AEGIS_URL"
+echo "Registering Hiwonder ROSOrin fleet nodes in Kirra at $KIRRA_URL"
 
 register_node() {
     local node_id="$1"
     local description="$2"
     echo "  Registering node: $node_id"
-    curl -sf -X POST "$AEGIS_URL/attestation/register" \
+    curl -sf -X POST "$KIRRA_URL/attestation/register" \
         -H "$AUTH_HEADER" \
         -H "$CONTENT_TYPE" \
         -d "{
@@ -41,7 +41,7 @@ register_dependency() {
     local from="$1"
     local to="$2"
     echo "  Dependency: $from -> $to"
-    curl -sf -X POST "$AEGIS_URL/fleet/dependencies" \
+    curl -sf -X POST "$KIRRA_URL/fleet/dependencies" \
         -H "$AUTH_HEADER" \
         -H "$CONTENT_TYPE" \
         -d "{\"node_id\": \"$to\", \"depends_on\": [\"$from\"]}" > /dev/null
@@ -92,6 +92,6 @@ echo ""
 echo "Next steps:"
 echo "  1. Replace PLACEHOLDER_PEM_REPLACE_WITH_REAL_KEY with actual TPM AK public keys"
 echo "  2. Build and launch the interlock:"
-echo "     cd ros2_ws && colcon build --packages-select aegis_safety"
+echo "     cd ros2_ws && colcon build --packages-select kirra_safety"
 echo "     source install/setup.bash"
-echo "     ros2 launch aegis_safety aegis_with_robot.launch.py aegis_token:=\$AEGIS_ADMIN_TOKEN"
+echo "     ros2 launch kirra_safety kirra_with_robot.launch.py kirra_token:=\$KIRRA_ADMIN_TOKEN"

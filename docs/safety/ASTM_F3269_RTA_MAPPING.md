@@ -32,7 +32,7 @@ an ASTM-recognized body has not yet been performed.
 Relationship to the existing preliminary mapping in
 `docs/safety/ASTM_F3269_MAPPING.md` (AEGIS-F3269-001 v1.0.0): that
 earlier document established the initial claim shape under the prior
-Aegis branding; this document (KIRRA-RTA-001) is the up-to-date
+Kirra branding; this document (KIRRA-RTA-001) is the up-to-date
 working mapping aligned with the current Kirra architecture, the
 ODD specification, and CERT-track artifacts. The earlier document
 remains in the safety case index for historical traceability.

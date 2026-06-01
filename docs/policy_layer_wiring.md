@@ -1,6 +1,6 @@
-# Wiring `enforce_actuator_safety_envelope` into `aegis_verifier_service.rs`
+# Wiring `enforce_actuator_safety_envelope` into `kirra_verifier_service.rs`
 
-This document records the exact diff to apply to `src/bin/aegis_verifier_service.rs`
+This document records the exact diff to apply to `src/bin/kirra_verifier_service.rs`
 to integrate the actuator safety envelope middleware introduced in v2.1.0.
 
 ---

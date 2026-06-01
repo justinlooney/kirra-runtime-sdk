@@ -1,4 +1,4 @@
-# Aegis Safety Kernel — Safety Architecture
+# Kirra Safety Kernel — Safety Architecture
 
 Document ID: AEGIS-SA-001
 Version: 1.0.0
@@ -10,9 +10,9 @@ Date: 2026-05-23
 
 ## 1. Overview
 
-The Aegis safety architecture is organized as three independent, sequentially ordered enforcement layers. A vehicle command must pass through all three layers before it can reach a downstream actuator. Each layer independently implements one or more safety goals and has its own failure mode and mitigation strategy. In addition, supplementary safety mechanisms provide cross-cutting protections that apply to multiple layers and safety goals.
+The Kirra safety architecture is organized as three independent, sequentially ordered enforcement layers. A vehicle command must pass through all three layers before it can reach a downstream actuator. Each layer independently implements one or more safety goals and has its own failure mode and mitigation strategy. In addition, supplementary safety mechanisms provide cross-cutting protections that apply to multiple layers and safety goals.
 
-This document references source file paths within the `aegis-runtime-sdk` crate (v1.5.0). All paths are relative to the crate root at `src/`.
+This document references source file paths within the `kirra-runtime-sdk` crate (v1.5.0). All paths are relative to the crate root at `src/`.
 
 ---
 
@@ -184,7 +184,7 @@ Layer 3 applies posture-aware command routing and hard kinematic envelope enforc
 | 6 | Bicycle model lateral acceleration: compute `v^2 / R` and clamp steering if result exceeds `max_lateral_accel_mps2` | SG-002 |
 | 7 | Kinematics forward simulation validation | SG-001, SG-002 |
 
-The hard velocity clamp (Priority 2) always executes before the rate-of-change limiter (implemented in `src/aegis_core.rs`), satisfying the invariant that the envelope cap always wins over rate priority.
+The hard velocity clamp (Priority 2) always executes before the rate-of-change limiter (implemented in `src/kirra_core.rs`), satisfying the invariant that the envelope cap always wins over rate priority.
 
 **Test coverage:** Unit test suite including `test_speed_above_ceiling_triggers_clamp_linear`, `test_nominal_highway_speed_high_steering_clamps_steering`, `test_nan_linear_velocity_is_denied`, `test_inf_linear_velocity_is_denied`, plus the full proptest suite in `src/gateway/kinematics_proptest.rs`.
 **Failure mode:** Incorrect contract loaded for current posture (e.g., Nominal contract applied during Degraded posture).
@@ -214,9 +214,9 @@ The `OperationalCommand::Unknown` early return (step 1) is a protected invariant
 
 **Mechanism ID:** M-007
 **Safety Goals implemented:** SG-006, SG-008
-**Implementation location:** `src/gateway/policy_layer.rs` — `AegisPolicyLayer`
+**Implementation location:** `src/gateway/policy_layer.rs` — `KirraPolicyLayer`
 
-`AegisPolicyLayer` is a Tower middleware that wraps the axum HTTP service. For each incoming request, it:
+`KirraPolicyLayer` is a Tower middleware that wraps the axum HTTP service. For each incoming request, it:
 
 1. Calls `classify_command()` (`src/gateway/policy.rs`) to map the HTTP path and method to an `OperationalCommand`.
 2. Calls `should_route_command()` with the classified command and the current posture cache.
@@ -370,7 +370,7 @@ Time-dependent functions (`resolve_posture_with_reason`, `should_route_command`,
 
 | Field | Value |
 |-------|-------|
-| Prepared by | Aegis Engineering |
+| Prepared by | Kirra Engineering |
 | Review status | Pending TUV pre-assessment |
 | Next review | 2026-11-23 |
 | Supersedes | None |
