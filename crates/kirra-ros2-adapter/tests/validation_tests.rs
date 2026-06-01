@@ -298,3 +298,60 @@ fn nominal_behavior_matches_prior_default() {
     assert_eq!(state.current_posture(), FleetPosture::Nominal,
         "AdaptorState must default to Nominal so pre-M1 callers see no behaviour change");
 }
+
+// ---------------------------------------------------------------------------
+// 7. H2 + M1 reconciliation — the proof test
+// ---------------------------------------------------------------------------
+//
+// This is THE integration test that proves H2 (ODD speed cap) and M1
+// (posture-aware adapter) are consistent. The case is:
+//
+//   Nominal posture, trajectory at 30 m/s — below the 35 m/s vehicle
+//   physical max but ABOVE the 22.35 m/s URBAN_ODD_SPEED_CAP_MPS.
+//
+// Before H2 landed, the slow loop built the per-pose contract from
+// `VehicleConfig::to_kinematics_contract()` with no ODD cap; 30 m/s
+// passed the kernel's Priority-2 ceiling check (30 < 35) and the slow
+// loop returned `Accept`. Drift between the safety case (cap = 22.35)
+// and the enforced behaviour (cap = 35) was silent.
+//
+// After H2 + M1 are both on main:
+//   - default_urban() sets odd_speed_cap_mps = Some(URBAN_ODD_SPEED_CAP_MPS)
+//     (config.rs:85)
+//   - to_kinematics_contract() propagates the field (config.rs:163)
+//   - validate_vehicle_command Priority 2 uses effective_max_speed_mps()
+//     = min(max_speed_mps, odd_speed_cap_mps) = 22.35
+//     (kinematics_contract.rs:340-343)
+// → per-pose check fires ClampLinear(22.35); aggregate slow-loop verdict
+// is `Clamp`. THIS test pins that chain.
+
+#[test]
+fn nominal_posture_clamps_above_odd_cap_to_22_35() {
+    // 10-pose straight trajectory, all at 30 m/s. dt = 0.1 s so the
+    // implied acceleration between consecutive poses is 0 (P3/P4 don't
+    // fire); only P2 fires, and only because the velocity exceeds the
+    // 22.35 m/s effective ceiling (NOT the 35 m/s vehicle max).
+    let trajectory = straight_trajectory(10, 30.0, 0.1);
+    let corridor = MockCorridorSource::straight_5m_half_width(200.0);
+    let objects: Vec<PerceivedObject> = Vec::new();
+    let cfg = VehicleConfig::default_urban();
+
+    // Sanity: 30 m/s is below the vehicle physical max — so the test
+    // really is probing the ODD cap, not the vehicle ceiling.
+    assert!(30.0 < cfg.max_speed_mps,
+        "test premise: 30 m/s must be below the vehicle physical max ({})",
+        cfg.max_speed_mps);
+    assert_eq!(
+        cfg.odd_speed_cap_mps,
+        Some(kirra_runtime_sdk::gateway::kinematics_contract::URBAN_ODD_SPEED_CAP_MPS),
+        "test premise: default_urban must carry the urban ODD cap"
+    );
+
+    let verdict = validate_trajectory_slow(
+        &trajectory, &corridor, &objects, &cfg, None, FleetPosture::Nominal,
+    );
+    assert_eq!(verdict, TrajectoryVerdict::Clamp,
+        "30 m/s under Nominal posture must Clamp against the 22.35 m/s ODD cap, \
+         NOT Accept-at-30. Before H2 + M1 reconciliation this case silently passed \
+         at 35 m/s vehicle max. Got: {verdict:?}");
+}

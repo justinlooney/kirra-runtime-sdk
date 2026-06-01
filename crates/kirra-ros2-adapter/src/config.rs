@@ -173,7 +173,14 @@ impl VehicleConfig {
     /// mirror parko-kirra's posture→profile mapping while preserving
     /// the per-platform footprint required by SG2 containment + the
     /// bicycle-model lateral-accel check.
-    // SAFETY: SG8 | REQ: mrc-derated-contract-shape | TEST: to_mrc_kinematics_contract_keeps_geometry_swaps_dynamic
+    ///
+    /// The `odd_speed_cap_mps` field survives the derate via the
+    /// shallow-copy from `to_kinematics_contract()` (we deliberately
+    /// do NOT overwrite it). Effective Degraded ceiling becomes
+    /// `min(mrc.max_speed_mps, odd_speed_cap_mps)` — for the urban
+    /// default `min(5.0, 22.35) = 5.0`, so the MRC cap binds and the
+    /// ODD cap is redundant-but-explicit (no `None`-cap surprise).
+    // SAFETY: SG8 | REQ: mrc-derated-contract-shape | TEST: to_mrc_kinematics_contract_keeps_geometry_swaps_dynamic,to_mrc_kinematics_contract_preserves_odd_cap
     pub fn to_mrc_kinematics_contract(&self) -> VehicleKinematicsContract {
         let mut c   = self.to_kinematics_contract();
         let mrc = VehicleKinematicsContract::mrc_fallback_profile();
@@ -184,6 +191,8 @@ impl VehicleConfig {
         c.max_steering_rate_deg_s = mrc.max_steering_rate_deg_s;
         c.min_follow_distance_m   = mrc.min_follow_distance_m;
         c.max_lateral_accel_mps2  = mrc.max_lateral_accel_mps2;
+        // `c.odd_speed_cap_mps` intentionally left untouched — it carries
+        // the integrator's ODD cap forward (see doc-comment above).
         c
     }
 
@@ -260,6 +269,20 @@ mod tests {
         assert!(mrc.max_speed_mps < nominal.max_speed_mps,
             "MRC cap ({}) must be tighter than vehicle nominal max ({})",
             mrc.max_speed_mps, nominal.max_speed_mps);
+    }
+
+    #[test]
+    fn to_mrc_kinematics_contract_preserves_odd_cap() {
+        // Cross-fix reconciliation (H2 + M1): the MRC-derate must NOT
+        // drop the ODD cap. The effective Degraded ceiling is
+        // min(5.0 MRC, 22.35 ODD) = 5.0 — MRC binds, ODD cap is
+        // explicit-but-redundant (no None-cap surprise on this path).
+        let cfg = VehicleConfig::default_urban();
+        let mrc = cfg.to_mrc_kinematics_contract();
+        assert_eq!(mrc.odd_speed_cap_mps, Some(URBAN_ODD_SPEED_CAP_MPS),
+            "MRC-derate must carry the integrator's ODD cap forward");
+        assert_eq!(mrc.effective_max_speed_mps(), 5.0,
+            "MRC max (5.0) is more restrictive than ODD cap (22.35) — MRC wins");
     }
 
     #[test]
