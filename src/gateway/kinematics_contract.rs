@@ -17,6 +17,32 @@
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// ODD Operational Speed Cap
+// ---------------------------------------------------------------------------
+
+/// Urban Occy deployment ODD operational speed cap (m/s).
+///
+/// Source: ADR-0001 (`docs/adr/0001-occy-odd-speed-cap.md`) /
+/// SPEED_ENVELOPE.md — derived from the RSS stopping-distance chain with
+/// ~28% margin on the worst-case 130 m sensor detection range.
+///
+/// This is the **operational ODD ceiling**, NOT the vehicle physical
+/// maximum (`nominal_reference_profile().max_speed_mps = 35.0`). The
+/// two concepts are intentionally kept distinct:
+///
+///   - `max_speed_mps`        — vehicle mechanical / drivetrain ceiling
+///   - `odd_speed_cap_mps`    — safety-case operational ceiling (per ODD)
+///
+/// The enforced ceiling at runtime is `min(max_speed_mps,
+/// odd_speed_cap_mps)`. See `VehicleKinematicsContract::effective_max_speed_mps`.
+///
+/// Exact value: 50 mph = 22.352 m/s; rounded to **22.35 m/s** per
+/// SPEED_ENVELOPE.md line 116 and ADR-0001 line 29. Validated unchanged
+/// in S8 Item C (`docs/safety/OCCY_SPEED_CAP_VALIDATION.md`,
+/// KIRRA-OCCY-SPEED-VAL-001).
+pub const URBAN_ODD_SPEED_CAP_MPS: f64 = 22.35;
+
+// ---------------------------------------------------------------------------
 // Contract Profiles
 // ---------------------------------------------------------------------------
 
@@ -58,11 +84,27 @@ pub struct VehicleKinematicsContract {
     pub overhang_front_m: f64,
     /// Distance from rear wheel axle to rear bumper (meters).
     pub overhang_rear_m: f64,
+    /// Optional ODD operational speed cap (m/s). Enforced as a separate
+    /// ceiling from `max_speed_mps`; the effective max =
+    /// `min(max_speed_mps, odd_speed_cap_mps)`.
+    ///
+    /// `None` means no ODD cap is applied (vehicle physical max only) —
+    /// integrators that deploy into an ODD with a defined cap (e.g. the
+    /// urban Occy ODD, 22.35 m/s per ADR-0001) MUST populate this; a
+    /// startup warning fires if it is missing on a deployment that
+    /// should have it. See `URBAN_ODD_SPEED_CAP_MPS`.
+    #[serde(default)]
+    pub odd_speed_cap_mps: Option<f64>,
 }
 
 impl VehicleKinematicsContract {
     /// Full operational profile for a standard reference vehicle platform.
     /// Suitable for `FleetPosture::Nominal`.
+    ///
+    /// Note: `odd_speed_cap_mps` is `None` because this is a *reference*
+    /// vehicle capability profile, not a deployment-specific ODD profile.
+    /// Deployments must set the ODD cap explicitly via the integrator
+    /// config (e.g. `VehicleConfig::default_urban`).
     pub fn nominal_reference_profile() -> Self {
         Self {
             max_speed_mps: 35.0,
@@ -79,6 +121,7 @@ impl VehicleKinematicsContract {
             length_m: 4.8,
             overhang_front_m: 0.9,
             overhang_rear_m: 1.1,
+            odd_speed_cap_mps: None,
         }
     }
 
@@ -99,6 +142,24 @@ impl VehicleKinematicsContract {
             length_m: 4.8,
             overhang_front_m: 0.9,
             overhang_rear_m: 1.1,
+            // MRC speed (5.0) is already well below any ODD cap; we leave
+            // odd_speed_cap_mps = None so the min() simply selects 5.0.
+            odd_speed_cap_mps: None,
+        }
+    }
+
+    /// Effective maximum forward speed enforced by the kinematics
+    /// pipeline. The Priority-2 hard ceiling and the P3/P4 clamping
+    /// bounds use this, not `max_speed_mps` directly.
+    ///
+    /// SAFETY: SG1 | REQ: odd-speed-cap-enforcement
+    /// (ADR-0001, SPEED_ENVELOPE.md, KIRRA-OCCY-SPEED-VAL-001)
+    #[inline]
+    #[must_use]
+    pub fn effective_max_speed_mps(&self) -> f64 {
+        match self.odd_speed_cap_mps {
+            Some(cap) if cap < self.max_speed_mps => cap,
+            _ => self.max_speed_mps,
         }
     }
 }
@@ -264,14 +325,21 @@ pub fn validate_vehicle_command(
     }
 
     // ------------------------------------------------------------------
-    // SAFETY: SG3 | REQ: velocity-hard-ceiling | TEST: test_speed_above_ceiling_triggers_clamp_linear,test_reverse_speed_above_ceiling_clamps_with_correct_sign,prop_clamp_linear_value_within_speed_contract,prop_allow_result_satisfies_speed_contract
+    // SAFETY: SG1 SG3 | REQ: velocity-hard-ceiling,odd-speed-cap-enforcement | TEST: test_speed_above_ceiling_triggers_clamp_linear,test_reverse_speed_above_ceiling_clamps_with_correct_sign,prop_clamp_linear_value_within_speed_contract,prop_allow_result_satisfies_speed_contract,test_command_above_odd_cap_below_vehicle_max_clamps_to_odd_cap,test_command_above_both_clamps_to_odd_cap,test_command_below_odd_cap_passes,test_no_odd_cap_falls_back_to_vehicle_max
     // (≅ AEGIS SG-001.)
     // Priority 2: Linear velocity hard ceiling
     // Checked before acceleration rate — a velocity-over-limit command
     // implies an over-limit acceleration; no need to compute it.
+    //
+    // The enforced ceiling is `effective_max_speed_mps()`:
+    //   min(max_speed_mps, odd_speed_cap_mps.unwrap_or(+∞))
+    // This separates the vehicle physical max (capability) from the ODD
+    // operational cap (safety case). See `URBAN_ODD_SPEED_CAP_MPS` for
+    // the urban Occy ODD value (22.35 m/s per ADR-0001).
     // ------------------------------------------------------------------
-    if cmd.linear_velocity_mps.abs() > contract.max_speed_mps {
-        let clamped = contract.max_speed_mps * cmd.linear_velocity_mps.signum();
+    let effective_max_speed = contract.effective_max_speed_mps();
+    if cmd.linear_velocity_mps.abs() > effective_max_speed {
+        let clamped = effective_max_speed * cmd.linear_velocity_mps.signum();
         return EnforceAction::ClampLinear(clamped);
     }
 
@@ -308,7 +376,7 @@ pub fn validate_vehicle_command(
 
     if implied_accel > 0.0 && implied_accel > contract.max_accel_mps2 + 1e-9 {
         v = (cmd.current_velocity_mps + contract.max_accel_mps2 * cmd.delta_time_s)
-            .clamp(-contract.max_speed_mps, contract.max_speed_mps);
+            .clamp(-effective_max_speed, effective_max_speed);
         v_clamped = true;
     }
 
@@ -317,7 +385,7 @@ pub fn validate_vehicle_command(
     // Asymmetric from acceleration: braking limit is typically higher.
     if implied_accel < 0.0 && implied_accel.abs() > contract.max_brake_mps2 + 1e-9 {
         v = (cmd.current_velocity_mps - contract.max_brake_mps2 * cmd.delta_time_s)
-            .clamp(-contract.max_speed_mps, contract.max_speed_mps);
+            .clamp(-effective_max_speed, effective_max_speed);
         v_clamped = true;
     }
 
@@ -865,6 +933,141 @@ mod kinematics_contract_tests {
             EnforceAction::Allow,
             "tiny negative implied_accel must NOT trigger the P4 brake clamp"
         );
+    }
+
+    // --- ODD speed cap enforcement (Option B, H2 fix) -----------------------
+    //
+    // The ODD operational speed cap (URBAN_ODD_SPEED_CAP_MPS = 22.35 m/s,
+    // per ADR-0001) is enforced as a separate ceiling from the vehicle
+    // physical max (35 m/s). The four tests below cover the matrix:
+    //
+    //   cmd  | vehicle_max | odd_cap | expected
+    //   -----+-------------+---------+----------------------
+    //   30   |     35      |  22.35  | ClampLinear(22.35)
+    //   20   |     35      |  22.35  | Allow
+    //   40   |     35      |  22.35  | ClampLinear(22.35)
+    //   30   |     35      |  None   | Allow            (falls back to 35)
+    //
+    // Source-of-truth: SPEED_ENVELOPE.md line 116; ADR-0001 line 29;
+    // S8 Item C (KIRRA-OCCY-SPEED-VAL-001).
+
+    /// Helper: nominal-reference profile with the urban ODD cap applied.
+    /// Mirrors what `VehicleConfig::default_urban()` produces at runtime.
+    fn nominal_with_urban_odd_cap() -> VehicleKinematicsContract {
+        VehicleKinematicsContract {
+            odd_speed_cap_mps: Some(URBAN_ODD_SPEED_CAP_MPS),
+            ..VehicleKinematicsContract::nominal_reference_profile()
+        }
+    }
+
+    #[test]
+    fn test_urban_odd_speed_cap_constant_matches_speed_envelope_doc() {
+        // SPEED_ENVELOPE.md line 116 / ADR-0001 line 29 / OCCY_SPEED_CAP_VALIDATION.md
+        // line 13 all state the cap as 22.35 m/s (the rounded value of
+        // 50 mph = 22.352 m/s). If this constant drifts, the safety case
+        // derivation no longer matches the enforced code path.
+        assert_eq!(URBAN_ODD_SPEED_CAP_MPS, 22.35);
+    }
+
+    /// SAFETY: SG1 | REQ: odd-speed-cap-enforcement
+    /// Command at 30 m/s — below the 35 m/s vehicle physical max but ABOVE
+    /// the 22.35 m/s ODD cap → must clamp to the ODD cap.
+    #[test]
+    fn test_command_above_odd_cap_below_vehicle_max_clamps_to_odd_cap() {
+        let contract = nominal_with_urban_odd_cap();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 30.0,
+            current_velocity_mps: 29.5,
+            delta_time_s: 0.5,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::ClampLinear(URBAN_ODD_SPEED_CAP_MPS),
+            "30 m/s is below 35 m/s vehicle max but above the 22.35 m/s ODD cap; must clamp to ODD cap"
+        );
+    }
+
+    /// SAFETY: SG1 | REQ: odd-speed-cap-enforcement
+    /// Command at 20 m/s — below the ODD cap → allowed (no clamp).
+    #[test]
+    fn test_command_below_odd_cap_passes() {
+        let contract = nominal_with_urban_odd_cap();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 20.0,
+            current_velocity_mps: 19.5,
+            delta_time_s: 0.5,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::Allow,
+            "20 m/s is below the 22.35 m/s ODD cap; must pass without clamp"
+        );
+    }
+
+    /// SAFETY: SG1 | REQ: odd-speed-cap-enforcement
+    /// Command at 40 m/s — above BOTH the 35 m/s vehicle max and the
+    /// 22.35 m/s ODD cap → most restrictive wins (clamps to the ODD cap).
+    #[test]
+    fn test_command_above_both_clamps_to_odd_cap() {
+        let contract = nominal_with_urban_odd_cap();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 40.0,
+            current_velocity_mps: 34.0,
+            delta_time_s: 0.5,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::ClampLinear(URBAN_ODD_SPEED_CAP_MPS),
+            "40 m/s exceeds both ceilings; min(35, 22.35) = 22.35 wins"
+        );
+    }
+
+    /// SAFETY: SG1 | REQ: odd-speed-cap-enforcement
+    /// `odd_speed_cap_mps = None` → falls back to vehicle physical max.
+    /// Same 30 m/s command that clamps with the cap now passes without
+    /// one. (The deployment startup warning is the surfacing mechanism
+    /// for the missing-cap case; the contract itself remains permissive.)
+    #[test]
+    fn test_no_odd_cap_falls_back_to_vehicle_max() {
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        // Sanity: the reference profile carries no ODD cap.
+        assert!(contract.odd_speed_cap_mps.is_none());
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 30.0,
+            current_velocity_mps: 29.5,
+            delta_time_s: 0.5,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        };
+        assert_eq!(
+            validate_vehicle_command(&cmd, &contract),
+            EnforceAction::Allow,
+            "With no ODD cap set, 30 m/s is below the 35 m/s vehicle max and must pass"
+        );
+    }
+
+    /// `effective_max_speed_mps` returns the more restrictive of
+    /// `max_speed_mps` and `odd_speed_cap_mps`. Verify the boundary cases.
+    #[test]
+    fn test_effective_max_speed_picks_more_restrictive() {
+        let with_cap = nominal_with_urban_odd_cap();
+        let no_cap   = VehicleKinematicsContract::nominal_reference_profile();
+        assert_eq!(with_cap.effective_max_speed_mps(), URBAN_ODD_SPEED_CAP_MPS);
+        assert_eq!(no_cap.effective_max_speed_mps(),   35.0);
+
+        // An ODD cap above the vehicle max is silently ignored (vehicle
+        // physical max remains the binding ceiling).
+        let cap_above = VehicleKinematicsContract {
+            odd_speed_cap_mps: Some(50.0),
+            ..VehicleKinematicsContract::nominal_reference_profile()
+        };
+        assert_eq!(cap_above.effective_max_speed_mps(), 35.0);
     }
 
     /// SG9 / GAP 8: `Display for DenyCode` must render byte-identical to

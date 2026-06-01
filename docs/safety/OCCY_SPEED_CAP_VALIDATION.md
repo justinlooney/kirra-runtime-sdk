@@ -132,6 +132,17 @@ The Occy ODD speed cap of **22.35 m/s (50 mph / 80 km/h) is validated**:
 **The cap is unchanged.** This document is a validation artifact, not
 a re-derivation.
 
+**Cap is now enforced in code (H2 closeout).** The 22.35 m/s ODD cap
+named in this document is enforced by
+`src/gateway/kinematics_contract.rs::validate_vehicle_command` via the
+constant `URBAN_ODD_SPEED_CAP_MPS` and the
+`VehicleKinematicsContract::effective_max_speed_mps` helper.
+`VehicleConfig::default_urban` sets the cap by default;
+`VehicleConfig::warn_if_missing_odd_cap` is called in
+`AdaptorState::new`/`with_config` to surface deployments that drop it.
+See SPEED_ENVELOPE.md §"Code enforcement (H2 closeout)" for the full
+file:function/test trace.
+
 ## 6. Interaction with S8 Item A (SG2 lateral margin)
 
 S8 Items A and C are **independent and do not interact**:

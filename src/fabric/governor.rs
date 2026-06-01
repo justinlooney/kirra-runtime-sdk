@@ -28,6 +28,8 @@ impl KinematicProfileType {
                 length_m:               0.6,
                 overhang_front_m:       0.2,
                 overhang_rear_m:        0.2,
+                // Non-AV vertical: no ODD operational cap applies.
+                odd_speed_cap_mps:      None,
             },
             Self::DroneNominal => VehicleKinematicsContract {
                 max_speed_mps:          15.0,
@@ -42,6 +44,7 @@ impl KinematicProfileType {
                 length_m:               0.6,
                 overhang_front_m:       0.1,
                 overhang_rear_m:        0.1,
+                odd_speed_cap_mps:      None,
             },
             Self::IndustrialNominal => VehicleKinematicsContract {
                 max_speed_mps:          0.5,
@@ -56,6 +59,7 @@ impl KinematicProfileType {
                 length_m:               1.5,
                 overhang_front_m:       0.5,
                 overhang_rear_m:        0.5,
+                odd_speed_cap_mps:      None,
             },
             Self::Custom => VehicleKinematicsContract::nominal_reference_profile(),
         }
@@ -77,6 +81,11 @@ impl KinematicProfileType {
             length_m: nominal.length_m,
             overhang_front_m: nominal.overhang_front_m,
             overhang_rear_m: nominal.overhang_rear_m,
+            // MRC derates the vehicle max by 0.3 — already well under any
+            // ODD cap, so propagating the parent's odd_speed_cap_mps is a
+            // no-op for min(). Carry it through anyway so downstream
+            // diagnostics see a consistent profile lineage.
+            odd_speed_cap_mps: nominal.odd_speed_cap_mps,
         }
     }
 }

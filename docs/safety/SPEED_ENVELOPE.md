@@ -114,3 +114,30 @@ Assumption validation: see **KIRRA-OCCY-SPEED-VAL-001**
 ADR-0001 assumption is dispositioned PROVEN / OK-ANALYTICAL / AoU-GAP /
 DEFERRED; the four AoU-GAP clauses are filed against #126 (perception)
 and #127 (actuation). The cap is unchanged at 22.35 m/s.
+
+### Code enforcement (H2 closeout)
+
+The cap is now **ENFORCED in code**, not solely documented:
+
+| Concern | Location |
+|---|---|
+| Constant | `src/gateway/kinematics_contract.rs::URBAN_ODD_SPEED_CAP_MPS = 22.35` |
+| Enforcement | `src/gateway/kinematics_contract.rs::validate_vehicle_command` (Priority 2 hard ceiling; uses `contract.effective_max_speed_mps()` which is `min(max_speed_mps, odd_speed_cap_mps)`) |
+| Effective-max helper | `src/gateway/kinematics_contract.rs::VehicleKinematicsContract::effective_max_speed_mps` |
+| Adapter default | `crates/kirra-ros2-adapter/src/config.rs::VehicleConfig::default_urban` sets `odd_speed_cap_mps = Some(URBAN_ODD_SPEED_CAP_MPS)` |
+| Startup warning | `crates/kirra-ros2-adapter/src/config.rs::VehicleConfig::warn_if_missing_odd_cap` (fires in `AdaptorState::new` / `AdaptorState::with_config`) |
+
+Tests (`src/gateway/kinematics_contract.rs::kinematics_contract_tests`):
+- `test_urban_odd_speed_cap_constant_matches_speed_envelope_doc`
+- `test_command_above_odd_cap_below_vehicle_max_clamps_to_odd_cap`
+- `test_command_below_odd_cap_passes`
+- `test_command_above_both_clamps_to_odd_cap`
+- `test_no_odd_cap_falls_back_to_vehicle_max`
+- `test_effective_max_speed_picks_more_restrictive`
+
+Design choice: the ODD operational cap is kept **separate** from the
+vehicle physical max (`max_speed_mps = 35.0`) so a single contract
+expresses both the mechanical ceiling (capability) and the safety-case
+ceiling (per ODD). The pipeline enforces the more restrictive of the
+two. The two concepts are deliberately not conflated — Option B in the
+H2 fix.

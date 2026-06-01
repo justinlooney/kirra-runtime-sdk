@@ -285,10 +285,12 @@ pub struct AdaptorState {
 
 impl AdaptorState {
     pub fn new() -> Arc<Self> {
+        let config = VehicleConfig::default_urban();
+        config.warn_if_missing_odd_cap();
         Arc::new(Self {
             by_asset: DashMap::new(),
             objects_cache: Arc::new(RwLock::new(Vec::new())),
-            config: Arc::new(VehicleConfig::default_urban()),
+            config: Arc::new(config),
             latest_odom: Arc::new(RwLock::new(None)),
             last_trajectory_ms: Arc::new(AtomicU64::new(0)),
             last_objects_ms:    Arc::new(AtomicU64::new(0)),
@@ -301,6 +303,7 @@ impl AdaptorState {
     /// when the integrator's vehicle profile diverges from
     /// `default_urban()` (e.g. shuttle, light truck).
     pub fn with_config(config: VehicleConfig) -> Arc<Self> {
+        config.warn_if_missing_odd_cap();
         Arc::new(Self {
             by_asset: DashMap::new(),
             objects_cache: Arc::new(RwLock::new(Vec::new())),
