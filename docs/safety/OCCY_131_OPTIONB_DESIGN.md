@@ -157,6 +157,87 @@ Enforcement site: `crates/kirra-ros2-adapter/src/validation.rs::validate_traject
 `VehicleConfig::to_mrc_kinematics_contract`
 (SAFETY: SG8 | REQ: mrc-derated-contract-shape).
 
+### 8b. Live posture source (M1b — fail-closed PostureTracker)
+
+M1 made the adapter posture-aware but `AdaptorState::current_posture`
+defaulted to `Nominal` and nothing drove it live. M1b connects the
+verifier's computed fleet posture to the adapter, with three
+**fail-closed properties** that mirror the SG9 telemetry-staleness
+watchdog:
+
+1. **Pre-first-event seed = `Degraded`.** A source-configured adapter
+   that has not yet received a posture event MUST NOT command at the
+   full envelope. Mirrors the verifier's own "new asset → Degraded"
+   seed behaviour.
+2. **Staleness derate.** If wall-clock now exceeds
+   `last_event_ms + POSTURE_STALENESS_TIMEOUT_MS` (default 6 s ≈ one
+   posture cycle + slack), the tracker derates `Nominal` → `Degraded`.
+   We do NOT hold the last-known `Nominal`.
+3. **`LockedOut` sticky-toward-safe.** A `LockedOut` observation holds
+   until an explicit non-LockedOut observation from the source (the
+   "recovery event"). A staleness timeout cannot relax the ceiling.
+
+The state machine lives in `crates/kirra-ros2-adapter/src/posture_tracker.rs`
+(`PostureTracker`, `POSTURE_STALENESS_TIMEOUT_MS`). It is a pure,
+deterministic function of `(now_ms, observations)` — unit-tested on
+stable in `posture_tracker::tracker_tests` (10 tests covering all
+three fail-closed properties + the boundary condition).
+
+Two modes (selected at `AdaptorState` construction):
+
+| Constructor | Tracker mode | `current_posture()` baseline |
+|---|---|---|
+| `AdaptorState::new` / `with_config` | `nominal_default_no_source` | always `Nominal` — **preserves the M1 default** for verifier-less deployments and unit tests |
+| `AdaptorState::with_posture_source` | `with_source` | pre-first-event `Degraded`; updates via `update_posture` from the SSE task |
+
+**SSE transport** (`crates/kirra-ros2-adapter/src/posture_source.rs`,
+gated on the `ros2` feature):
+
+1. `reqwest` streaming GET to `${KIRRA_POSTURE_STREAM_URL}/system/posture/stream`
+   with `Authorization: Bearer ${KIRRA_ADMIN_TOKEN}` and
+   `x-kirra-client-id: ${KIRRA_POSTURE_CLIENT_ID}` (defaults to
+   `kirra-ros2-adapter`).
+2. The verifier's SSE event payload (`PostureStreamEvent`) carries
+   either a per-node `FleetNodePosture` or a transition marker with
+   `posture: None`. Rather than decode both variants, the adapter
+   uses the SSE event as a **wake-up signal** and re-fetches the
+   aggregate via `GET /fleet/posture` (folded worst-of across nodes).
+3. Disconnect → exponential backoff (1 s → 2 s → 4 s → … capped at 30 s).
+   The `PostureTracker`'s staleness derate (property 2 above) covers
+   the disconnect window automatically — no special reconnect logic
+   is required to keep the safety invariant.
+
+Selection is via env var. The binary classifies the environment into
+THREE states (see `kirra_ros2_adapter_node::classify_posture_source`)
+and treats the misconfiguration case as fail-closed:
+
+| Env state | Decision | Posture floor |
+|---|---|---|
+| `KIRRA_POSTURE_STREAM_URL` unset | `NoSource` → `AdaptorState::new` + no SSE task | `Nominal` (M1 default; verifier-less / CARLA-only deployments) |
+| `KIRRA_POSTURE_STREAM_URL` set + `KIRRA_ADMIN_TOKEN` set | `Live` → `AdaptorState::with_posture_source` + SSE task | live posture; tracker starts at `Degraded` and updates on each event |
+| `KIRRA_POSTURE_STREAM_URL` set + `KIRRA_ADMIN_TOKEN` missing/empty | `ConfiguredNoTransport` → `AdaptorState::with_posture_source` + **no SSE task** + WARN | **`Degraded` (fail-closed)** — tracker seeds Degraded pre-first-event, no observe will ever fire, the adapter holds Degraded until the operator fixes the auth and restarts |
+
+The `ConfiguredNoTransport` branch is the critical fail-closed
+amendment. When the operator's INTENT to govern is explicit (the URL
+is set), any failure to actually use the source must hold the adapter
+in `Degraded` — never silently fall back to the no-source `Nominal`
+baseline. This is the posture analog of "missing admin token → 503,
+never 200" in the verifier.
+
+(Considered and rejected: hard refusal-to-start on misconfiguration.
+Graceful Degraded is recommended — the vehicle can still operate in
+MRC rather than not at all, and the disposition matches the rest of
+the fail-closed machine.)
+
+**Alternative considered (deferred).** Option B — a separate ROS 2
+bridge republishing verifier posture on a topic — keeps the adapter
+pure-ROS 2 but adds a component. Defer unless a deployment already has
+such a bridge.
+
+Enforcement sites:
+- State machine: `crates/kirra-ros2-adapter/src/posture_tracker.rs::PostureTracker` (SAFETY: SG8 SG9 | REQ: posture-source-fail-closed).
+- SSE transport: `crates/kirra-ros2-adapter/src/posture_source.rs::spawn_posture_source` (SAFETY: SG8 SG9 | REQ: posture-source-fail-closed-transport — integration-tested).
+
 ## 9. Demo (CARLA + scenario_runner)
 
 Autoware-in-CARLA as the doer; Governor as the final gate. Inject:
