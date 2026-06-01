@@ -1,0 +1,96 @@
+// parko/crates/parko-ros2/src/config.rs
+//
+// Node configuration — topic names, sensor input shape, tick period,
+// staleness budget. Built from env / CLI in the binary; threaded
+// through the rest of the crate.
+
+use std::time::Duration;
+
+/// Configuration for the Parko ROS 2 node. Constructed by the binary
+/// from env vars / CLI; passed by `Arc<ParkoNodeConfig>` to the drain
+/// tasks so they can read it without lock contention.
+#[derive(Debug, Clone)]
+pub struct ParkoNodeConfig {
+    /// ROS 2 topic the node subscribes to for sensor observations.
+    /// The integrator maps the topic's payload to a `SensorFrame` via
+    /// the `SensorInputMapping` in `sensor_mapping.rs`. Default:
+    /// `~/input/observation` (a project-local sensor.msg/Observation
+    /// topic placeholder).
+    pub sensor_topic: String,
+    /// ROS 2 topic the node publishes gated `OutgoingTwist` commands
+    /// to. Default: `~/output/cmd_vel`. The integrator maps this to
+    /// their vehicle interface (typically `geometry_msgs::Twist`).
+    pub command_topic: String,
+    /// Tick period, seconds. Defaults to 0.05 s (20 Hz) — matches
+    /// `parko_core::InferenceLoop`'s default. The governor receives
+    /// this as `delta_time_s` for rate-of-change checks.
+    pub tick_period_s: f64,
+
+    /// Sensor-input staleness budget, ms. If `now - frame.timestamp_ms`
+    /// exceeds this, the tick pipeline emits a stopped command rather
+    /// than running inference on a stale frame. Default 200 ms = ~4×
+    /// the tick period @ 20 Hz; the integrator should tighten this
+    /// per platform.
+    /// **TODO:** revisit per platform after measuring real
+    /// observation-arrival jitter; this is a placeholder analogous to
+    /// `POSTURE_STALENESS_TIMEOUT_MS` in M1b.
+    pub sensor_staleness_budget_ms: u64,
+
+    /// MRC fallback published when a sensor input is stale or
+    /// inference fails. Always a stopped twist (linear = angular = 0)
+    /// per the M1 / parko-kirra discipline. Stored as a field so the
+    /// integrator may override (e.g. a controlled-deceleration
+    /// MRC instead of a pure stop) without forking the node.
+    pub mrc_command: OutgoingTwistDefaults,
+}
+
+/// Placeholder for an MRC fallback override. Today's MRC is always
+/// `OutgoingTwist::stopped()`; this struct exists so a future
+/// integrator can provide a controlled-deceleration MRC without
+/// having to fork the crate. Stays empty until that need is real.
+#[derive(Debug, Clone, Default)]
+pub struct OutgoingTwistDefaults;
+
+impl Default for ParkoNodeConfig {
+    fn default() -> Self {
+        Self {
+            sensor_topic: "~/input/observation".to_string(),
+            command_topic: "~/output/cmd_vel".to_string(),
+            tick_period_s: 0.05,
+            sensor_staleness_budget_ms: 200,
+            mrc_command: OutgoingTwistDefaults,
+        }
+    }
+}
+
+impl ParkoNodeConfig {
+    #[must_use]
+    pub fn tick_period(&self) -> Duration {
+        Duration::from_secs_f64(self.tick_period_s.max(0.001))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_tick_period_is_20hz() {
+        let cfg = ParkoNodeConfig::default();
+        assert!((cfg.tick_period_s - 0.05).abs() < 1e-9);
+        assert_eq!(cfg.tick_period(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn tick_period_clamps_floor_to_avoid_zero_duration() {
+        let cfg = ParkoNodeConfig {
+            tick_period_s: 0.0,
+            ..ParkoNodeConfig::default()
+        };
+        // The seconds_f64 → Duration round-trip would yield 0 ns at
+        // exactly 0.0, which would spin the timer; the floor of 1 ms
+        // guards against config typos.
+        assert!(cfg.tick_period() >= Duration::from_micros(900),
+            "tick_period must floor above zero to avoid a busy-spin");
+    }
+}

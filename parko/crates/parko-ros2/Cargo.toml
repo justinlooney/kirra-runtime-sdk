@@ -1,0 +1,81 @@
+# parko/crates/parko-ros2/Cargo.toml
+#
+# M2 — Parko ROS 2 node. Brings Parko's end-to-end ML control path live
+# in a ROS 2 deployment, parallel to the Occy adapter
+# (`kirra-ros2-adapter`). See `docs/safety/PARKO_OCCY_TOPOLOGY.md`
+# (KIRRA-OCCY-TOPOLOGY-001) for the parallel-paths decision.
+#
+# Layout follows the kirra-ros2-adapter convention:
+#   - Default build = no ROS / no ORT deps. Pure logic that the unit
+#     tests exercise via parko-core's MockBackend.
+#   - `ros2` feature → r2r 0.9.5, tokio runtime hooks, the node binary.
+#     The integrator turns this on alongside a sourced ROS 2 environment
+#     and (for live ONNX inference) `ORT_DYLIB_PATH` pointing at a
+#     local libonnxruntime.
+
+[package]
+name = "parko-ros2"
+version = "0.1.0"
+edition = "2021"
+description = "ROS 2 node for Parko's end-to-end ML control path (M2; parallel to kirra-ros2-adapter)"
+license = "Apache-2.0 OR MIT"
+
+[features]
+# Default = no ROS / no ORT. The state-machine + mapping tests run
+# under the default lane via parko-core's MockBackend; the live r2r
+# transport and ORT backend are feature-gated.
+default = []
+
+# Enable the r2r-backed node and the binary entry point. Requires a
+# sourced ROS 2 environment (Humble/Jazzy/Kilted per r2r 0.9.5 support).
+ros2 = ["dep:r2r", "dep:tracing-subscriber", "dep:futures"]
+
+# Pull in parko-onnx (the production CPU backend). Optional so the
+# default unit-test lane doesn't require libonnxruntime on the build
+# host.
+onnx-backend = ["dep:parko-onnx"]
+
+[dependencies]
+# Shared core (sensor model, scheduler, ControlCommand, SafetyGovernor
+# trait, MockBackend).
+parko-core  = { path = "../parko-core" }
+# The dual-governor comparator that gates every command leaving the
+# loop. This is the safety bridge: Parko produces commands, parko-kirra
+# governs them, KirraGovernor enforces the same envelopes Occy uses.
+parko-kirra = { path = "../parko-kirra" }
+# Kernel — the kinematics contract + FleetPosture come from here.
+# parko-kirra already depends on it; pulling it in directly lets the
+# node read posture and configure kinematics without going through the
+# kirra-runtime-sdk indirection on every call.
+kirra-runtime-sdk = { path = "../../.." }
+
+# Async runtime. Default features so `tokio::spawn` and `mpsc` channels
+# are available in both lanes (the scheduler already uses them).
+tokio   = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+# ROS 2 bindings — feature-gated, pinned per the r2r project's
+# explicit no-API-stability stance. Same pin as the adapter.
+r2r = { version = "=0.9.5", optional = true }
+
+# Structured logging in the binary. Optional + gated on ros2 since
+# only the binary needs a subscriber.
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optional = true }
+
+# futures Stream / StreamExt for consuming r2r's untyped subscription
+# streams in the drain tasks. Same pattern as the adapter.
+futures = { version = "0.3", optional = true }
+
+# Optional ONNX backend. The integrator opts in when ORT is installed.
+parko-onnx = { path = "../parko-onnx", optional = true }
+
+[dev-dependencies]
+# State-machine tests use parko-core's MockBackend (no ORT, no ROS).
+tokio = { version = "1", features = ["full", "test-util", "macros"] }
+
+# The node binary is feature-gated to `ros2`; the default cargo build
+# does not see this entry.
+[[bin]]
+name = "parko_ros2_node"
+path = "src/bin/parko_ros2_node.rs"
+required-features = ["ros2"]

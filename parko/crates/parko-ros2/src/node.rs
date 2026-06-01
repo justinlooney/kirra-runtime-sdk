@@ -1,0 +1,167 @@
+// parko/crates/parko-ros2/src/node.rs
+//
+// r2r-backed Parko ROS 2 node. Feature-gated on `ros2`. Default cargo
+// builds (and CI) do not compile this file.
+//
+// Responsibility:
+//   - r2r context + node init
+//   - Subscribe to the configured sensor topic; per-message →
+//     `SensorInputMapping::to_frame` → `run_pipeline_tick`.
+//   - Publish each tick's `OutgoingTwist` to the configured actuator
+//     topic.
+//   - Honour shutdown signals from the binary (the `JoinHandle::abort`
+//     path).
+//
+// What this file does NOT do:
+//   - Carry safety logic. The fail-closed paths live in
+//     `tick_pipeline.rs` and parko-kirra; this module is pure transport.
+//   - Subscribe to the verifier's posture stream. M1b's PostureTracker
+//     is the reusable mechanism — wiring it into this node is the
+//     next-milestone deliverable. For M2 the node accepts a posture
+//     parameter (CLI / env) and defaults to `Nominal`.
+
+use std::sync::Arc;
+
+use parko_core::backend::InferenceBackend;
+use parko_core::safety::SafetyPosture;
+use parko_core::scheduler::InferenceLoop;
+use tokio::sync::Mutex;
+
+use crate::command_mapping::OutgoingTwist;
+use crate::config::ParkoNodeConfig;
+use crate::sensor_mapping::SensorInputMapping;
+use crate::tick_pipeline::{run_pipeline_tick, TickError};
+
+/// Run the Parko ROS 2 node. Owns the r2r context for the lifetime of
+/// the returned future. Cancelling the future drops the node + the
+/// subscriptions + the publisher.
+///
+/// `infer` is an `Arc<Mutex<InferenceLoop<B>>>` built by the binary;
+/// the loop has its governor and tick period pre-attached. `mapping`
+/// is the integrator's sensor → frame mapper. `posture` is the
+/// **static** posture for now (M1b wiring is a follow-up; see the
+/// module-level note).
+pub async fn run_node<B, M>(
+    config:  Arc<ParkoNodeConfig>,
+    infer:   Arc<Mutex<InferenceLoop<B>>>,
+    mapping: Arc<M>,
+    posture: SafetyPosture,
+    node_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    B: InferenceBackend + 'static,
+    M: SensorInputMapping<Sample = Vec<f32>> + 'static,
+{
+    let ctx = r2r::Context::create()?;
+    let mut node = r2r::Node::create(ctx, node_name, "parko")?;
+
+    // --- Subscriptions ------------------------------------------------
+    //
+    // The sensor topic carries the integrator's observation message.
+    // For M2 we expect a vector-of-f32 payload via a JSON-wrapped
+    // sensor msg (project-local convention). Production integrators
+    // swap this for their typed message + a corresponding
+    // `SensorInputMapping<Sample = TheirMsg>`.
+    let sensor_sub = node.subscribe_untyped(
+        &config.sensor_topic,
+        // The wire type is integrator-defined; we use a JSON-shaped
+        // message so the M2 default works with any publisher that can
+        // emit a JSON array of floats. Integrators replace this with
+        // their own message + mapping.
+        "std_msgs/msg/Float32MultiArray",
+        r2r::QosProfile::default(),
+    )?;
+
+    // --- Publisher ----------------------------------------------------
+    let cmd_pub = node.create_publisher_untyped(
+        &config.command_topic,
+        "geometry_msgs/msg/Twist",
+        r2r::QosProfile::default(),
+    )?;
+
+    // --- Drain task: consume the sensor stream, tick, publish ---------
+    let drain_config  = Arc::clone(&config);
+    let drain_infer   = Arc::clone(&infer);
+    let drain_mapping = Arc::clone(&mapping);
+
+    let drain_task = tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut frame_id: u64 = 0;
+        let mut stream = sensor_sub;
+        while let Some(msg) = stream.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = ?e,
+                        "parko-ros2 sensor stream error; sensor staleness will derate to stop");
+                    continue;
+                }
+            };
+            // Project-local JSON shape: { "data": [f32, ...], "stamp_ms": u64 }
+            let sample_vec: Vec<f32> = msg.get("data")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|n| n.as_f64().map(|f| f as f32)).collect())
+                .unwrap_or_default();
+            let stamp_ms: u64 = msg.get("stamp_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            frame_id = frame_id.saturating_add(1);
+            let frame = drain_mapping.to_frame(frame_id, stamp_ms, &sample_vec);
+            let outcome = run_pipeline_tick(
+                &drain_config,
+                Arc::clone(&drain_infer),
+                frame,
+                posture,
+            ).await;
+
+            if let Some(err) = &outcome.error {
+                match err {
+                    TickError::StaleSensorInput { frame_id, frame_age_ms, budget_ms } =>
+                        tracing::warn!(frame_id, frame_age_ms, budget_ms,
+                            "parko-ros2: sensor input stale; publishing MRC"),
+                    TickError::InferenceError(msg) =>
+                        tracing::error!(error = %msg,
+                            "parko-ros2: inference error; publishing MRC"),
+                }
+            }
+
+            // Publish the gated twist (always — happy path OR MRC).
+            if let Err(e) = publish_twist(&cmd_pub, outcome.twist) {
+                tracing::warn!(error = ?e,
+                    "parko-ros2: failed to publish OutgoingTwist; \
+                     the next tick will retry");
+            }
+        }
+        tracing::error!("parko-ros2: sensor subscription stream closed — \
+                         tick loop exiting; the actuator will see staleness");
+    });
+
+    // Drive the r2r executor until the drain task ends or we're
+    // cancelled by the binary's shutdown handler.
+    let spin_task = tokio::task::spawn_blocking(move || {
+        loop {
+            node.spin_once(std::time::Duration::from_millis(50));
+        }
+    });
+
+    tokio::select! {
+        _ = drain_task => {}
+        _ = spin_task  => {}
+    }
+    Ok(())
+}
+
+/// Map an `OutgoingTwist` to the geometry_msgs/Twist JSON envelope that
+/// r2r's `create_publisher_untyped` expects, and publish it.
+fn publish_twist(
+    publisher: &r2r::PublisherUntyped,
+    twist: OutgoingTwist,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use serde_json::json;
+    let payload = json!({
+        "linear":  { "x": twist.linear_x_mps,  "y": 0.0, "z": 0.0 },
+        "angular": { "x": 0.0, "y": 0.0,        "z": twist.angular_z_rads },
+    });
+    publisher.publish(payload)
+        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(format!("publish: {e:?}")))
+}
