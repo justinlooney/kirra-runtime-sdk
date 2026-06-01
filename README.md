@@ -296,6 +296,48 @@ The `kirra-ros2-adapter` crate is feature-gated on `ros2` (default build
 produces no ROS deps; opt in via `--features ros2` against a sourced ROS 2
 + Lanelet2 environment).
 
+### Parko ROS 2 Node (parallel path — M2)
+
+For edge robotics / differential-drive deployments where the control
+policy is an ML model rather than a planner+follower, the
+**`parko/crates/parko-ros2`** crate provides a parallel ROS 2 node
+that runs Parko's end-to-end ML control path live:
+
+```
+sensor topic → SensorFrame → InferenceLoop → GovernorComparator → OutgoingTwist → /cmd_vel
+                  (parko-core)     (parko-kirra dual-governor;        (geometry_msgs/Twist)
+                                    divergence audit + escalation)
+```
+
+Layout mirrors `kirra-ros2-adapter`:
+- Default build = no ROS / no ORT deps (pure logic; `MockBackend`-based
+  unit tests).
+- `ros2` feature → r2r 0.9.5 + the node binary.
+- `onnx-backend` feature → parko-onnx OrtBackend (production inference;
+  requires `ORT_DYLIB_PATH`).
+
+Fail-closed paths: sensor staleness → stopped twist (MRC);
+`InferenceLoop::tick` error → stopped twist; comparator divergence
+escalation (LockedOut) → stopped twist; backend `load_model` failure
+at startup → process exit with a clear error (not a silent no-op).
+
+```bash
+# Stable lane (MockBackend unit tests; no ROS / no ORT)
+cd parko && cargo test -p parko-ros2
+
+# Production lane (requires sourced ROS 2 + ORT_DYLIB_PATH)
+source /opt/ros/humble/setup.bash
+export ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
+cd parko && cargo build -p parko-ros2 --features ros2,onnx-backend
+```
+
+The Parko and Occy paths run **side by side**, not chained — they
+produce incompatible artifacts (instantaneous commands vs. full
+trajectories) and share only the safety primitives (parko-core RSS,
+`VehicleKinematicsContract`, posture-driven MRC, ODD speed cap). See
+[`docs/safety/PARKO_OCCY_TOPOLOGY.md`](docs/safety/PARKO_OCCY_TOPOLOGY.md)
+(KIRRA-OCCY-TOPOLOGY-001) for the L1 parallel-paths decision.
+
 ### Fleet Posture States
 
 | Posture | Command Routing |
