@@ -190,27 +190,51 @@ async fn main() {
     });
     tracing::info!(?args, "kirra_ros2_adapter_node starting");
 
-    // M1b — if KIRRA_POSTURE_STREAM_URL is set (alongside the admin
-    // token + client id), construct a source-configured AdaptorState
-    // and spawn the SSE subscriber. The PostureTracker starts at
-    // Degraded (fail-closed seed); the SSE task drives it Nominal as
-    // soon as the verifier confirms. If the URL env var is absent we
-    // keep the M1 default (no-source tracker → Nominal forever) so
-    // verifier-less deployments and CARLA-only smoke runs are
-    // unaffected.
-    let posture_source_config = load_posture_source_config();
-    let state = match &posture_source_config {
-        Some(cfg) => {
-            tracing::info!(verifier_base_url = %cfg.verifier_base_url,
-                "M1b: live posture source configured; tracker starts at Degraded \
-                 until the first SSE event lands");
-            AdaptorState::with_posture_source(VehicleConfig::default_urban())
-        }
-        None => {
+    // M1b — three-state posture-source decision:
+    //
+    //   NoSource              (URL unset)                    → AdaptorState::new()
+    //                                                          + no SSE task
+    //                                                          → Nominal (M1 default)
+    //   ConfiguredNoTransport (URL set, auth missing/unusable)
+    //                                                        → with_posture_source()
+    //                                                          + no SSE task
+    //                                                          → Degraded (FAIL-CLOSED)
+    //   Live(cfg)             (URL + auth present)            → with_posture_source()
+    //                                                          + spawn SSE task
+    //                                                          → live posture from the
+    //                                                          verifier
+    //
+    // The ConfiguredNoTransport branch is the critical fail-closed
+    // amendment: the operator's INTENT to govern is explicit (they set
+    // the URL), so any failure to actually use the source must hold the
+    // adapter in Degraded, NOT drop back to the no-source Nominal
+    // baseline. The PostureTracker's pre-first-event seed gives us this
+    // for free: source-configured + no observe ever called = Degraded
+    // forever, until the operator fixes the auth and restarts.
+    let decision = classify_posture_source();
+    let state = match &decision {
+        PostureSourceDecision::NoSource => {
             tracing::info!(
                 "M1b: KIRRA_POSTURE_STREAM_URL not set; using M1 default \
                  (no-source tracker — posture stays Nominal)");
             AdaptorState::new()
+        }
+        PostureSourceDecision::ConfiguredNoTransport { reason } => {
+            tracing::warn!(reason = %reason,
+                "M1b: posture-source URL is set but unusable; entering \
+                 source-configured mode WITHOUT live transport. The \
+                 PostureTracker will hold Degraded until the configuration \
+                 is corrected and the adapter restarts. This is the \
+                 fail-closed disposition: operator intent to govern is \
+                 explicit, so the adapter must not silently fall back to \
+                 the full envelope.");
+            AdaptorState::with_posture_source(VehicleConfig::default_urban())
+        }
+        PostureSourceDecision::Live(cfg) => {
+            tracing::info!(verifier_base_url = %cfg.verifier_base_url,
+                "M1b: live posture source configured; tracker starts at Degraded \
+                 until the first SSE event lands");
+            AdaptorState::with_posture_source(VehicleConfig::default_urban())
         }
     };
 
@@ -219,11 +243,16 @@ async fn main() {
         std::process::exit(3);
     });
 
-    // SSE subscriber (M1b). Spawned only when the source is configured;
-    // the JoinHandle is aborted at shutdown alongside the adapter task.
-    let posture_task = posture_source_config.map(|cfg| {
-        spawn_posture_source(Arc::clone(&state), cfg)
-    });
+    // SSE subscriber (M1b). Spawned ONLY in the Live branch — the
+    // ConfiguredNoTransport branch deliberately omits it so the tracker
+    // holds Degraded.
+    let posture_task = match decision {
+        PostureSourceDecision::Live(cfg) => {
+            Some(spawn_posture_source(Arc::clone(&state), cfg))
+        }
+        PostureSourceDecision::NoSource
+        | PostureSourceDecision::ConfiguredNoTransport { .. } => None,
+    };
 
     // The adapter's main task: r2r Context + Node + subscriptions +
     // slow/fast loops. Owns the runtime for the lifetime of the node.
@@ -250,27 +279,64 @@ async fn main() {
     tracing::info!("kirra_ros2_adapter_node exit");
 }
 
-/// Read the three env vars that configure the M1b SSE subscriber, all-or-nothing.
+/// Three-state classification of the posture-source environment.
+///
+/// The binary uses this to decide both (a) which `AdaptorState`
+/// constructor to call and (b) whether to spawn the SSE transport
+/// task. See `main` for the dispatch table.
+enum PostureSourceDecision {
+    /// `KIRRA_POSTURE_STREAM_URL` is unset or empty. Verifier-less
+    /// deployment / CARLA-only smoke. Use the M1 no-source default —
+    /// `AdaptorState::new()` → tracker returns `Nominal` forever.
+    NoSource,
+    /// URL is set (operator INTENT to govern is explicit) but the
+    /// transport cannot be brought up — typically a missing or empty
+    /// `KIRRA_ADMIN_TOKEN`. Build `AdaptorState::with_posture_source`
+    /// (the tracker's pre-first-event seed is `Degraded`) but do
+    /// NOT spawn the SSE task. The tracker holds Degraded until the
+    /// operator fixes the misconfiguration and restarts. This is the
+    /// fail-closed disposition for "intended but unusable" sources;
+    /// the previous (initial M1b) implementation incorrectly dropped
+    /// back to the no-source Nominal baseline here.
+    ConfiguredNoTransport { reason: String },
+    /// URL + auth both present. Build `with_posture_source` AND spawn
+    /// the SSE task → live posture from the verifier.
+    Live(PostureSourceConfig),
+}
+
+/// Read the three env vars that configure the M1b SSE subscriber and
+/// classify the result. See `PostureSourceDecision` for the three
+/// states.
 ///
 /// `KIRRA_POSTURE_STREAM_URL` (the verifier base URL, e.g.
-/// `http://kirra-verifier:8090`) gates the subscriber. Setting it
-/// REQUIRES `KIRRA_ADMIN_TOKEN` (verifier auth) and
-/// `KIRRA_POSTURE_CLIENT_ID` (the `x-kirra-client-id` header for
-/// identity-gated routes). A missing required var emits a WARN and
-/// drops back to the M1 no-source default.
-fn load_posture_source_config() -> Option<PostureSourceConfig> {
-    let url = std::env::var("KIRRA_POSTURE_STREAM_URL").ok().filter(|s| !s.is_empty())?;
+/// `http://kirra-verifier:8090`) gates the source-configured modes.
+/// Setting it REQUIRES `KIRRA_ADMIN_TOKEN` (verifier auth); without a
+/// usable token we return `ConfiguredNoTransport` (fail-closed →
+/// Degraded), NOT `NoSource` (Nominal). `KIRRA_POSTURE_CLIENT_ID`
+/// (the `x-kirra-client-id` header for identity-gated routes) is
+/// optional and defaults to `"kirra-ros2-adapter"`.
+fn classify_posture_source() -> PostureSourceDecision {
+    let Some(url) = std::env::var("KIRRA_POSTURE_STREAM_URL").ok().filter(|s| !s.is_empty())
+    else {
+        return PostureSourceDecision::NoSource;
+    };
     let admin_token = match std::env::var("KIRRA_ADMIN_TOKEN") {
         Ok(t) if !t.is_empty() => t,
         _ => {
-            tracing::warn!(
-                "KIRRA_POSTURE_STREAM_URL is set but KIRRA_ADMIN_TOKEN is missing/empty; \
-                 dropping back to the M1 no-source default. The verifier's identity-gated \
-                 SSE route requires the admin token; the adapter will not subscribe.");
-            return None;
+            // URL set, auth missing/empty. Operator intent is explicit —
+            // hold Degraded, do NOT silently widen the envelope.
+            return PostureSourceDecision::ConfiguredNoTransport {
+                reason: "KIRRA_ADMIN_TOKEN is missing or empty; the verifier's \
+                         identity-gated SSE route requires the admin token"
+                    .to_string(),
+            };
         }
     };
     let client_id = std::env::var("KIRRA_POSTURE_CLIENT_ID").ok().filter(|s| !s.is_empty())
         .unwrap_or_else(|| "kirra-ros2-adapter".to_string());
-    Some(PostureSourceConfig { verifier_base_url: url, admin_token, client_id })
+    PostureSourceDecision::Live(PostureSourceConfig {
+        verifier_base_url: url,
+        admin_token,
+        client_id,
+    })
 }

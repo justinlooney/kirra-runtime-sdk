@@ -672,4 +672,56 @@ mod tests {
         assert_eq!(verdict, TrajectoryVerdict::Accept,
             "clock skew must not falsely trigger staleness (saturating_sub → 0)");
     }
+
+    // -----------------------------------------------------------------------
+    // M1b amendment: misconfigured-source fail-CLOSED invariant
+    // -----------------------------------------------------------------------
+    //
+    // The binary's decision tree (see `kirra_ros2_adapter_node::classify_posture_source`)
+    // distinguishes three states. This test pins the most-easily-missed
+    // one — URL set + token missing/unusable → construct
+    // source-configured state WITHOUT spawning an SSE transport. The
+    // `PostureTracker` seeds Degraded pre-first-event and never receives
+    // one, so `current_posture()` MUST hold at Degraded forever rather
+    // than dropping to the M1 no-source Nominal default.
+    //
+    // The previous (M1b initial) wiring treated missing token as a
+    // reason to drop back to `AdaptorState::new()` — which returns
+    // Nominal forever. That was a fail-OPEN path in the one case where
+    // governance intent was explicit (the operator set the URL). This
+    // test ensures it can never regress.
+    //
+    // SAFETY: SG8 SG9 | REQ: posture-source-fail-closed-misconfig
+
+    #[test]
+    fn url_set_but_token_missing_holds_degraded_not_nominal() {
+        // The binary's behaviour on misconfiguration: build the
+        // source-configured AdaptorState but do NOT spawn the SSE task.
+        let state = AdaptorState::with_posture_source(VehicleConfig::default_urban());
+        // No observe() will ever fire — the source is "intended but
+        // unusable". The tracker must seed and HOLD at Degraded.
+        assert_eq!(
+            state.current_posture(),
+            FleetPosture::Degraded,
+            "misconfigured posture source must hold Degraded — \
+             must NEVER fail open to Nominal"
+        );
+        // Read again after a no-op delay — still Degraded. The tracker's
+        // pre-first-event seed is time-independent (see
+        // tracker_source_pre_first_event_is_degraded in posture_tracker.rs).
+        assert_eq!(state.current_posture(), FleetPosture::Degraded);
+    }
+
+    #[test]
+    fn url_unset_no_source_default_is_still_nominal() {
+        // Regression: the M1 no-source default is **untouched** by the
+        // M1b amendment. Verifier-less deployments (URL env var unset)
+        // continue to use `AdaptorState::new()` and see `Nominal`.
+        let state = AdaptorState::new();
+        assert_eq!(
+            state.current_posture(),
+            FleetPosture::Nominal,
+            "URL-unset no-source default must remain Nominal (M1 path unchanged)"
+        );
+    }
 }

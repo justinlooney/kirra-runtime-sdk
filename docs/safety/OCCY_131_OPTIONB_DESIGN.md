@@ -207,11 +207,27 @@ gated on the `ros2` feature):
    the disconnect window automatically — no special reconnect logic
    is required to keep the safety invariant.
 
-Selection is via env var: setting `KIRRA_POSTURE_STREAM_URL` constructs
-the source-configured `AdaptorState` and spawns the SSE task; leaving
-it unset preserves the M1 default. Missing `KIRRA_ADMIN_TOKEN` with the
-URL set logs a WARN and drops back to the M1 default rather than
-silently subscribing without auth.
+Selection is via env var. The binary classifies the environment into
+THREE states (see `kirra_ros2_adapter_node::classify_posture_source`)
+and treats the misconfiguration case as fail-closed:
+
+| Env state | Decision | Posture floor |
+|---|---|---|
+| `KIRRA_POSTURE_STREAM_URL` unset | `NoSource` → `AdaptorState::new` + no SSE task | `Nominal` (M1 default; verifier-less / CARLA-only deployments) |
+| `KIRRA_POSTURE_STREAM_URL` set + `KIRRA_ADMIN_TOKEN` set | `Live` → `AdaptorState::with_posture_source` + SSE task | live posture; tracker starts at `Degraded` and updates on each event |
+| `KIRRA_POSTURE_STREAM_URL` set + `KIRRA_ADMIN_TOKEN` missing/empty | `ConfiguredNoTransport` → `AdaptorState::with_posture_source` + **no SSE task** + WARN | **`Degraded` (fail-closed)** — tracker seeds Degraded pre-first-event, no observe will ever fire, the adapter holds Degraded until the operator fixes the auth and restarts |
+
+The `ConfiguredNoTransport` branch is the critical fail-closed
+amendment. When the operator's INTENT to govern is explicit (the URL
+is set), any failure to actually use the source must hold the adapter
+in `Degraded` — never silently fall back to the no-source `Nominal`
+baseline. This is the posture analog of "missing admin token → 503,
+never 200" in the verifier.
+
+(Considered and rejected: hard refusal-to-start on misconfiguration.
+Graceful Degraded is recommended — the vehicle can still operate in
+MRC rather than not at all, and the disposition matches the rest of
+the fail-closed machine.)
 
 **Alternative considered (deferred).** Option B — a separate ROS 2
 bridge republishing verifier posture on a topic — keeps the adapter
