@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Aegis + OpenAI: Safety-filtered robot control via GPT function calling.
-The AI decides what to do. Aegis decides if it's physically safe to do it.
+Kirra + OpenAI: Safety-filtered robot control via GPT function calling.
+The AI decides what to do. Kirra decides if it's physically safe to do it.
 
 This example demonstrates:
-  - Sending AI-generated actions through Aegis before hardware execution
+  - Sending AI-generated actions through Kirra before hardware execution
   - Handling Allow, Deny (posture), and Deny (kinematic breach) responses
   - Subscribing to the SSE posture stream for proactive posture awareness
   - Mocked LLM output to demonstrate the safety filter without OpenAI credentials
@@ -21,26 +21,26 @@ import requests
 
 # import openai  # pip install openai
 
-AEGIS_URL = "http://localhost:8090"
-AEGIS_TOKEN = "your-admin-token"
-AEGIS_CLIENT_ID = "openai-agent-001"
+KIRRA_URL = "http://localhost:8090"
+KIRRA_TOKEN = "your-admin-token"
+KIRRA_CLIENT_ID = "openai-agent-001"
 
 # Set to True and provide OPENAI_API_KEY to use real GPT function calling.
 USE_REAL_OPENAI = False
 
 # ---------------------------------------------------------------------------
-# Aegis Action Filter client
+# Kirra Action Filter client
 # ---------------------------------------------------------------------------
 
-def check_action_with_aegis(
+def check_action_with_kirra(
     action_type: str,
     target_node: str,
     risk_class: str,
     payload: dict,
 ) -> dict:
-    """Send any AI-generated action through Aegis before executing it on hardware.
+    """Send any AI-generated action through Kirra before executing it on hardware.
 
-    Returns the Aegis decision dict:
+    Returns the Kirra decision dict:
       {
         "allowed": bool,
         "reason": str,
@@ -48,14 +48,14 @@ def check_action_with_aegis(
         "request_id": str,
       }
 
-    Raises requests.HTTPError if Aegis returns a non-2xx status (e.g. 401, 503).
+    Raises requests.HTTPError if Kirra returns a non-2xx status (e.g. 401, 503).
     Always raises on network failure — treat that as a deny in the caller.
     """
     resp = requests.post(
-        f"{AEGIS_URL}/action_filter/evaluate",
+        f"{KIRRA_URL}/action_filter/evaluate",
         headers={
-            "Authorization": f"Bearer {AEGIS_TOKEN}",
-            "x-aegis-client-id": AEGIS_CLIENT_ID,
+            "Authorization": f"Bearer {KIRRA_TOKEN}",
+            "x-kirra-client-id": KIRRA_CLIENT_ID,
             "Content-Type": "application/json",
         },
         json={
@@ -93,7 +93,7 @@ OPENAI_FUNCTIONS = [
         "name": "move_robot",
         "description": (
             "Move a robot at the specified linear and angular velocity. "
-            "This command is subject to Aegis safety filtering."
+            "This command is subject to Kirra safety filtering."
         ),
         "parameters": {
             "type": "object",
@@ -137,10 +137,10 @@ OPENAI_FUNCTIONS = [
 
 def execute_function_call(function_name: str, arguments: dict) -> str:
     """
-    Execute an LLM-generated function call through Aegis safety filtering.
+    Execute an LLM-generated function call through Kirra safety filtering.
 
     This is the core integration point: every function call the model requests
-    goes through check_action_with_aegis() before any hardware interaction.
+    goes through check_action_with_kirra() before any hardware interaction.
     Returns a string result to feed back to the model.
     """
     print(f"\n[AGENT] Model requested: {function_name}({arguments})")
@@ -160,17 +160,17 @@ def execute_function_call(function_name: str, arguments: dict) -> str:
         }
 
         try:
-            decision = check_action_with_aegis(
+            decision = check_action_with_kirra(
                 action_type="cmd_vel",
                 target_node=target_node,
                 risk_class="kinetic_write",
                 payload=payload,
             )
         except requests.exceptions.RequestException as exc:
-            print(f"  [AEGIS] Unreachable: {exc}. Treating as DENY.")
-            return "Action denied: Aegis safety filter unavailable."
+            print(f"  [KIRRA] Unreachable: {exc}. Treating as DENY.")
+            return "Action denied: Kirra safety filter unavailable."
 
-        print(f"  [AEGIS] Decision: allowed={decision['allowed']}, "
+        print(f"  [KIRRA] Decision: allowed={decision['allowed']}, "
               f"reason={decision['reason']}, "
               f"posture={decision['posture_at_evaluation']}, "
               f"request_id={decision['request_id']}")
@@ -204,17 +204,17 @@ def execute_function_call(function_name: str, arguments: dict) -> str:
         target_node = arguments.get("target_node", "sensor_01")
 
         try:
-            decision = check_action_with_aegis(
+            decision = check_action_with_kirra(
                 action_type="read_telemetry",
                 target_node=target_node,
                 risk_class="read",
                 payload={},
             )
         except requests.exceptions.RequestException as exc:
-            print(f"  [AEGIS] Unreachable: {exc}. Treating as DENY.")
-            return "Telemetry read denied: Aegis safety filter unavailable."
+            print(f"  [KIRRA] Unreachable: {exc}. Treating as DENY.")
+            return "Telemetry read denied: Kirra safety filter unavailable."
 
-        print(f"  [AEGIS] Decision: allowed={decision['allowed']}, "
+        print(f"  [KIRRA] Decision: allowed={decision['allowed']}, "
               f"reason={decision['reason']}, "
               f"posture={decision['posture_at_evaluation']}")
 
@@ -288,7 +288,7 @@ def run_agent_loop_with_real_openai(user_prompt: str) -> None:
 # ---------------------------------------------------------------------------
 
 class PostureStreamSubscriber:
-    """Background thread that subscribes to the Aegis SSE posture stream."""
+    """Background thread that subscribes to the Kirra SSE posture stream."""
 
     def __init__(self):
         self.current_posture = "Unknown"
@@ -305,10 +305,10 @@ class PostureStreamSubscriber:
     def _run(self):
         try:
             resp = requests.get(
-                f"{AEGIS_URL}/system/posture/stream",
+                f"{KIRRA_URL}/system/posture/stream",
                 headers={
-                    "Authorization": f"Bearer {AEGIS_TOKEN}",
-                    "x-aegis-client-id": AEGIS_CLIENT_ID,
+                    "Authorization": f"Bearer {KIRRA_TOKEN}",
+                    "x-kirra-client-id": KIRRA_CLIENT_ID,
                     "Accept": "text/event-stream",
                 },
                 stream=True,
@@ -340,20 +340,20 @@ class PostureStreamSubscriber:
 
 def demo_mocked_llm_output():
     """
-    Demonstrates the Aegis safety filter without requiring OpenAI credentials.
+    Demonstrates the Kirra safety filter without requiring OpenAI credentials.
 
     Simulates three scenarios that an LLM agent might generate:
       1. A valid motion command (should be allowed in Nominal posture)
       2. A hallucinated extreme velocity (should be denied: KINEMATIC_ENVELOPE_BREACH)
       3. A hallucinated unknown action type (should be denied: UNKNOWN_ACTION_TYPE)
 
-    NOTE: This demo connects to a live Aegis instance at AEGIS_URL.
-    If Aegis is not running, each check_action_with_aegis() call will raise
+    NOTE: This demo connects to a live Kirra instance at KIRRA_URL.
+    If Kirra is not running, each check_action_with_kirra() call will raise
     a connection error, which is caught and printed gracefully.
     """
     print("=" * 60)
-    print("Aegis Action Filter Demo (Mocked LLM Output)")
-    print(f"Aegis URL: {AEGIS_URL}")
+    print("Kirra Action Filter Demo (Mocked LLM Output)")
+    print(f"Kirra URL: {KIRRA_URL}")
     print("=" * 60)
 
     # Mocked LLM function calls — simulating what GPT-4o might generate
@@ -401,7 +401,7 @@ def demo_mocked_llm_output():
 
     print("\n" + "=" * 60)
     print("Demo complete.")
-    print("Check /system/audit/export on your Aegis instance to see")
+    print("Check /system/audit/export on your Kirra instance to see")
     print("all decisions logged to the SHA-256 hash-chained audit ledger.")
     print("=" * 60)
 
@@ -409,7 +409,7 @@ def demo_mocked_llm_output():
 if __name__ == "__main__":
     if USE_REAL_OPENAI:
         # Real OpenAI mode: uses GPT function calling, requires OPENAI_API_KEY
-        print("Starting Aegis-filtered robot agent with real OpenAI...")
+        print("Starting Kirra-filtered robot agent with real OpenAI...")
 
         # Subscribe to posture stream in background for proactive posture awareness
         posture_stream = PostureStreamSubscriber()

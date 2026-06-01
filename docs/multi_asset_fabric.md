@@ -4,7 +4,7 @@
 
 ### The Problem
 
-The original Aegis runtime was designed around a single-fleet model: one DAG of trust nodes, one posture state, one set of kinematic limits. This works well when all devices operate under a unified trust boundary, but modern deployments involve heterogeneous physical systems — autonomous vehicles, warehouse robots, drones, industrial controllers, and infrastructure nodes — each with radically different safety envelopes, operational roles, and failure modes.
+The original Kirra runtime was designed around a single-fleet model: one DAG of trust nodes, one posture state, one set of kinematic limits. This works well when all devices operate under a unified trust boundary, but modern deployments involve heterogeneous physical systems — autonomous vehicles, warehouse robots, drones, industrial controllers, and infrastructure nodes — each with radically different safety envelopes, operational roles, and failure modes.
 
 A single `FleetPosture` cannot meaningfully distinguish between a 35 m/s autonomous highway vehicle and a 0.5 m/s warehouse robot. Applying the same lockout or degraded state to both simultaneously ignores the operational reality that a slow-moving robot has very different consequences from a high-speed AV going LockedOut.
 
@@ -185,7 +185,7 @@ The log is append-only and all entries are kept in memory during runtime. For du
 
 ## API Reference
 
-All fabric endpoints require Bearer token authentication (`AEGIS_ADMIN_TOKEN`).
+All fabric endpoints require Bearer token authentication (`KIRRA_ADMIN_TOKEN`).
 
 ### POST /fabric/assets/register
 

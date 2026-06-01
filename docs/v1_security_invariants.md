@@ -1,6 +1,6 @@
-# Aegis v1.0.0 — Full Security Invariant Audit Specification
+# Kirra v1.0.0 — Full Security Invariant Audit Specification
 
-This document establishes the absolute security invariants of the Aegis distributed legitimacy engine. Every operational pathway, optimization, and recovery procedure must satisfy these ten structural properties. Any deviation or shortcut constitutes a fatal security failure.
+This document establishes the absolute security invariants of the Kirra distributed legitimacy engine. Every operational pathway, optimization, and recovery procedure must satisfy these ten structural properties. Any deviation or shortcut constitutes a fatal security failure.
 
 ---
 
@@ -27,7 +27,7 @@ This document establishes the absolute security invariants of the Aegis distribu
 ## 4. PassiveStandby Read-Only Enforcement
 * **Invariant**: Nodes configured as replicas must be structurally incapable of introducing state mutations or data divergence.
 * **Specification**:
-  * On service initialization, if `AEGIS_VERIFIER_MODE` resolves to `PassiveStandby`, the gatekeeper helper `require_active_mode` must evaluate to a hard error boundary.
+  * On service initialization, if `KIRRA_VERIFIER_MODE` resolves to `PassiveStandby`, the gatekeeper helper `require_active_mode` must evaluate to a hard error boundary.
   * Any request attempting to hit `register_node`, `issue_challenge`, `verify_attestation`, or `register_dependencies` on a standby node must fail immediately, returning `503 Service Unavailable` without allocating internal query or execution resources.
 
 ## 5. Write-Through Persistence Ordering

@@ -1,7 +1,7 @@
-# Aegis v2.0.0 — AV Kinematics Flight Envelope Protection
+# Kirra v2.0.0 — AV Kinematics Flight Envelope Protection
 
 This document freezes the deterministic, physical safety invariants used to gate motion
-planning outputs before they reach vehicle actuators. Aegis does not generate trajectories;
+planning outputs before they reach vehicle actuators. Kirra does not generate trajectories;
 it intercepts proposed commands and either passes, clamps, or drops them based on hard
 physical contracts.
 
@@ -9,12 +9,12 @@ physical contracts.
 
 ## 1. Safety Kernel Invariants
 
-Aegis operates on an uncompromising execution contract for every `ProposedVehicleCommand`
+Kirra operates on an uncompromising execution contract for every `ProposedVehicleCommand`
 that arrives at the actuator policy layer:
 
-- **Passive Monitoring vs. Active Enforcement**: Aegis does not generate trajectories; it
+- **Passive Monitoring vs. Active Enforcement**: Kirra does not generate trajectories; it
   intercepts proposed `CmdVel` or actuator targets. The perception and planning stacks own
-  their own reliability; Aegis owns admissibility.
+  their own reliability; Kirra owns admissibility.
 
 - **Fail-Closed Clamping**: Commands exceeding hard limits are either smoothly clamped to
   the maximum safe boundary (`EnforceAction::Clamp*`) or dropped entirely
@@ -101,16 +101,16 @@ safe haven.
 
 These three concepts are distinct:
 
-- **Safe Stop** (`LockedOut`): Commanded by Aegis when the fleet posture is `LockedOut`.
+- **Safe Stop** (`LockedOut`): Commanded by Kirra when the fleet posture is `LockedOut`.
   All actuator write commands are dropped. The vehicle transitions to a controlled halt.
   Not a crash stop — braking is still governed by `max_brake_mps2`.
 
 - **MRC (Minimal Risk Condition)** (`Degraded`): The vehicle continues to operate but under
-  the `mrc_fallback_profile()`. Planning continues; Aegis enforces the tighter envelope.
+  the `mrc_fallback_profile()`. Planning continues; Kirra enforces the tighter envelope.
   The system can recover to `Nominal` if degraded nodes recover.
 
 - **Emergency Brake** (external, out of scope): A separate hard-wired electrical interlock
-  layer. Aegis does not replace this; it operates upstream of it.
+  layer. Kirra does not replace this; it operates upstream of it.
 
 ---
 
@@ -124,7 +124,7 @@ module and belong in other system layers:
 - **Traffic law compliance** — behavioral planning stack responsibility
 - **Emergency braking (hardware interlock)** — physical brake controller, not software
 
-Aegis enforces that the command is *physically admissible for the vehicle platform*. Whether
+Kirra enforces that the command is *physically admissible for the vehicle platform*. Whether
 the command is *contextually correct for the environment* is the planner's problem.
 
 ---

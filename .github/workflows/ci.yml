@@ -127,6 +127,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install ONNX Runtime v1.24.2 (cross-backend equivalence test)
+        # The OpenVINO test suite includes a cross-backend equivalence
+        # test (`ort_ov_output_equivalence_on_mnist`) that loads the SAME
+        # MNIST model through parko-onnx's `OrtBackend` and compares its
+        # output to OpenVINO's. That backend dlopens libonnxruntime.so at
+        # runtime (ort `load-dynamic`), so this job needs the ONNX runtime
+        # too — identical install to the parko-onnx job. Without it the
+        # equivalence test panics ("Is libonnxruntime.so installed?").
+        run: |
+          set -euo pipefail
+          curl -L -o /tmp/onnxruntime-1.24.2.tgz \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz
+          mkdir -p "$HOME/.local/onnxruntime"
+          tar -xzf /tmp/onnxruntime-1.24.2.tgz \
+            -C "$HOME/.local/onnxruntime" --strip-components=1
+          test -f "$HOME/.local/onnxruntime/lib/libonnxruntime.so" \
+            || (echo "libonnxruntime.so missing after install"; exit 1)
       - name: Install OpenVINO runtime (Intel apt repo, 2024.x)
         # The `openvino = "0.11"` crate links against OpenVINO 2024.x.
         # Intel ships a Debian package via their public apt repo —
@@ -145,11 +162,23 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/intel-openvino-2024.list
           sudo apt-get update
           sudo apt-get install -y openvino-2024.5.0
-          # Find the C library — the openvino-finder probes the
-          # standard install paths automatically, but we sanity-check
-          # before running the tests so a missing lib produces a
-          # clear CI failure rather than a panic deep in a test.
-          find /opt/intel -name "libopenvino_c.so*" -print | head -5
+          # Sanity-check the C runtime BEFORE running the tests so a
+          # missing lib is a clear failure here rather than a panic deep
+          # in a test. The apt/DEB package installs to the system FHS
+          # location /usr/lib/x86_64-linux-gnu — NOT /opt/intel, which is
+          # only created by the standalone OpenVINO archive installer.
+          # /usr/lib/x86_64-linux-gnu is exactly what openvino-finder
+          # (SYSTEM_INSTALLATION_DIRECTORIES, OpenVINO >= 2022.3) probes by
+          # default, so no LD_LIBRARY_PATH / OPENVINO_* env var is needed
+          # at test time.
+          if ! ls /usr/lib/x86_64-linux-gnu/libopenvino_c.so* >/dev/null 2>&1; then
+            echo "::error::libopenvino_c.so not found in /usr/lib/x86_64-linux-gnu after apt install"
+            echo "Installed openvino shared objects (for diagnosis):"
+            dpkg -L openvino-2024.5.0 | grep -E 'libopenvino.*\.so' || true
+            exit 1
+          fi
+          echo "OpenVINO C runtime present:"
+          ls -1 /usr/lib/x86_64-linux-gnu/libopenvino_c.so*
       - name: parko-openvino tests
         # OpenVINO-dependent. Same flakiness disposition as
         # parko-onnx: if this job becomes unreliable in CI (Intel apt
@@ -158,12 +187,16 @@ jobs:
         # remain gating regardless.
         working-directory: parko
         env:
-          # The openvino-finder crate uses LD_LIBRARY_PATH /
-          # OPENVINO_LIB_PATH when set; the apt install lands the
-          # library at /opt/intel/openvino/runtime/lib/intel64/.
-          LD_LIBRARY_PATH: /opt/intel/openvino/runtime/lib/intel64
-          OPENVINO_LIB_PATH: /opt/intel/openvino/runtime/lib/intel64
+          # ONNX runtime for the cross-backend equivalence test (parko-onnx
+          # `OrtBackend`, ort load-dynamic). OpenVINO itself needs NO env
+          # var: the apt/DEB package lands libopenvino_c.so in
+          # /usr/lib/x86_64-linux-gnu, which openvino-finder probes by
+          # default. (The previous /opt/intel paths were the archive
+          # installer's layout, which apt never creates — that stale
+          # assumption is what broke this job.)
+          ORT_DYLIB_PATH: ${{ env.HOME }}/.local/onnxruntime/lib/libonnxruntime.so
         run: cargo test -p parko-openvino
+
 
   static-analysis:
     name: Static Analysis (ISO 26262)

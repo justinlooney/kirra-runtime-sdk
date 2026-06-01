@@ -1,12 +1,12 @@
-# Aegis v1.0.0 — Release Notes and Architecture Specification
+# Kirra v1.0.0 — Release Notes and Architecture Specification
 
-This document serves as the definitive release announcement and architectural specification for the Aegis v1.0.0 Stable Control Plane baseline. It establishes the programmatic lineage, structural topology mappings, and core engineering philosophy behind the production-hardened legitimacy platform.
+This document serves as the definitive release announcement and architectural specification for the Kirra v1.0.0 Stable Control Plane baseline. It establishes the programmatic lineage, structural topology mappings, and core engineering philosophy behind the production-hardened legitimacy platform.
 
 ---
 
 ## 1. Release Declaration
 
-Aegis v1.0.0 establishes a production-grade distributed legitimacy control plane combining:
+Kirra v1.0.0 establishes a production-grade distributed legitimacy control plane combining:
 - TPM-backed cryptographic attestation
 - Recursive DAG trust propagation
 - Fail-closed gateway enforcement
@@ -15,13 +15,13 @@ Aegis v1.0.0 establishes a production-grade distributed legitimacy control plane
 - Active/passive operational redundancy
 - Atomic disaster recovery restoration
 
-> **The Aegis Thesis**: The system does not assume trust. The system continuously proves trust.
+> **The Kirra Thesis**: The system does not assume trust. The system continuously proves trust.
 
 ---
 
 ## 2. Milestone Lineage
 
-The evolution of the Aegis codebase through its iterative milestones tracks a deliberate, uncompromising path toward architectural hardening. Every milestone preserved fail-closed semantics as a non-negotiable invariant.
+The evolution of the Kirra codebase through its iterative milestones tracks a deliberate, uncompromising path toward architectural hardening. Every milestone preserved fail-closed semantics as a non-negotiable invariant.
 
 | Version | Capability Introduced |
 | :--- | :--- |
@@ -64,7 +64,7 @@ The topology below describes the exact, unidirectional cryptographic validation 
            │
            ▼
 ┌──────────────────────────┐
-│      Aegis Verifier      │
+│      Kirra Verifier      │
 ├──────────────────────────┤
 │  Nonce Validation        │
 │  Signature Verification  │
@@ -120,9 +120,9 @@ The topology below describes the exact, unidirectional cryptographic validation 
 
 ## 6. Failure Philosophy
 
-Aegis is explicitly engineered to prioritize platform legitimacy above all else. When an anomaly occurs, the control-plane platform defaults to a defensive posture.
+Kirra is explicitly engineered to prioritize platform legitimacy above all else. When an anomaly occurs, the control-plane platform defaults to a defensive posture.
 
-Aegis is engineered to fail closed. When uncertainty exists:
+Kirra is engineered to fail closed. When uncertainty exists:
  * Permissions collapse
  * Mutations halt
  * Topology propagation stops
@@ -160,7 +160,7 @@ To ensure strict engineering discipline and keep code complexities tightly bound
  * **Self-healing topology rewriting**: Topology modifications require administrative token authentication.
  * **Distributed write replication**: State synchronization is managed via JSON data transfers.
 
-> *Aegis v1.0.0 prioritizes deterministic control, auditability, and fail-closed operation over autonomous coordination complexity.*
+> *Kirra v1.0.0 prioritizes deterministic control, auditability, and fail-closed operation over autonomous coordination complexity.*
 
 ---
 
@@ -179,4 +179,4 @@ The architectural groundwork laid in v1.0.0 allows a clear path forward for subs
 
 ## 10. Final Release Statement
 
-Aegis v1.0.0 establishes a deterministic, cryptographically anchored legitimacy fabric for distributed operational systems. Trust is continuously measured. Authorization is continuously re-evaluated. Failure collapses safely.
+Kirra v1.0.0 establishes a deterministic, cryptographically anchored legitimacy fabric for distributed operational systems. Trust is continuously measured. Authorization is continuously re-evaluated. Failure collapses safely.

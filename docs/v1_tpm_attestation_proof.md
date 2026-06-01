@@ -1,14 +1,14 @@
-# Aegis v1.0.0 — TPM Attestation Verification Specification
+# Kirra v1.0.0 — TPM Attestation Verification Specification
 
-This document provides the definitive mathematical and structural specification for the Aegis v1.0.0 Trusted Platform Module (TPM) remote attestation architecture. It details the precise tracking mechanics that ensure the control plane relies exclusively on unmockable, cryptographically validated platform state assertions rather than transient network configurations.
+This document provides the definitive mathematical and structural specification for the Kirra v1.0.0 Trusted Platform Module (TPM) remote attestation architecture. It details the precise tracking mechanics that ensure the control plane relies exclusively on unmockable, cryptographically validated platform state assertions rather than transient network configurations.
 
 ---
 
 ## 1. Attestation Trust Model
 
-The Aegis security model operates on a zero-trust network posture. Network layer identifiers (such as IP addresses, MAC coordinates, or transport-layer sessions) are treated as hostile, modifiable vectors.
+The Kirra security model operates on a zero-trust network posture. Network layer identifiers (such as IP addresses, MAC coordinates, or transport-layer sessions) are treated as hostile, modifiable vectors.
 
-> **Root Security Invariant**: Aegis does not trust network identity. Aegis trusts measured platform state.
+> **Root Security Invariant**: Kirra does not trust network identity. Kirra trusts measured platform state.
 
 Trust is established by building a rigid cryptographic chain of custody from physical silicon registers up to cluster-wide policy enforcement:
 

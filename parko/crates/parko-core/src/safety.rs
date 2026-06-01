@@ -4,7 +4,7 @@ use crate::commands::ControlCommand;
 
 /// Operational posture passed to safety governors. Parallel to but
 /// independent of any specific safety system's posture vocabulary.
-/// parko-core owns this type; adapter crates (e.g., parko-aegis) map
+/// parko-core owns this type; adapter crates (e.g., parko-kirra) map
 /// it to their respective external types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafetyPosture {

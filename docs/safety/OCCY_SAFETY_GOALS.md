@@ -9,7 +9,7 @@ with an *explicit, traceable* derivation.
 
 **Relationship to AEGIS-SG-001.** This document does NOT supersede
 `docs/safety/SAFETY_GOALS.md` (AEGIS-SG-001), which defines the broader
-16-goal scheme covering the full Aegis kernel scope (AV + UGV + robot + drone +
+16-goal scheme covering the full Kirra kernel scope (AV + UGV + robot + drone +
 industrial protocols + fabric). This document is the planner-focused Occy
 derivation; the two coexist. See §6.2 for the cross-mapping.
 
@@ -228,7 +228,7 @@ action).**
 ### 6.2 Mapping to AEGIS-SG-001 (preexisting kernel safety goals)
 
 The preexisting `docs/safety/SAFETY_GOALS.md` (AEGIS-SG-001 v1.0.0) defines a
-broader 16-goal scheme covering the full Aegis kernel scope. The Occy
+broader 16-goal scheme covering the full Kirra kernel scope. The Occy
 derivation here is a planner-focused subset with different numbering. Both
 schemes coexist; this table shows the correspondence so an assessor (or a code
 reviewer reading a `Safety:` traceability tag) can navigate either way.

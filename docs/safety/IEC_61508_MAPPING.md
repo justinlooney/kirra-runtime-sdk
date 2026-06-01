@@ -1,4 +1,4 @@
-# Aegis — IEC 61508 SIL 3 Preliminary Claim Mapping
+# Kirra — IEC 61508 SIL 3 Preliminary Claim Mapping
 
 Document ID: AEGIS-61508-001
 Version: 1.0.0
@@ -10,12 +10,12 @@ Date: 2026-05-23
 
 ## 1. Purpose
 
-This document provides a preliminary mapping of Aegis safety functions to IEC 61508 requirements for a Safety Integrity Level 3 (SIL 3) claim using the Safety Element out of Context (SEooC) model defined in IEC 61508-2 Annex B.
+This document provides a preliminary mapping of Kirra safety functions to IEC 61508 requirements for a Safety Integrity Level 3 (SIL 3) claim using the Safety Element out of Context (SEooC) model defined in IEC 61508-2 Annex B.
 
 This is a pre-assessment document intended to support:
 1. Scoping discussions with a Functional Safety assessment body (Exida, TUV SUD, SGS)
 2. Gap identification before committing to formal certification
-3. Evidence that the Aegis development approach is aligned with IEC 61508
+3. Evidence that the Kirra development approach is aligned with IEC 61508
 
 This document does not constitute a formal SIL claim. A formal claim requires an independent assessment body to verify compliance.
 
@@ -23,19 +23,19 @@ This document does not constitute a formal SIL claim. A formal claim requires an
 
 ## 2. Item Definition and Scope
 
-**E/E/PE Safety-related System:** Aegis Runtime Safety Kernel (`aegis-runtime-sdk` v1.5.0)
+**E/E/PE Safety-related System:** Kirra Runtime Safety Kernel (`kirra-runtime-sdk` v1.5.0)
 
 **Type of system:** Software SEooC — Safety Element out of Context
 
-Under the SEooC model, Aegis is certified as a software component with assumed safety requirements (ASRs). Integrators perform in-context verification to confirm ASRs are satisfied in their specific deployment.
+Under the SEooC model, Kirra is certified as a software component with assumed safety requirements (ASRs). Integrators perform in-context verification to confirm ASRs are satisfied in their specific deployment.
 
 **System boundary:**
-- In scope: All safety functions implemented in `aegis-runtime-sdk`, specifically the enforcement pipeline, posture derivation, and trust graph layer
+- In scope: All safety functions implemented in `kirra-runtime-sdk`, specifically the enforcement pipeline, posture derivation, and trust graph layer
 - Out of scope: Hardware platform, operating system, upstream AI planner, physical actuators
 
 **Claimed SIL:** SIL 3
 
-**Justification for SIL 3:** Based on the risk assessment in AEGIS-HARA-001, the highest-ASIL hazards (H-001, H-002, H-003, H-006, H-009, H-012) are rated ASIL-D under ISO 26262. The IEC 61508 equivalent is SIL 3. A SIL 4 claim would require continuous mode operation with a PFH < 10^-8/h; the command-on-demand nature of Aegis enforcement places it in high-demand mode with PFH requirements, where SIL 3 (PFH < 10^-7/h) is the appropriate target.
+**Justification for SIL 3:** Based on the risk assessment in AEGIS-HARA-001, the highest-ASIL hazards (H-001, H-002, H-003, H-006, H-009, H-012) are rated ASIL-D under ISO 26262. The IEC 61508 equivalent is SIL 3. A SIL 4 claim would require continuous mode operation with a PFH < 10^-8/h; the command-on-demand nature of Kirra enforcement places it in high-demand mode with PFH requirements, where SIL 3 (PFH < 10^-7/h) is the appropriate target.
 
 ---
 
@@ -43,7 +43,7 @@ Under the SEooC model, Aegis is certified as a software component with assumed s
 
 ### SF-001: Motion Command Velocity Clamping [SIL 3]
 
-**Description:** Aegis shall clamp the linear velocity of any motion command to the active kinematic contract's max_speed_mps before forwarding to the actuator.
+**Description:** Kirra shall clamp the linear velocity of any motion command to the active kinematic contract's max_speed_mps before forwarding to the actuator.
 
 **Implementation:** `validate_vehicle_command()` Priority 2 check in `src/gateway/kinematics_contract.rs`
 
@@ -59,7 +59,7 @@ Under the SEooC model, Aegis is certified as a software component with assumed s
 
 ### SF-002: Lateral Acceleration Constraint [SIL 3]
 
-**Description:** Aegis shall compute bicycle model lateral acceleration for every steering command and clamp steering angle when lateral acceleration would exceed max_lateral_accel_mps2.
+**Description:** Kirra shall compute bicycle model lateral acceleration for every steering command and clamp steering angle when lateral acceleration would exceed max_lateral_accel_mps2.
 
 **Implementation:** `validate_vehicle_command()` Priority 6 check — `lateral_accel = velocity^2 * tan(steering_deg.to_radians()) / wheelbase_m`
 
@@ -73,7 +73,7 @@ Under the SEooC model, Aegis is certified as a software component with assumed s
 
 ### SF-003: Posture-Gated Command Routing [SIL 3]
 
-**Description:** Aegis shall deny all WriteState and SystemMutation commands when fleet posture is Degraded, and deny all commands when fleet posture is LockedOut or the posture cache is stale.
+**Description:** Kirra shall deny all WriteState and SystemMutation commands when fleet posture is Degraded, and deny all commands when fleet posture is LockedOut or the posture cache is stale.
 
 **Implementation:** `should_route_command()` in `src/posture_cache.rs`
 
@@ -90,7 +90,7 @@ Under the SEooC model, Aegis is certified as a software component with assumed s
 
 ### SF-004: NaN/Inf Rejection [SIL 2]
 
-**Description:** Aegis shall reject any motion command containing NaN or infinite values before any arithmetic evaluation.
+**Description:** Kirra shall reject any motion command containing NaN or infinite values before any arithmetic evaluation.
 
 **Implementation:** `validate_vehicle_command()` Priority 0 check — `!field.is_finite()` for all f64 fields
 
@@ -102,7 +102,7 @@ Under the SEooC model, Aegis is certified as a software component with assumed s
 
 ### SF-005: Unknown Command Denial [SIL 3]
 
-**Description:** Aegis shall deny any action classified as OperationalCommand::Unknown in all fleet posture states, before posture evaluation.
+**Description:** Kirra shall deny any action classified as OperationalCommand::Unknown in all fleet posture states, before posture evaluation.
 
 **Implementation:** `should_route_command()` early return — `if command == OperationalCommand::Unknown { return false; }` in `src/posture_cache.rs`
 
@@ -114,7 +114,7 @@ Under the SEooC model, Aegis is certified as a software component with assumed s
 
 ### SF-006: Cross-Asset Trust Propagation [SIL 3]
 
-**Description:** In a Multi-Asset Fabric deployment, when a leader asset transitions to LockedOut, Aegis shall propagate Degraded posture to all follower assets within one fabric recalculation cycle.
+**Description:** In a Multi-Asset Fabric deployment, when a leader asset transitions to LockedOut, Kirra shall propagate Degraded posture to all follower assets within one fabric recalculation cycle.
 
 **Implementation:** `FabricRouter::propagate_cross_asset_trust()` in `src/fabric/router.rs` — 4 propagation rules (convoy, drone-controller, infrastructure, warehouse-robot)
 
@@ -128,7 +128,7 @@ IEC 61508-2 Table 2 and 3 define architectural constraints for SIL claims based 
 
 ### Software Architecture (IEC 61508-3 Clause 7.4)
 
-| Requirement | Aegis Implementation | Compliance |
+| Requirement | Kirra Implementation | Compliance |
 |-------------|---------------------|------------|
 | Modular design | Functions decomposed into layers (Trust Graph, Posture Derivation, Enforcement) | Compliant |
 | Structured programming | Rust ownership model enforces structured control flow; no goto, no unsafe on critical paths | Compliant |
@@ -139,7 +139,7 @@ IEC 61508-2 Table 2 and 3 define architectural constraints for SIL claims based 
 
 ### Avoidance of Systematic Failures (IEC 61508-3 Clause 7.4.4)
 
-| Technique | Aegis Implementation |
+| Technique | Kirra Implementation |
 |-----------|---------------------|
 | Defensive programming (B.2.2) | Fail-closed on every error path; LockedOut as default unknown posture |
 | Modular approach (B.2.4) | Three-layer architecture; each layer independently testable |
@@ -153,7 +153,7 @@ IEC 61508-2 Table 2 and 3 define architectural constraints for SIL claims based 
 
 ## 5. Software Development Process (IEC 61508-3 Part 6)
 
-| Phase | IEC 61508-3 Requirement | Aegis Status |
+| Phase | IEC 61508-3 Requirement | Kirra Status |
 |-------|------------------------|--------------|
 | Software requirements specification | Safety goals (AEGIS-SG-001) + technical requirements (AEGIS-RTM-001) | Complete (Draft) |
 | Software architecture design | Three-layer safety architecture (AEGIS-SA-001) | Complete (Draft) |
@@ -168,17 +168,17 @@ IEC 61508-2 Table 2 and 3 define architectural constraints for SIL claims based 
 
 ## 6. Assumed Safety Requirements (SEooC)
 
-For the SEooC model, Aegis declares the following Assumed Safety Requirements (ASRs) that integrators must verify in-context:
+For the SEooC model, Kirra declares the following Assumed Safety Requirements (ASRs) that integrators must verify in-context:
 
 | ASR ID | Assumption | Integrator Verification Required |
 |--------|------------|----------------------------------|
-| ASR-001 | The upstream AI planner sends commands in the ProposedVehicleCommand JSON schema via HTTP POST to the Aegis enforcement endpoint | Integrator documents the interface contract between planner and Aegis |
-| ASR-002 | AEGIS_ADMIN_TOKEN and AEGIS_SUPERVISOR_RESET_KEY are provisioned as non-empty environment variables before startup | Integrator documents key provisioning procedure |
+| ASR-001 | The upstream AI planner sends commands in the ProposedVehicleCommand JSON schema via HTTP POST to the Kirra enforcement endpoint | Integrator documents the interface contract between planner and Kirra |
+| ASR-002 | KIRRA_ADMIN_TOKEN and KIRRA_SUPERVISOR_RESET_KEY are provisioned as non-empty environment variables before startup | Integrator documents key provisioning procedure |
 | ASR-003 | The kinematic contract parameters (max_speed_mps, max_lateral_accel_mps2, wheelbase_m) are correctly configured for the specific platform | Integrator provides vehicle/robot specification and confirms parameters |
 | ASR-004 | The deployment platform provides a monotonic clock with resolution sufficient for AV_WATCHDOG_SWEEP_MS (100ms) operation | Integrator confirms platform clock specification |
 | ASR-005 | The SQLite database is on durable storage; filesystem failure is covered by the integrator's platform FMEA | Integrator documents storage reliability |
-| ASR-006 | Network latency between the AI planner and Aegis is < 50ms under normal operation | Integrator measures and documents network latency |
-| ASR-007 | The Aegis process is supervised by a process monitor (systemd, QNX resource manager, or equivalent) that restarts it on crash | Integrator documents process supervision configuration |
+| ASR-006 | Network latency between the AI planner and Kirra is < 50ms under normal operation | Integrator measures and documents network latency |
+| ASR-007 | The Kirra process is supervised by a process monitor (systemd, QNX resource manager, or equivalent) that restarts it on crash | Integrator documents process supervision configuration |
 
 ---
 
@@ -209,7 +209,7 @@ For the SEooC model, Aegis declares the following Assumed Safety Requirements (A
 
 | Field | Value |
 |-------|-------|
-| Prepared by | Aegis Engineering |
+| Prepared by | Kirra Engineering |
 | Review status | Pre-assessment (not yet reviewed by assessment body) |
 | Next review | 2026-11-23 |
 | Supersedes | None |

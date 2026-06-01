@@ -1,4 +1,4 @@
-# Aegis — ASTM F3269 Run Time Assurance Mapping
+# Kirra — ASTM F3269 Run Time Assurance Mapping
 
 Document ID: AEGIS-F3269-001
 Version: 1.0.0
@@ -12,15 +12,15 @@ Date: 2026-05-23
 
 ASTM F3269-21 defines a methodology for Run Time Assurance (RTA) monitoring of autonomous and semi-autonomous systems. RTA provides a runtime safety monitor that bounds the behavior of a primary autonomous function (e.g., an AI navigation stack) and reverts to a safe backup control law when the primary function operates outside proven-safe bounds.
 
-Aegis is architecturally an RTA monitor. This document maps each F3269 concept to the corresponding Aegis component, confirming that Aegis satisfies the intent of the standard.
+Kirra is architecturally an RTA monitor. This document maps each F3269 concept to the corresponding Kirra component, confirming that Kirra satisfies the intent of the standard.
 
 ---
 
 ## 2. Terminology Mapping
 
-| ASTM F3269 Term | Aegis Implementation | Notes |
+| ASTM F3269 Term | Kirra Implementation | Notes |
 |-----------------|---------------------|-------|
-| RTA Monitor | Aegis Safety Kernel (`aegis_verifier_service` binary + `validate_vehicle_command()` + `should_route_command()`) | The Aegis process is the monitor — it intercepts every proposed command and gates it |
+| RTA Monitor | Kirra Safety Kernel (`kirra_verifier_service` binary + `validate_vehicle_command()` + `should_route_command()`) | The Kirra process is the monitor — it intercepts every proposed command and gates it |
 | Primary Function (PF) | AI Planner / Autonomous Navigation Stack (e.g., Nav2, LLM-based controller, CARLA autopilot) | The upstream system generating ProposedVehicleCommand JSON payloads |
 | Backup Control Law (BCL) | MRC Fallback Profile (`VehicleKinematicsContract::mrc_fallback_profile()`) | Applied automatically when FleetPosture transitions to Degraded |
 | Safe Set / Safe Region | FleetPosture::Nominal with Nominal Reference Profile active | The region of operation where the primary function is within verified bounds |
@@ -51,7 +51,7 @@ Aegis is architecturally an RTA monitor. This document maps each F3269 concept t
                              │ POST /actuator/motion/command
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   RTA MONITOR (Aegis)                        │
+│                   RTA MONITOR (Kirra)                        │
 │                                                              │
 │  1. Posture Gate (should_route_command)                      │
 │     LockedOut → DenyAll                                      │
@@ -135,12 +135,12 @@ These invariants are verified by proptest properties in `src/gateway/kinematics_
 
 ## 6. Claim Against F3269 Requirements
 
-| F3269 Requirement | Aegis Claim | Evidence |
+| F3269 Requirement | Kirra Claim | Evidence |
 |-------------------|-------------|----------|
 | RTA.1: The RTA monitor shall detect when the primary function exceeds the safe set | validate_vehicle_command() detects speed, acceleration, steering, and NaN/Inf exceedances synchronously on every command | src/gateway/kinematics_contract.rs, 306 passing tests |
 | RTA.2: The RTA monitor shall switch to the backup control law within the fault tolerant time interval | Posture transition to Degraded applies MRC profile to next command (synchronous, per-command FTTI) | FTTI for kinematic enforcement: per-command (< 1ms); FTTI for posture: AV_TELEMETRY_TIMEOUT_MS = 2000ms |
 | RTA.3: The backup control law shall keep the system within the recovery region | MRC Fallback Profile max_speed = 5.0 m/s is within the proven-safe region for all vehicle types | VehicleKinematicsContract::mrc_fallback_profile() |
-| RTA.4: The RTA monitor shall be independent of the primary function | Aegis is a separate process; primary function has no write access to Aegis state; admin token required for all mutations | Architectural separation; require_admin_token on all mutation routes |
+| RTA.4: The RTA monitor shall be independent of the primary function | Kirra is a separate process; primary function has no write access to Kirra state; admin token required for all mutations | Architectural separation; require_admin_token on all mutation routes |
 | RTA.5: The RTA monitor shall fail to a safe state | Stale posture cache → LockedOut (all commands denied). Absent env token → 503 fail-closed. Empty posture cache → LockedOut. Poisoned RwLock → LockedOut. | src/posture_cache.rs:should_route_command, AEGIS-SG-005 |
 | RTA.6: The RTA monitor shall record evidence of monitoring decisions | Every command evaluation generates an audit entry in the SHA-256 hash-chained audit log with Ed25519 signature | src/audit_chain.rs, AEGIS-SG-010 |
 
@@ -160,6 +160,6 @@ These invariants are verified by proptest properties in `src/gateway/kinematics_
 
 | Field | Value |
 |-------|-------|
-| Prepared by | Aegis Engineering |
+| Prepared by | Kirra Engineering |
 | Next review | 2026-11-23 |
 | Supersedes | None |

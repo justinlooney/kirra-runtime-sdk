@@ -1,6 +1,6 @@
-# Aegis Safety Kernel — Installation Guide
+# Kirra Safety Kernel — Installation Guide
 
-Aegis is a deterministic safety enforcement kernel for autonomous systems.
+Kirra is a deterministic safety enforcement kernel for autonomous systems.
 It intercepts motion commands from AI planners and enforces hard physical
 limits before they reach actuators — preventing unsafe commands from reaching
 robots, vehicles, drones, or industrial equipment regardless of what the AI
@@ -31,7 +31,7 @@ instructs.
 ## Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/justinlooney/aegis/master/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/justinlooney/kirra-runtime-sdk/master/install.sh | sudo bash
 ```
 
 The installer will:
@@ -51,24 +51,24 @@ The installer will:
 ### Admin Token
 The admin token is a secret password required for all management operations —
 registering devices, viewing fleet posture, submitting safety reports. Think of
-it like a root password for the Aegis API.
+it like a root password for the Kirra API.
 
 - **Leave blank** to have the installer generate a secure random token
 - **Enter your own** if you want a specific value (minimum 16 characters recommended)
-- The token is stored in `/etc/aegis/aegis.env`, readable only by root and the
-  `aegis` system user
+- The token is stored in `/etc/kirra/kirra.env`, readable only by root and the
+  `kirra` system user
 - **Write it down or store it in a password manager** — you'll need it for API calls
 
 ### Port
-The TCP port Aegis listens on. Default is **8090**.
+The TCP port Kirra listens on. Default is **8090**.
 
 Change this if:
 - Another service already uses 8090
 - Your firewall requires a specific port
-- You're running multiple Aegis instances on the same machine
+- You're running multiple Kirra instances on the same machine
 
 ### Database Location
-Where Aegis stores its SQLite database. Default is `/var/lib/aegis/aegis.db`.
+Where Kirra stores its SQLite database. Default is `/var/lib/kirra/kirra.db`.
 
 Change this if:
 - You want the database on a separate volume
@@ -82,13 +82,13 @@ Change this if:
 ### Check the Service is Running
 
 ```bash
-sudo systemctl status aegis-verifier
+sudo systemctl status kirra-verifier
 ```
 
 You should see `active (running)`. If not, check the logs:
 
 ```bash
-sudo journalctl -u aegis-verifier -n 50
+sudo journalctl -u kirra-verifier -n 50
 ```
 
 ### Test the API
@@ -103,19 +103,19 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 ```
 
 Replace `YOUR_TOKEN` with the token shown at the end of installation,
-or find it in `/etc/aegis/aegis.env`.
+or find it in `/etc/kirra/kirra.env`.
 
 ### View Logs
 
 ```bash
 # Live log stream
-sudo journalctl -u aegis-verifier -f
+sudo journalctl -u kirra-verifier -f
 
 # Last 100 lines
-sudo journalctl -u aegis-verifier -n 100
+sudo journalctl -u kirra-verifier -n 100
 
 # Logs from the last hour
-sudo journalctl -u aegis-verifier --since "1 hour ago"
+sudo journalctl -u kirra-verifier --since "1 hour ago"
 ```
 
 ---
@@ -124,38 +124,38 @@ sudo journalctl -u aegis-verifier --since "1 hour ago"
 
 | Action | Command |
 |--------|---------|
-| Check status | `sudo systemctl status aegis-verifier` |
-| Start | `sudo systemctl start aegis-verifier` |
-| Stop | `sudo systemctl stop aegis-verifier` |
-| Restart | `sudo systemctl restart aegis-verifier` |
-| View logs | `sudo journalctl -u aegis-verifier -f` |
-| Disable autostart | `sudo systemctl disable aegis-verifier` |
+| Check status | `sudo systemctl status kirra-verifier` |
+| Start | `sudo systemctl start kirra-verifier` |
+| Stop | `sudo systemctl stop kirra-verifier` |
+| Restart | `sudo systemctl restart kirra-verifier` |
+| View logs | `sudo journalctl -u kirra-verifier -f` |
+| Disable autostart | `sudo systemctl disable kirra-verifier` |
 
 ---
 
 ## Configuration
 
-Configuration lives in `/etc/aegis/aegis.env`. Edit this file to change
+Configuration lives in `/etc/kirra/kirra.env`. Edit this file to change
 any setting, then restart the service.
 
 ```bash
-sudo nano /etc/aegis/aegis.env
-sudo systemctl restart aegis-verifier
+sudo nano /etc/kirra/kirra.env
+sudo systemctl restart kirra-verifier
 ```
 
 ### Configuration Reference
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `AEGIS_ADMIN_TOKEN` | **Yes** | — | Bearer token for admin API calls |
-| `AEGIS_VERIFIER_ADDR` | No | `0.0.0.0:8090` | Listen address and port |
-| `AEGIS_DB_PATH` | No | `/var/lib/aegis/aegis.db` | SQLite database path |
-| `AEGIS_VERIFIER_MODE` | No | `active` | `active` or `passive_standby` |
-| `AEGIS_TRUSTED_INGRESS_MODE` | No | `false` | Require client ID headers |
-| `AEGIS_INSTANCE_ID` | No | hostname | Unique ID for HA deployments |
-| `AEGIS_HEARTBEAT_INTERVAL` | No | `2000` | HA heartbeat interval (ms) |
-| `AEGIS_PROMOTION_TIMEOUT` | No | `10000` | HA promotion timeout (ms) |
-| `AEGIS_SUPERVISOR_RESET_KEY` | No | — | Supervisor reset operations |
+| `KIRRA_ADMIN_TOKEN` | **Yes** | — | Bearer token for admin API calls |
+| `KIRRA_VERIFIER_ADDR` | No | `0.0.0.0:8090` | Listen address and port |
+| `KIRRA_DB_PATH` | No | `/var/lib/kirra/kirra.db` | SQLite database path |
+| `KIRRA_VERIFIER_MODE` | No | `active` | `active` or `passive_standby` |
+| `KIRRA_TRUSTED_INGRESS_MODE` | No | `false` | Require client ID headers |
+| `KIRRA_INSTANCE_ID` | No | hostname | Unique ID for HA deployments |
+| `KIRRA_HEARTBEAT_INTERVAL` | No | `2000` | HA heartbeat interval (ms) |
+| `KIRRA_PROMOTION_TIMEOUT` | No | `10000` | HA promotion timeout (ms) |
+| `KIRRA_SUPERVISOR_RESET_KEY` | No | — | Supervisor reset operations |
 
 ### Rotating the Admin Token
 
@@ -164,11 +164,11 @@ sudo systemctl restart aegis-verifier
 NEW_TOKEN=$(openssl rand -hex 32)
 
 # Update the config file
-sudo sed -i "s/^AEGIS_ADMIN_TOKEN=.*/AEGIS_ADMIN_TOKEN=${NEW_TOKEN}/" \
-    /etc/aegis/aegis.env
+sudo sed -i "s/^KIRRA_ADMIN_TOKEN=.*/KIRRA_ADMIN_TOKEN=${NEW_TOKEN}/" \
+    /etc/kirra/kirra.env
 
 # Restart to apply
-sudo systemctl restart aegis-verifier
+sudo systemctl restart kirra-verifier
 
 echo "New token: ${NEW_TOKEN}"
 ```
@@ -180,19 +180,19 @@ Update all clients and integrations with the new token before restarting.
 ## Upgrading
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/justinlooney/aegis/master/install.sh \
+curl -fsSL https://raw.githubusercontent.com/justinlooney/kirra-runtime-sdk/master/install.sh \
     | sudo bash -s -- --force
 ```
 
 The `--force` flag reinstalls over the existing installation. Your configuration
-(`/etc/aegis/aegis.env`) and database (`/var/lib/aegis/aegis.db`) are preserved.
+(`/etc/kirra/kirra.env`) and database (`/var/lib/kirra/kirra.db`) are preserved.
 
 ---
 
 ## Uninstalling
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/justinlooney/aegis/master/install.sh \
+curl -fsSL https://raw.githubusercontent.com/justinlooney/kirra-runtime-sdk/master/install.sh \
     | sudo bash -s -- --uninstall
 ```
 
@@ -200,45 +200,45 @@ This removes the binary and service but **preserves** your configuration and
 database. To remove everything:
 
 ```bash
-sudo rm -rf /etc/aegis /var/lib/aegis /var/log/aegis
-sudo userdel -r aegis 2>/dev/null || true
+sudo rm -rf /etc/kirra /var/lib/kirra /var/log/kirra
+sudo userdel -r kirra 2>/dev/null || true
 ```
 
 ---
 
 ## High Availability (Two-Instance Setup)
 
-For production deployments where Aegis must remain running even if one
+For production deployments where Kirra must remain running even if one
 machine fails, deploy two instances: one `active` (primary) and one
 `passive_standby` (standby). Both must share the same SQLite database
 (via NFS, shared block storage, or database replication).
 
-**Primary instance** (`/etc/aegis/aegis.env`):
+**Primary instance** (`/etc/kirra/kirra.env`):
 ```
-AEGIS_VERIFIER_MODE=active
-AEGIS_INSTANCE_ID=aegis-primary
+KIRRA_VERIFIER_MODE=active
+KIRRA_INSTANCE_ID=kirra-primary
 ```
 
-**Standby instance** (`/etc/aegis/aegis.env`):
+**Standby instance** (`/etc/kirra/kirra.env`):
 ```
-AEGIS_VERIFIER_MODE=passive_standby
-AEGIS_INSTANCE_ID=aegis-standby
-AEGIS_DB_PATH=/mnt/shared/aegis.db
+KIRRA_VERIFIER_MODE=passive_standby
+KIRRA_INSTANCE_ID=kirra-standby
+KIRRA_DB_PATH=/mnt/shared/kirra.db
 ```
 
 The standby monitors the primary's heartbeat. If the primary is silent for
-10 seconds (configurable via `AEGIS_PROMOTION_TIMEOUT`), the standby
+10 seconds (configurable via `KIRRA_PROMOTION_TIMEOUT`), the standby
 automatically promotes itself to active and begins enforcing posture.
 
 ---
 
 ## Firewall Configuration
 
-If you have a firewall (ufw, iptables, firewalld), allow the Aegis port:
+If you have a firewall (ufw, iptables, firewalld), allow the Kirra port:
 
 ```bash
 # ufw
-sudo ufw allow 8090/tcp comment "Aegis Safety Kernel"
+sudo ufw allow 8090/tcp comment "Kirra Safety Kernel"
 
 # firewalld
 sudo firewall-cmd --permanent --add-port=8090/tcp
@@ -258,12 +258,12 @@ sudo ufw allow from 10.0.1.0/24 to any port 8090
 Set environment variables before running the installer to skip all prompts:
 
 ```bash
-export AEGIS_ADMIN_TOKEN="your-secret-token-here"
-export AEGIS_PORT="8090"
-export AEGIS_DB_PATH="/var/lib/aegis/aegis.db"
-export AEGIS_VERIFIER_MODE="active"
+export KIRRA_ADMIN_TOKEN="your-secret-token-here"
+export KIRRA_PORT="8090"
+export KIRRA_DB_PATH="/var/lib/kirra/kirra.db"
+export KIRRA_VERIFIER_MODE="active"
 
-curl -fsSL https://raw.githubusercontent.com/justinlooney/aegis/master/install.sh \
+curl -fsSL https://raw.githubusercontent.com/justinlooney/kirra-runtime-sdk/master/install.sh \
     | sudo -E bash -s -- --non-interactive
 ```
 
@@ -276,72 +276,72 @@ The `-E` flag passes your environment variables through sudo.
 ### Service Won't Start
 
 ```bash
-sudo journalctl -u aegis-verifier -n 100
+sudo journalctl -u kirra-verifier -n 100
 ```
 
 Common causes:
-- **Port already in use**: Change `AEGIS_VERIFIER_ADDR` in `/etc/aegis/aegis.env`
-- **Database directory not writable**: `sudo chown aegis:aegis /var/lib/aegis`
-- **Missing admin token**: Ensure `AEGIS_ADMIN_TOKEN` is set in `/etc/aegis/aegis.env`
+- **Port already in use**: Change `KIRRA_VERIFIER_ADDR` in `/etc/kirra/kirra.env`
+- **Database directory not writable**: `sudo chown kirra:kirra /var/lib/kirra`
+- **Missing admin token**: Ensure `KIRRA_ADMIN_TOKEN` is set in `/etc/kirra/kirra.env`
 
 ### API Returns 401 Unauthorized
 
 Your admin token is wrong or missing. Check:
 ```bash
 # View the configured token (requires root)
-sudo grep AEGIS_ADMIN_TOKEN /etc/aegis/aegis.env
+sudo grep KIRRA_ADMIN_TOKEN /etc/kirra/kirra.env
 ```
 
 Use it in requests:
 ```bash
-curl -H "Authorization: Bearer $(sudo grep AEGIS_ADMIN_TOKEN /etc/aegis/aegis.env | cut -d= -f2)" \
+curl -H "Authorization: Bearer $(sudo grep KIRRA_ADMIN_TOKEN /etc/kirra/kirra.env | cut -d= -f2)" \
      http://localhost:8090/fleet/posture
 ```
 
 ### API Returns 503 Service Unavailable
 
 The admin token environment variable is empty or missing. Restart the service
-after ensuring `AEGIS_ADMIN_TOKEN` is set in `/etc/aegis/aegis.env`.
+after ensuring `KIRRA_ADMIN_TOKEN` is set in `/etc/kirra/kirra.env`.
 
 ### Database Errors
 
 ```bash
 # Check disk space
-df -h /var/lib/aegis
+df -h /var/lib/kirra
 
 # Check file ownership
-ls -la /var/lib/aegis/
+ls -la /var/lib/kirra/
 
 # Fix ownership if wrong
-sudo chown -R aegis:aegis /var/lib/aegis
+sudo chown -R kirra:kirra /var/lib/kirra
 ```
 
 ### Architecture Mismatch
 
 If you see `Exec format error`, the binary architecture doesn't match your
 system. The installer detects architecture automatically — if it downloaded
-the wrong binary, open an issue at https://github.com/justinlooney/aegis/issues
+the wrong binary, open an issue at https://github.com/justinlooney/kirra-runtime-sdk/issues
 with the output of `uname -m`.
 
 ---
 
 ## Security Notes
 
-- The admin token is equivalent to root access to the Aegis API. Treat it
+- The admin token is equivalent to root access to the Kirra API. Treat it
   like a password.
-- `/etc/aegis/aegis.env` is readable by root and the `aegis` group only
+- `/etc/kirra/kirra.env` is readable by root and the `kirra` group only
   (mode 640). Do not change this permission.
-- The `aegis` system user has no login shell and no home directory outside
-  `/var/lib/aegis`. It cannot be used to log in.
+- The `kirra` system user has no login shell and no home directory outside
+  `/var/lib/kirra`. It cannot be used to log in.
 - All administrative API calls are logged to the tamper-evident audit chain
   stored in the database.
-- For production deployments, place Aegis behind a TLS-terminating reverse
+- For production deployments, place Kirra behind a TLS-terminating reverse
   proxy (nginx, Caddy) and restrict direct port access.
 
 ---
 
 ## Getting Help
 
-- **Documentation**: https://github.com/justinlooney/aegis
-- **Issues**: https://github.com/justinlooney/aegis/issues
-- **Logs**: `sudo journalctl -u aegis-verifier -f`
+- **Documentation**: https://github.com/justinlooney/kirra-runtime-sdk
+- **Issues**: https://github.com/justinlooney/kirra-runtime-sdk/issues
+- **Logs**: `sudo journalctl -u kirra-verifier -f`

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Hardware-in-loop replay proof: validates Aegis proxy behaviour against reference vectors.
+"""Hardware-in-loop replay proof: validates Kirra proxy behaviour against reference vectors.
 
-Three phases are tested in sequence against a running Aegis gateway on localhost:5502.
+Three phases are tested in sequence against a running Kirra gateway on localhost:5502.
 Each phase sends a single Modbus TCP FC06 frame and checks the exact byte response.
 
 PHASE_1: 1201.8 GPM — within envelope, passes through unchanged.
@@ -9,7 +9,7 @@ PHASE_2: 4593.6 GPM — exceeds 3000.0 GPM ceiling, clamped and forwarded as 300
 PHASE_3: register 11 (0x000B) — not the monitored asset_identifier 10, triggers exception 0x02.
 
 Usage:
-    AEGIS_SUPERVISOR_RESET_KEY=<key> cargo run -- config/asset_profile.json &
+    KIRRA_SUPERVISOR_RESET_KEY=<key> cargo run -- config/asset_profile.json &
     python3 tests/hil_replay_proof.py
 """
 
