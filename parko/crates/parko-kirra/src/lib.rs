@@ -25,12 +25,12 @@
 //   either deny → Deny.
 //
 // CAVEAT — bound value derivation:
-//   `MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER` is a conservative ballpark
-//   for an urban service robot, NOT a validated per-platform limit. The
-//   real value requires a SOTIF/robot-spec derivation (rollover analysis,
-//   sweep envelope vs. pedestrian clearance, platform CoG + track width),
-//   analogous to how the linear speed cap traces to ADR-0001. Filed for
-//   per-platform SOTIF work — see CAVEATS in the constant doc.
+//   The angular-velocity bound is SOTIF-derived as of #136 (see
+//   `angular_bound::AngularVelocityBound`, `PlatformParams`, and
+//   `docs/safety/ANGULAR_VELOCITY_SOTIF.md`). The H1 placeholder
+//   constants are gone. The new bound is `ω_max(v) = min(rollover(v),
+//   sweep, ftti)`. **Status: DRAFT — pending formal safety-engineer
+//   review.**
 
 use kirra_runtime_sdk::gateway::kinematics_contract::{
     validate_vehicle_command, EnforceAction, ProposedVehicleCommand, VehicleKinematicsContract,
@@ -42,7 +42,9 @@ use parko_core::commands::ControlCommand;
 use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 use parko_core::RssState;
 
+pub mod angular_bound;
 pub mod comparator;
+pub use angular_bound::{AngularVelocityBound, PlatformParams, ROLLOVER_MIN_LINEAR_VELOCITY_MPS};
 pub use comparator::GovernorComparator;
 
 /// MRC (Minimum Risk Condition) velocity ceiling.
@@ -51,40 +53,25 @@ pub use comparator::GovernorComparator;
 /// Single source of truth. Per ADL-001.
 pub const MRC_VELOCITY_CEILING_MPS: f64 = 5.0;
 
-/// Conservative **placeholder** angular-velocity (yaw-rate) ceiling for
-/// the Nominal posture, rad/s. **NOT a validated limit.**
+/// **Angular-velocity bound — SOTIF-derived (issue #136).**
 ///
-/// # SOTIF derivation gap (TODO)
+/// The H1 placeholder constants (`MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER
+/// = 1.5`, `MRC_ANGULAR_VELOCITY_CEILING_RAD_S = 0.5`) are removed.
+/// The bound is now computed by
+/// `crate::angular_bound::AngularVelocityBound::omega_max(v)` from
+/// platform parameters (`PlatformParams`):
 ///
-/// The real per-platform bound depends on:
-///   - Rollover threshold (CoG height, track width, surface friction).
-///   - Sweep-envelope vs. pedestrian clearance (a `max_track_radius × ω`
-///     surface velocity above which the platform cannot stop short of
-///     a human leg in the FTTI budget).
-///   - Actuator hardware limit (wheel-encoder slip, drive-current limit).
+///   ω_max(v) = min(rollover(v), sweep, ftti)
 ///
-/// Until a SOTIF derivation produces a defensible value per platform,
-/// this placeholder is used so the axis is **checked** even if the
-/// number is provisional. Do not treat `1.5 rad/s` as authoritative —
-/// it is approximately 86 °/s, a slow turn-in-place for a small urban
-/// service robot. Tighter is safer.
+/// with rollover masked below `ROLLOVER_MIN_LINEAR_VELOCITY_MPS` to
+/// handle the v=0 singularity. See `crate::angular_bound` and
+/// `docs/safety/ANGULAR_VELOCITY_SOTIF.md` for the derivation,
+/// assumptions, and worked reference numbers.
 ///
-/// Analogous to how `URBAN_ODD_SPEED_CAP_MPS` traces to ADR-0001 /
-/// KIRRA-OCCY-SPEED-VAL-001 — when this bound earns a SOTIF basis it
-/// should be promoted to a sourced constant in the safety case.
-///
-// TODO(SOTIF): replace with per-platform derivation; this is a placeholder.
-pub const MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER: f64 = 1.5;
-
-/// MRC (degraded / RSS-unsafe) angular-velocity ceiling, rad/s.
-///
-/// Mirrors the linear MRC philosophy: when posture contracts, the
-/// envelope contracts on **both** axes. Ratio chosen as 1/3 of the
-/// Nominal placeholder (`0.5 rad/s` ≈ 29 °/s — a deliberate, slow
-/// reposition). Same SOTIF derivation gap as the Nominal value.
-///
-// TODO(SOTIF): replace with per-platform derivation; this is a placeholder.
-pub const MRC_ANGULAR_VELOCITY_CEILING_RAD_S: f64 = 0.5;
+/// **Status:** DRAFT — pending formal safety-engineer review. The
+/// improvement over the H1 placeholders is real (reasoning + defensible
+/// values where there were none), but treating these numbers as a
+/// validated safety claim requires sign-off.
 
 /// A safety governor backed by the Kirra runtime SDK's vehicle kinematics
 /// contract.
@@ -96,14 +83,15 @@ pub struct KirraGovernor {
     #[allow(dead_code)]
     fallback_contract: VehicleKinematicsContract,
     rss_state: RssState,
-    /// Absolute angular-velocity ceiling, rad/s, applied in the Nominal
-    /// posture (both directions: bound is on `|angular_velocity|`).
-    /// Default = `MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER`. See the
-    /// constant's doc for the SOTIF derivation gap.
-    max_angular_velocity_rad_s: f64,
-    /// Absolute angular-velocity ceiling, rad/s, applied in MRC (Degraded
-    /// or RSS-unsafe). Default = `MRC_ANGULAR_VELOCITY_CEILING_RAD_S`.
-    mrc_max_angular_velocity_rad_s: f64,
+    /// SOTIF-derived angular-velocity bound for the Nominal posture.
+    /// Default = `AngularVelocityBound::nominal(PlatformParams::conservative_default())`.
+    /// Override per platform via `with_platform_params` or
+    /// `with_angular_bounds`.
+    nominal_angular_bound: AngularVelocityBound,
+    /// SOTIF-derived angular-velocity bound for the MRC (Degraded /
+    /// RSS-unsafe) posture. Default = `AngularVelocityBound::mrc(...)`
+    /// with `mrc_posture_factor = 0.5`. Override per platform similarly.
+    mrc_angular_bound: AngularVelocityBound,
 }
 
 impl KirraGovernor {
@@ -111,24 +99,30 @@ impl KirraGovernor {
     /// contract profiles and selects between them per-call based on
     /// the posture passed to `evaluate()`.
     ///
-    /// Angular-velocity bounds default to the placeholder constants
-    /// (`MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER`,
-    /// `MRC_ANGULAR_VELOCITY_CEILING_RAD_S`) — see the constant docs
-    /// for the SOTIF derivation gap. Use
-    /// `KirraGovernor::with_angular_bounds` to override per platform.
+    /// Angular-velocity bounds default to the SOTIF-derived bound
+    /// from `PlatformParams::conservative_default()` — produces a
+    /// tight bound that fails toward safe for an uncharacterised
+    /// platform. Override with `with_platform_params(params)` to
+    /// pass platform-specific geometry + FTTI, or
+    /// `with_angular_bounds(nom, mrc)` for a direct scalar override.
+    /// See `crate::angular_bound` for the derivation;
+    /// `docs/safety/ANGULAR_VELOCITY_SOTIF.md` is the safety case
+    /// (DRAFT — pending formal safety-engineer review).
     pub fn new() -> Self {
         Self {
             nominal_contract: VehicleKinematicsContract::nominal_reference_profile(),
             fallback_contract: VehicleKinematicsContract::mrc_fallback_profile(),
             rss_state: RssState { safe: true, longitudinal_margin: f64::MAX, lateral_margin: f64::MAX },
-            max_angular_velocity_rad_s: MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER,
-            mrc_max_angular_velocity_rad_s: MRC_ANGULAR_VELOCITY_CEILING_RAD_S,
+            nominal_angular_bound: AngularVelocityBound::nominal(PlatformParams::conservative_default()),
+            mrc_angular_bound:     AngularVelocityBound::mrc    (PlatformParams::conservative_default()),
         }
     }
 
-    /// Overrides the angular-velocity bounds with platform-specific
-    /// values. Use this once a SOTIF derivation produces a defensible
-    /// per-platform ceiling.
+    /// Overrides the angular-velocity bounds with **v-independent
+    /// scalar** values. Use this when the SOTIF derivation has already
+    /// been done elsewhere and you want a single number per posture.
+    /// For per-platform v-dependent bounds (rollover, sweep, FTTI),
+    /// use `with_platform_params` instead.
     ///
     /// Panics if either bound is non-finite or non-positive.
     pub fn with_angular_bounds(mut self, nominal_rad_s: f64, mrc_rad_s: f64) -> Self {
@@ -142,8 +136,27 @@ impl KirraGovernor {
             "MRC angular bound must be a finite positive value, got {}",
             mrc_rad_s
         );
-        self.max_angular_velocity_rad_s = nominal_rad_s;
-        self.mrc_max_angular_velocity_rad_s = mrc_rad_s;
+        self.nominal_angular_bound = AngularVelocityBound::Scalar(nominal_rad_s);
+        self.mrc_angular_bound     = AngularVelocityBound::Scalar(mrc_rad_s);
+        self
+    }
+
+    /// **Issue #136 SOTIF** — overrides the angular-velocity bounds
+    /// with platform-parameter-driven `ω_max(v) = min(rollover(v),
+    /// sweep, ftti)` derivations. The Nominal bound uses
+    /// `posture_factor = 1.0`; the MRC bound uses
+    /// `params.mrc_posture_factor` (default 0.5).
+    ///
+    /// See `crate::angular_bound::PlatformParams` for the field
+    /// catalog and `docs/safety/ANGULAR_VELOCITY_SOTIF.md` for the
+    /// derivation. DRAFT — pending formal safety-engineer review.
+    pub fn with_platform_params(mut self, params: PlatformParams) -> Self {
+        params.validate().expect(
+            "PlatformParams failed validation; check geometry > 0 and \
+             mrc_posture_factor in (0, 1]"
+        );
+        self.nominal_angular_bound = AngularVelocityBound::nominal(params.clone());
+        self.mrc_angular_bound     = AngularVelocityBound::mrc(params);
         self
     }
 
@@ -162,8 +175,8 @@ impl KirraGovernor {
             nominal_contract: profile.clone(),
             fallback_contract: profile,
             rss_state: RssState { safe: true, longitudinal_margin: f64::MAX, lateral_margin: f64::MAX },
-            max_angular_velocity_rad_s: MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER,
-            mrc_max_angular_velocity_rad_s: MRC_ANGULAR_VELOCITY_CEILING_RAD_S,
+            nominal_angular_bound: AngularVelocityBound::nominal(PlatformParams::conservative_default()),
+            mrc_angular_bound:     AngularVelocityBound::mrc    (PlatformParams::conservative_default()),
         }
     }
 
@@ -176,8 +189,8 @@ impl KirraGovernor {
             nominal_contract: profile.clone(),
             fallback_contract: profile,
             rss_state: RssState { safe: true, longitudinal_margin: f64::MAX, lateral_margin: f64::MAX },
-            max_angular_velocity_rad_s: MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER,
-            mrc_max_angular_velocity_rad_s: MRC_ANGULAR_VELOCITY_CEILING_RAD_S,
+            nominal_angular_bound: AngularVelocityBound::nominal(PlatformParams::conservative_default()),
+            mrc_angular_bound:     AngularVelocityBound::mrc    (PlatformParams::conservative_default()),
         }
     }
 
@@ -212,10 +225,15 @@ impl KirraGovernor {
     fn apply_mrc_profile(&self, proposed: &ControlCommand) -> EnforcementAction {
         let safe_linear = proposed.linear_velocity.min(MRC_VELOCITY_CEILING_MPS);
         let linear_clamped = safe_linear < proposed.linear_velocity;
-        let angular_clamped =
-            proposed.angular_velocity.abs() > self.mrc_max_angular_velocity_rad_s;
+        // SOTIF-derived: ω_max evaluated at the COMMAND's linear
+        // velocity (clamped to the post-linear-cap value so the
+        // rollover constraint is consistent with what'll actually
+        // be commanded).
+        let v_for_bound = safe_linear.abs();
+        let mrc_omega_max = self.mrc_angular_bound.omega_max(v_for_bound);
+        let angular_clamped = proposed.angular_velocity.abs() > mrc_omega_max;
         let safe_angular = if angular_clamped {
-            self.mrc_max_angular_velocity_rad_s * proposed.angular_velocity.signum()
+            mrc_omega_max * proposed.angular_velocity.signum()
         } else {
             proposed.angular_velocity
         };
@@ -233,10 +251,15 @@ impl KirraGovernor {
     /// Applies the Nominal angular-velocity ceiling to a proposed command,
     /// returning the clamped magnitude (sign-preserved) when the bound is
     /// exceeded, else `None`.
-    // SAFETY: SG8 | REQ: angular-velocity-bound | TEST: nominal_angular_above_bound_clamps_to_max,nominal_angular_below_bound_passes_through,in_place_rotation_above_bound_is_clamped,linear_and_angular_both_above_bound_returns_clampmotion,locked_out_dominates_high_angular_velocity,reverse_spin_above_bound_clamps_with_correct_sign
+    ///
+    /// **#136 SOTIF:** the ceiling is `ω_max(v) = min(rollover(v),
+    /// sweep, ftti)` from `AngularVelocityBound::omega_max`, evaluated
+    /// at the proposed command's linear velocity.
+    // SAFETY: SG8 | REQ: angular-velocity-bound-sotif | TEST: nominal_angular_above_bound_clamps_to_max,nominal_angular_below_bound_passes_through,in_place_rotation_above_bound_is_clamped,linear_and_angular_both_above_bound_returns_clampmotion,locked_out_dominates_high_angular_velocity,reverse_spin_above_bound_clamps_with_correct_sign
     fn nominal_angular_clamp(&self, proposed: &ControlCommand) -> Option<f64> {
-        if proposed.angular_velocity.abs() > self.max_angular_velocity_rad_s {
-            Some(self.max_angular_velocity_rad_s * proposed.angular_velocity.signum())
+        let omega_max = self.nominal_angular_bound.omega_max(proposed.linear_velocity.abs());
+        if proposed.angular_velocity.abs() > omega_max {
+            Some(omega_max * proposed.angular_velocity.signum())
         } else {
             None
         }
@@ -320,7 +343,7 @@ impl SafetyGovernor for KirraGovernor {
 
 #[cfg(test)]
 mod tests {
-    use super::{KirraGovernor, MRC_VELOCITY_CEILING_MPS};
+    use super::{KirraGovernor, MRC_VELOCITY_CEILING_MPS, PlatformParams};
     use parko_core::commands::ControlCommand;
     use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
     use parko_core::RssState;
@@ -521,11 +544,29 @@ mod tests {
     //   LockedOut | any        | above bound    | Deny (hard stop)
     //   Nominal   | within     | reverse above  | ClampAngularVelocity with sign preserved
     //
-    // The bound used here is the placeholder constant
-    // `MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER` (1.5 rad/s); see its doc
-    // for the SOTIF derivation gap.
+    // The H1 enforcement-logic tests pin the angular bound at the
+    // pre-SOTIF placeholder values (1.5 / 0.5 rad/s) via the back-
+    // compat `with_angular_bounds` (Scalar) overlay. This keeps the
+    // tests focused on the enforcement LOGIC (sign preservation,
+    // multi-axis ClampMotion, sticky behaviour) without coupling them
+    // to the SOTIF derivation's specific numbers — the derivation
+    // tests live in `crate::angular_bound::tests` and the
+    // `derived_*` tests below.
 
-    use super::{MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER, MRC_ANGULAR_VELOCITY_CEILING_RAD_S};
+    /// Local constant — pins the H1 numeric expectations against a
+    /// known scalar bound, NOT the SOTIF derivation default. Lets
+    /// the existing enforcement-logic assertions read the same way
+    /// they did before #136 landed.
+    const H1_NOMINAL_RAD_S: f64 = 1.5;
+    const H1_MRC_RAD_S:     f64 = 0.5;
+
+    /// Helper: build a governor with the legacy scalar bounds so the
+    /// enforcement-logic tests below have a known reference. Tests
+    /// of the SOTIF derivation itself construct their own governors
+    /// via `with_platform_params`.
+    fn legacy_scalar_gov() -> KirraGovernor {
+        KirraGovernor::new().with_angular_bounds(H1_NOMINAL_RAD_S, H1_MRC_RAD_S)
+    }
 
     fn cmd_twist(linear: f64, angular: f64) -> ControlCommand {
         ControlCommand { linear_velocity: linear, angular_velocity: angular, timestamp_ms: 0 }
@@ -545,9 +586,9 @@ mod tests {
     /// linear within envelope, angular within bound → Allow.
     #[test]
     fn nominal_angular_below_bound_passes_through() {
-        let gov = KirraGovernor::new();
+        let gov = legacy_scalar_gov();
         let prev = cmd_twist(3.0, 0.0);
-        let proposed = cmd_twist(3.0, MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER - 0.1);
+        let proposed = cmd_twist(3.0, H1_NOMINAL_RAD_S - 0.1);
         let action = gov.evaluate(&proposed, Some(&prev), 0.05, SafetyPosture::Nominal);
         assert!(
             matches!(action, EnforcementAction::Allow),
@@ -560,15 +601,15 @@ mod tests {
     /// (the linear axis is untouched; only the angular axis is clamped).
     #[test]
     fn nominal_angular_above_bound_clamps_to_max() {
-        let gov = KirraGovernor::new();
+        let gov = legacy_scalar_gov();
         let prev = cmd_twist(3.0, 0.0);
-        let proposed = cmd_twist(3.0, MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER + 1.0);
+        let proposed = cmd_twist(3.0, H1_NOMINAL_RAD_S + 1.0);
         let action = gov.evaluate(&proposed, Some(&prev), 0.05, SafetyPosture::Nominal);
         match action {
             EnforcementAction::ClampAngularVelocity(a) => {
                 assert!(
-                    (a - MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER).abs() < 1e-12,
-                    "expected angular clamped to {MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER}, got {a}"
+                    (a - H1_NOMINAL_RAD_S).abs() < 1e-12,
+                    "expected angular clamped to {H1_NOMINAL_RAD_S}, got {a}"
                 );
             }
             other => panic!("expected ClampAngularVelocity, got {other:?}"),
@@ -581,13 +622,13 @@ mod tests {
     /// (infinite curvature). Approach A handles it cleanly.
     #[test]
     fn in_place_rotation_above_bound_is_clamped() {
-        let gov = KirraGovernor::new();
+        let gov = legacy_scalar_gov();
         let prev = cmd_twist(0.0, 0.0);
-        let proposed = cmd_twist(0.0, MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER * 2.0);
+        let proposed = cmd_twist(0.0, H1_NOMINAL_RAD_S * 2.0);
         let action = gov.evaluate(&proposed, Some(&prev), 0.05, SafetyPosture::Nominal);
         match action {
             EnforcementAction::ClampAngularVelocity(a) => {
-                assert_eq!(a, MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER);
+                assert_eq!(a, H1_NOMINAL_RAD_S);
             }
             other => panic!(
                 "in-place rotation with excess spin must clamp angular axis; got {other:?}"
@@ -599,13 +640,13 @@ mod tests {
     /// Reverse spin (negative angular) above bound — clamps with sign preserved.
     #[test]
     fn reverse_spin_above_bound_clamps_with_correct_sign() {
-        let gov = KirraGovernor::new();
+        let gov = legacy_scalar_gov();
         let prev = cmd_twist(0.0, 0.0);
-        let proposed = cmd_twist(0.0, -(MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER + 0.5));
+        let proposed = cmd_twist(0.0, -(H1_NOMINAL_RAD_S + 0.5));
         let action = gov.evaluate(&proposed, Some(&prev), 0.05, SafetyPosture::Nominal);
         match action {
             EnforcementAction::ClampAngularVelocity(a) => {
-                assert_eq!(a, -MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER);
+                assert_eq!(a, -H1_NOMINAL_RAD_S);
             }
             other => panic!("expected ClampAngularVelocity with negative sign; got {other:?}"),
         }
@@ -618,9 +659,9 @@ mod tests {
     /// is exceeding the placeholder bound.
     #[test]
     fn linear_and_angular_both_above_bound_returns_clampmotion() {
-        let gov = KirraGovernor::new();
+        let gov = legacy_scalar_gov();
         let prev = cmd_twist(30.0, 0.0);
-        let proposed = cmd_twist(40.0, MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER + 0.5);
+        let proposed = cmd_twist(40.0, H1_NOMINAL_RAD_S + 0.5);
         let action = gov.evaluate(&proposed, Some(&prev), 0.05, SafetyPosture::Nominal);
         match action {
             EnforcementAction::ClampMotion { linear, angular } => {
@@ -630,7 +671,7 @@ mod tests {
                     lin <= 35.0 + 1e-9,
                     "linear must be clamped at or below the vehicle max (35 m/s), got {lin}"
                 );
-                assert_eq!(ang, MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER);
+                assert_eq!(ang, H1_NOMINAL_RAD_S);
             }
             other => panic!("expected ClampMotion {{Some,Some}}, got {other:?}"),
         }
@@ -641,18 +682,18 @@ mod tests {
     /// is clamped. Mirror of the linear MRC ceiling philosophy.
     #[test]
     fn degraded_angular_above_bound_clamps_to_mrc_angular_ceiling() {
-        let gov = KirraGovernor::new();
+        let gov = legacy_scalar_gov();
         // linear is within MRC linear cap so only the angular axis fires.
         let proposed = cmd_twist(
             MRC_VELOCITY_CEILING_MPS - 0.5,
-            MRC_ANGULAR_VELOCITY_CEILING_RAD_S + 0.3,
+            H1_MRC_RAD_S + 0.3,
         );
         let action = gov.evaluate(&proposed, None, 0.05, SafetyPosture::Degraded);
         match action {
             EnforcementAction::ClampAngularVelocity(a) => {
                 assert!(
-                    (a - MRC_ANGULAR_VELOCITY_CEILING_RAD_S).abs() < 1e-12,
-                    "expected angular clamped to MRC ceiling {MRC_ANGULAR_VELOCITY_CEILING_RAD_S}, got {a}"
+                    (a - H1_MRC_RAD_S).abs() < 1e-12,
+                    "expected angular clamped to MRC ceiling {H1_MRC_RAD_S}, got {a}"
                 );
             }
             other => panic!("expected ClampAngularVelocity under Degraded; got {other:?}"),
@@ -663,16 +704,16 @@ mod tests {
     /// Degraded — both axes over their MRC caps → ClampMotion.
     #[test]
     fn degraded_both_axes_above_bound_returns_clampmotion() {
-        let gov = KirraGovernor::new();
+        let gov = legacy_scalar_gov();
         let proposed = cmd_twist(
             MRC_VELOCITY_CEILING_MPS + 2.0,
-            MRC_ANGULAR_VELOCITY_CEILING_RAD_S + 0.4,
+            H1_MRC_RAD_S + 0.4,
         );
         let action = gov.evaluate(&proposed, None, 0.05, SafetyPosture::Degraded);
         match action {
             EnforcementAction::ClampMotion { linear, angular } => {
                 assert_eq!(linear, Some(MRC_VELOCITY_CEILING_MPS));
-                assert_eq!(angular, Some(MRC_ANGULAR_VELOCITY_CEILING_RAD_S));
+                assert_eq!(angular, Some(H1_MRC_RAD_S));
             }
             other => panic!("expected ClampMotion {{Some,Some}} under Degraded; got {other:?}"),
         }
@@ -683,8 +724,8 @@ mod tests {
     /// value is, the verdict is Deny / hard-stop.
     #[test]
     fn locked_out_dominates_high_angular_velocity() {
-        let gov = KirraGovernor::new();
-        let proposed = cmd_twist(0.0, MAX_ANGULAR_VELOCITY_RAD_S_PLACEHOLDER * 10.0);
+        let gov = legacy_scalar_gov();
+        let proposed = cmd_twist(0.0, H1_NOMINAL_RAD_S * 10.0);
         let action = gov.evaluate(&proposed, None, 0.05, SafetyPosture::LockedOut);
         assert!(
             matches!(action, EnforcementAction::Deny { .. }),
@@ -719,5 +760,91 @@ mod tests {
     #[should_panic(expected = "MRC angular bound must be a finite positive value")]
     fn with_angular_bounds_rejects_nan() {
         let _ = KirraGovernor::new().with_angular_bounds(1.0, f64::NAN);
+    }
+
+    // -----------------------------------------------------------------------
+    // #136 — SOTIF derivation INTEGRATION tests (governor side)
+    // -----------------------------------------------------------------------
+    //
+    // Pure ω_max(v) math is in `crate::angular_bound::tests`. These
+    // tests verify the governor's evaluate path uses the derived
+    // bound at the proposed command's linear velocity — swapping
+    // PlatformParams changes the verdict.
+
+    /// SOTIF derivation drives the governor verdict. 0.5 rad/s
+    /// passes under urban-reference (sweep ≈ 0.833) but clamps under
+    /// conservative default (sweep ≈ 0.2). Same command, different
+    /// config, different verdict — proves the derivation isn't a no-op.
+    #[test]
+    fn derived_bound_changes_verdict_between_platforms() {
+        let proposed = cmd_twist(1.0, 0.5);
+        let urban = KirraGovernor::new()
+            .with_platform_params(PlatformParams::urban_service_robot_reference());
+        let action_urban = urban.evaluate(
+            &proposed, Some(&cmd_twist(1.0, 0.0)), 0.05, SafetyPosture::Nominal);
+        assert!(matches!(action_urban, EnforcementAction::Allow),
+            "urban-reference: 0.5 rad/s at v=1 m/s must Allow; got {action_urban:?}");
+        let cons = KirraGovernor::new();
+        let action_cons = cons.evaluate(
+            &proposed, Some(&cmd_twist(1.0, 0.0)), 0.05, SafetyPosture::Nominal);
+        match action_cons {
+            EnforcementAction::ClampAngularVelocity(a) => {
+                assert!((a - 0.2_f64).abs() < 1e-9,
+                    "conservative default: expected 0.2 rad/s, got {a}");
+            }
+            other => panic!("conservative default must clamp; got {other:?}"),
+        }
+    }
+
+    /// v=0 in-place rotation under the derived bound — singularity
+    /// masked, sweep + FTTI bind. Urban reference: clamps to ~0.833.
+    #[test]
+    fn derived_in_place_rotation_clamps_to_sweep_bound() {
+        let gov = KirraGovernor::new()
+            .with_platform_params(PlatformParams::urban_service_robot_reference());
+        let proposed = cmd_twist(0.0, 1.0);
+        let action = gov.evaluate(&proposed, None, 0.05, SafetyPosture::Nominal);
+        match action {
+            EnforcementAction::ClampAngularVelocity(a) => {
+                assert!((a - 0.833_f64).abs() < 1e-2,
+                    "in-place: expected ~0.833 (sweep), got {a}");
+            }
+            other => panic!("expected ClampAngularVelocity at v=0; got {other:?}"),
+        }
+    }
+
+    /// Degraded MRC tightens the derived bound — sweep budget halves
+    /// to ~0.4167 under the 0.5 posture factor.
+    #[test]
+    fn derived_mrc_in_place_rotation_is_tighter_than_nominal() {
+        let gov = KirraGovernor::new()
+            .with_platform_params(PlatformParams::urban_service_robot_reference());
+        let proposed = cmd_twist(0.0, 1.0);
+        let action = gov.evaluate(&proposed, None, 0.05, SafetyPosture::Degraded);
+        match action {
+            EnforcementAction::ClampAngularVelocity(a) => {
+                assert!((a - 0.4167_f64).abs() < 1e-2,
+                    "MRC in-place: expected ~0.4167, got {a}");
+            }
+            other => panic!("expected ClampAngularVelocity under MRC; got {other:?}"),
+        }
+    }
+
+    /// `with_angular_bounds` (Scalar) is v-independent — back-compat
+    /// confirmation for the H1 enforcement-logic tests.
+    #[test]
+    fn with_angular_bounds_scalar_back_compat_is_v_independent() {
+        let gov = KirraGovernor::new().with_angular_bounds(0.7, 0.3);
+        for v in [0.0_f64, 1.0, 5.0] {
+            let proposed = cmd_twist(v, 0.8);
+            let action = gov.evaluate(
+                &proposed, Some(&cmd_twist(v, 0.0)), 0.05, SafetyPosture::Nominal);
+            match action {
+                EnforcementAction::ClampAngularVelocity(a) => {
+                    assert!((a - 0.7_f64).abs() < 1e-9, "v={v}: expected 0.7, got {a}");
+                }
+                other => panic!("v={v}: expected ClampAngularVelocity, got {other:?}"),
+            }
+        }
     }
 }
