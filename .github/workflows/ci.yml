@@ -182,36 +182,35 @@ jobs:
           set -euo pipefail
           OPENVINO_VER="2025.1"        # pinned minor (>= 2025.1 satisfies openvino-rs#167)
           OPENVINO_DIST="ubuntu24"     # runs-on: ubuntu-latest == ubuntu-24.04
-          # Fallback exact build id (used only if the directory listing can't be
-          # resolved). Replace if the download 404s — verify on the storage site.
-          OPENVINO_FULLVER_FALLBACK="2025.1.0.18503"
+          OPENVINO_FULLVER="2025.1.0.18503"
           BASE="https://storage.openvinotoolkit.org/repositories/openvino/packages/${OPENVINO_VER}/linux"
-          # Resolve the exact tarball (its build id is not derivable). GUARD the
-          # pipeline with `|| true`: a curl/grep miss must NOT die under
-          # `set -e`/`pipefail` before the diagnostic runs (the prior version
-          # exited 1 with zero output, masking whether the URL or the pattern
-          # was wrong).
-          echo "Listing ${BASE}/ ..."
-          LISTING="$(curl -fsSL "${BASE}/" || true)"
-          TARBALL="$(printf '%s\n' "${LISTING}" \
-            | grep -oE "(l_)?openvino_toolkit_${OPENVINO_DIST}_${OPENVINO_VER}\.[0-9.]+_x86_64\.tgz" \
-            | sort -V | tail -n1 || true)"
-          if [ -n "${TARBALL}" ]; then
-            URL="${BASE}/${TARBALL}"
-            echo "Resolved from listing: ${TARBALL}"
-          else
-            echo "Listing yielded no tarball (got ${#LISTING} bytes). openvino_toolkit*.tgz seen:"
-            printf '%s\n' "${LISTING}" | grep -oE "[a-z_]*openvino_toolkit[^\"<> ]+\.tgz" | sort -u | head -20 || true
-            echo "Falling back to pinned build ${OPENVINO_FULLVER_FALLBACK}."
-            URL="${BASE}/openvino_toolkit_${OPENVINO_DIST}_${OPENVINO_FULLVER_FALLBACK}_x86_64.tgz"
-          fi
-          echo "Downloading ${URL}"
-          if ! curl -fL -o /tmp/openvino.tgz "${URL}"; then
-            echo "::error::OpenVINO archive download failed: ${URL}"
-            echo "  Pin the correct directory/version/build id by browsing"
-            echo "  https://storage.openvinotoolkit.org/repositories/openvino/packages/"
+          URL="${BASE}/openvino_toolkit_${OPENVINO_DIST}_${OPENVINO_FULLVER}_x86_64.tgz"
+          # DIAGNOSTIC: the prior run got a 1061-byte HTTP-200 body for BOTH the
+          # directory and the tarball URL (a soft-404 / landing / block page, not
+          # a file) — `curl -f` can't catch that (it's a 200), and `tar` failed
+          # "not in gzip format". Capture the server's ACTUAL response (status,
+          # type, size, final URL, body head) so the correct path/build — or a
+          # host-side block — is visible, and only proceed if the bytes are a
+          # real gzip. A browser UA rules out a trivial UA block.
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+          echo "== Directory: ${BASE}/ =="
+          curl -sSL -A "${UA}" -o /tmp/ov_dir.txt \
+            -w "  HTTP %{http_code} type=%{content_type} size=%{size_download} final=%{url_effective}\n" \
+            "${BASE}/" || true
+          echo "  ---- body head ----"; head -c 1200 /tmp/ov_dir.txt; echo; echo "  ----"
+          echo "== Tarball: ${URL} =="
+          curl -sSL -A "${UA}" -o /tmp/openvino.tgz \
+            -w "  HTTP %{http_code} type=%{content_type} size=%{size_download} final=%{url_effective}\n" \
+            "${URL}" || true
+          MAGIC="$(head -c2 /tmp/openvino.tgz | od -An -tx1 | tr -d ' \n')"
+          if [ "${MAGIC}" != "1f8b" ]; then
+            echo "::error::Downloaded content is NOT a gzip archive (magic=${MAGIC}) — soft-404/landing/block page, not the tarball."
+            echo "  ---- response body head ----"; head -c 1200 /tmp/openvino.tgz; echo; echo "  ----"
+            echo "  Use the body/headers above to pin the correct URL (dir/version/build/prefix),"
+            echo "  or confirm storage.openvinotoolkit.org blocks the runner."
             exit 1
           fi
+          echo "Got a real gzip archive — proceeding."
           sudo mkdir -p /opt/intel/openvino_2025
           # --strip-components=1 drops the top-level versioned dir so the runtime
           # lands directly under /opt/intel/openvino_2025.
