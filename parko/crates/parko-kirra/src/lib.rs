@@ -162,6 +162,25 @@ impl KirraGovernor {
         self
     }
 
+    /// Sets the per-ODD operational speed cap on the nominal contract. The
+    /// effective nominal ceiling then becomes `min(max_speed_mps, cap)` via
+    /// `VehicleKinematicsContract::effective_max_speed_mps`. Mirrors
+    /// `DiverseKirraGovernor::with_odd_speed_cap` so a `GovernorComparator`
+    /// can pair the two on the SAME ODD cap and they agree by construction;
+    /// without it the cap could not be configured and the diverse governor's
+    /// ODD-cap arm was unreachable (quality-hardening finding).
+    ///
+    /// Panics if `cap_mps` is non-finite or non-positive.
+    pub fn with_odd_speed_cap(mut self, cap_mps: f64) -> Self {
+        assert!(
+            cap_mps.is_finite() && cap_mps > 0.0,
+            "ODD speed cap must be a finite positive value, got {}",
+            cap_mps
+        );
+        self.nominal_contract.odd_speed_cap_mps = Some(cap_mps);
+        self
+    }
+
     /// Updates the RSS safe-distance state.
     /// Called by the control loop after each RSS evaluation cycle.
     pub fn update_rss_state(&mut self, state: RssState) {
