@@ -168,16 +168,15 @@ jobs:
   parko-openvino:
     name: Parko OpenVINO Backend Tests (pip openvino-2025.1)
     runs-on: ubuntu-latest
-    # This job is now SPLIT into two test steps (see below):
-    #   1. OpenVINO-only tests — GATING. Confirmed green in CI once the pip
-    #      wheel install + bare-symlink fix landed (#143 resolved); they failed
-    #      before only because OvBackend::new was rejected as "version too old".
-    #   2. Cross-backend equivalence test — isolated, step-level
-    #      continue-on-error (#144), because it shares parko-onnx's ort init
-    #      path (under test via the rc.11 downgrade).
-    # The job-level continue-on-error is REMOVED so the OpenVINO backend is now
-    # genuinely gated; only the equivalence step (#144) remains non-gating.
-    # `parko-safety` remains the primary gating safety check regardless.
+    # This job is SPLIT into two test steps (see below), BOTH gating:
+    #   1. OpenVINO-only tests — exercise OvBackend through the pip OpenVINO
+    #      2025.1 wheel (#143 resolved by the wheel + bare-symlink install).
+    #   2. Cross-backend equivalence test — exercises OrtBackend + OvBackend
+    #      together. Was briefly non-gating while the apparent ort "init
+    #      deadlock" (#144) was diagnosed as the empty-$HOME ORT_DYLIB_PATH
+    #      bug; now fixed, so this step is gating again.
+    # No continue-on-error anywhere in this job; `parko-safety` remains the
+    # primary gating safety check.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -274,19 +273,18 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: cargo test -p parko-openvino -- --nocapture --skip ort_ov_output_equivalence_on_mnist
-      - name: parko-openvino cross-backend equivalence test (non-gating, ort #144)
+      - name: parko-openvino cross-backend equivalence test (GATING)
         # `ort_ov_output_equivalence_on_mnist` loads the SAME MNIST model
         # through parko-onnx's OrtBackend and compares it to OpenVINO's, so it
-        # shares parko-onnx's ort init path (#144). It is kept ISOLATED in its
-        # own STEP-LEVEL continue-on-error so that, until the ort downgrade is
-        # confirmed to clear the init deadlock here too, it cannot block the
-        # now-gating OpenVINO-only step above. Once the rc.11 downgrade is
-        # proven to green this test in CI, this step can be promoted to gating
-        # (drop continue-on-error). `timeout-minutes` fast-fails any residual
-        # hang. ORT_DYLIB_PATH points OrtBackend's load-dynamic at
-        # libonnxruntime.so; LD_LIBRARY_PATH (OpenVINO) still comes from the
-        # install step via $GITHUB_ENV.
-        continue-on-error: true
+        # exercises BOTH runtimes together. It was previously isolated under
+        # step-level continue-on-error while the apparent ort "init deadlock"
+        # (#144) was diagnosed; that turned out to be the empty-$HOME
+        # ORT_DYLIB_PATH bug, now fixed, and this test passes cleanly in CI
+        # (rc.11 + ONNX Runtime 1.23.2). It is therefore GATING again — no
+        # continue-on-error — so a real cross-backend divergence blocks.
+        # `timeout-minutes` keeps a fast-fail guard. ORT_DYLIB_PATH (OrtBackend
+        # load-dynamic) and LD_LIBRARY_PATH (OpenVINO) come from the install
+        # steps via $GITHUB_ENV.
         timeout-minutes: 10
         working-directory: parko
         env:
