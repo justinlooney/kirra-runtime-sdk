@@ -182,20 +182,36 @@ jobs:
           set -euo pipefail
           OPENVINO_VER="2025.1"        # pinned minor (>= 2025.1 satisfies openvino-rs#167)
           OPENVINO_DIST="ubuntu24"     # runs-on: ubuntu-latest == ubuntu-24.04
+          # Fallback exact build id (used only if the directory listing can't be
+          # resolved). Replace if the download 404s — verify on the storage site.
+          OPENVINO_FULLVER_FALLBACK="2025.1.0.18503"
           BASE="https://storage.openvinotoolkit.org/repositories/openvino/packages/${OPENVINO_VER}/linux"
-          # The exact tarball carries a build id (e.g. 2025.1.0.18503) that is
-          # NOT derivable, so resolve the precise filename from the directory
-          # listing rather than hard-coding a build number.
-          TARBALL="$(curl -fsSL "${BASE}/" \
+          # Resolve the exact tarball (its build id is not derivable). GUARD the
+          # pipeline with `|| true`: a curl/grep miss must NOT die under
+          # `set -e`/`pipefail` before the diagnostic runs (the prior version
+          # exited 1 with zero output, masking whether the URL or the pattern
+          # was wrong).
+          echo "Listing ${BASE}/ ..."
+          LISTING="$(curl -fsSL "${BASE}/" || true)"
+          TARBALL="$(printf '%s\n' "${LISTING}" \
             | grep -oE "(l_)?openvino_toolkit_${OPENVINO_DIST}_${OPENVINO_VER}\.[0-9.]+_x86_64\.tgz" \
-            | sort -V | tail -n1)"
-          if [ -z "${TARBALL}" ]; then
-            echo "::error::Could not resolve an OpenVINO ${OPENVINO_VER} ${OPENVINO_DIST} archive at ${BASE}/ — check the version/dist pin."
-            curl -fsSL "${BASE}/" | grep -oE "[a-z_]*openvino_toolkit[^\"<> ]+\.tgz" | sort -u | head || true
+            | sort -V | tail -n1 || true)"
+          if [ -n "${TARBALL}" ]; then
+            URL="${BASE}/${TARBALL}"
+            echo "Resolved from listing: ${TARBALL}"
+          else
+            echo "Listing yielded no tarball (got ${#LISTING} bytes). openvino_toolkit*.tgz seen:"
+            printf '%s\n' "${LISTING}" | grep -oE "[a-z_]*openvino_toolkit[^\"<> ]+\.tgz" | sort -u | head -20 || true
+            echo "Falling back to pinned build ${OPENVINO_FULLVER_FALLBACK}."
+            URL="${BASE}/openvino_toolkit_${OPENVINO_DIST}_${OPENVINO_FULLVER_FALLBACK}_x86_64.tgz"
+          fi
+          echo "Downloading ${URL}"
+          if ! curl -fL -o /tmp/openvino.tgz "${URL}"; then
+            echo "::error::OpenVINO archive download failed: ${URL}"
+            echo "  Pin the correct directory/version/build id by browsing"
+            echo "  https://storage.openvinotoolkit.org/repositories/openvino/packages/"
             exit 1
           fi
-          echo "Resolved OpenVINO archive: ${TARBALL}"
-          curl -fL -o /tmp/openvino.tgz "${BASE}/${TARBALL}"
           sudo mkdir -p /opt/intel/openvino_2025
           # --strip-components=1 drops the top-level versioned dir so the runtime
           # lands directly under /opt/intel/openvino_2025.
