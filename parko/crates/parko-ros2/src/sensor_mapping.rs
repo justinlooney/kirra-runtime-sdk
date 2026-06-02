@@ -1330,6 +1330,362 @@ impl RadarMapping {
 }
 
 // ===========================================================================
+// IMU mapping  (sensor_msgs/Imu → state-vector tensor)
+// ===========================================================================
+//
+// SAFETY FRAMING. Sensor mapping is UPSTREAM of the governor's guarantee. An
+// IMU mapping that adds/omits gravity on the wrong axis, scrambles a
+// quaternion, or carries a field at the wrong index feeds Parko's model
+// corrupted motion state — a command that is confidently wrong AND within the
+// envelope the governor passes. Deterministic, convention-correct, fail-closed
+// is the point.
+//
+// STATE-VECTOR PATTERN — reuses the odom mapping above. Output is a flat,
+// fixed-order `Vec<f32>` (there is NO NCHW/NHWC layout for a 1-D state vector,
+// so — like odom — there is no layout enum). Orientation reuses odom's
+// `OdomOrientation` enum and `quat_to_euler` verbatim, so adapter, odom, and
+// IMU agree on quaternion convention + what "yaw" means.
+//
+// WHAT'S NEW VS ODOM (each a correctness surface): odom carried linear
+// VELOCITY; the IMU carries linear ACCELERATION, and a raw accelerometer reads
+// the GRAVITY vector (~9.81 m/s² on the up axis) even when stationary. Plus
+// IMU orientation is OPTIONAL (sensor_msgs/Imu reports it unavailable via
+// covariance[0] = -1). Both are handled explicitly below; odom does NOT
+// validate quaternion norm, so the unit-norm check here is newly added.
+//
+// GRAVITY (FLAGGED — the headline IMU concern). The model expects either raw
+// (gravity-included) or gravity-compensated (true motion) acceleration; the
+// wrong one is a silent ~9.81 m/s² offset on one axis. `GravityPolicy` makes it
+// explicit — never silently picked. `Raw` is the safe lossless default (no
+// transform). `Compensated` subtracts the rotated gravity vector and FAILS
+// CLOSED if orientation is absent (you cannot remove gravity without attitude;
+// never assume level).
+//
+// UNITS / AXIS CONVENTION (EXPLICIT, like the LiDAR axis convention). Body
+// frame REP-103: x-forward, y-left, z-up. `angular_velocity` is rad/s (NOT
+// deg/s — a 57× error). `linear_acceleration` is m/s² (NOT g). A stationary
+// LEVEL IMU reads `+gravity` on the +z (up) axis. Quaternion is ROS order
+// `(x, y, z, w)`, Hamilton convention (same as odom). The quaternion must be
+// unit-norm: validated within `quat_norm_tolerance` and REJECTED beyond it —
+// never silently re-normalized (that masks a sensor fault).
+//
+// ROS SHIM — DEFERRED. `sensor_msgs/Imu → ImuSample` and the
+// `SensorInputMapping` trait impl are the ros2-gated layer, like the other
+// shims. PLANNED, not implemented here. (Magnetometer is a separate message,
+// `sensor_msgs/MagneticField` — a possible small follow-on state-vector
+// mapping, out of scope here.)
+
+/// A unit quaternion in ROS order `(x, y, z, w)`, Hamilton convention — the
+/// same convention odom's `quat_to_euler` consumes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quaternion {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub w: f32,
+}
+
+impl Quaternion {
+    /// Euclidean norm `√(x²+y²+z²+w²)`. A valid orientation quaternion is 1.0.
+    #[must_use]
+    pub fn norm(self) -> f32 {
+        (self.x * self.x + self.y * self.y + self.z * self.z + self.w * self.w).sqrt()
+    }
+}
+
+/// One IMU observation. NOT the ROS message — that is the deferred shim's
+/// input. `orientation` is `None` when the sensor reports it unavailable
+/// (`sensor_msgs/Imu` covariance[0] = -1); it is NEVER fabricated as identity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImuSample {
+    /// Linear acceleration, m/s², body frame. Includes gravity (raw
+    /// accelerometer); see `GravityPolicy`.
+    pub linear_acceleration: [f32; 3],
+    /// Angular velocity, rad/s, body frame.
+    pub angular_velocity: [f32; 3],
+    /// Orientation, or `None` if unavailable.
+    pub orientation: Option<Quaternion>,
+}
+
+/// How the gravity component of `linear_acceleration` is handled.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GravityPolicy {
+    /// Pass the accelerometer reading through unchanged (gravity included).
+    /// Lossless, no transform — the model must expect raw acceleration.
+    Raw,
+    /// Subtract the rotated gravity vector to recover true linear acceleration.
+    /// REQUIRES orientation; fails closed (`GravityCompensationNeedsOrientation`)
+    /// if it is absent — gravity cannot be removed without knowing attitude.
+    Compensated,
+}
+
+/// Feature scaling for the accel/gyro blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImuNormalization {
+    /// Physical units (m/s², rad/s); orientation is never scaled.
+    Raw,
+    /// `acceleration / accel_scale`, `angular_velocity / gyro_scale`. NO clamp —
+    /// clamping would lose the very transient (a spike, a jerk) the model needs.
+    /// Orientation (quaternion already unit, Euler in radians) is not scaled.
+    Normalized,
+}
+
+/// Optional fault gate: an implausibly large reading is REJECTED, never clipped
+/// (clamping an impossible value to a plausible max hides the fault).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImuSanityBound {
+    /// Max plausible `|linear_acceleration|` (vector magnitude), m/s².
+    pub max_accel_mps2: f32,
+    /// Max plausible `|angular_velocity|` (vector magnitude), rad/s.
+    pub max_gyro_rad_s: f32,
+}
+
+/// IMU state-vector mapping configuration. Everything that changes physical
+/// meaning is explicit; no hidden default. Output order (each block present
+/// only if selected): `[acceleration(3)] [angular_velocity(3)] [orientation]`.
+#[derive(Debug, Clone)]
+pub struct ImuConfig {
+    /// Include the (policy-applied) linear acceleration block (3 floats).
+    pub include_acceleration: bool,
+    /// Include the angular-velocity (gyro) block (3 floats).
+    pub include_angular_velocity: bool,
+    /// Include the orientation block, in the chosen representation. Reuses
+    /// odom's `OdomOrientation` (Quaternion=4, FullEuler=3, Yaw=1). `Some`
+    /// requires the sample to carry orientation, else fail-closed.
+    pub include_orientation: Option<OdomOrientation>,
+    /// Raw vs gravity-compensated acceleration. See `GravityPolicy`.
+    pub gravity_policy: GravityPolicy,
+    /// Gravity magnitude (m/s²) used by `Compensated`. Finite, `> 0`.
+    pub gravity_mps2: f32,
+    /// Accel/gyro scaling. See `ImuNormalization`.
+    pub normalization: ImuNormalization,
+    /// Under `Normalized`, the acceleration mapping to 1.0. Finite, `> 0`.
+    pub accel_scale: f32,
+    /// Under `Normalized`, the angular velocity mapping to 1.0. Finite, `> 0`.
+    pub gyro_scale: f32,
+    /// Unit-norm tolerance for the orientation quaternion. `>= 0`, finite.
+    pub quat_norm_tolerance: f32,
+    /// Optional implausible-magnitude fault gate.
+    pub sanity: Option<ImuSanityBound>,
+    /// Tensor name inside the produced `TensorBatch`.
+    pub tensor_name: String,
+}
+
+impl ImuConfig {
+    /// Total length of the produced state vector.
+    #[must_use]
+    pub fn vector_len(&self) -> usize {
+        (if self.include_acceleration { 3 } else { 0 })
+            + (if self.include_angular_velocity { 3 } else { 0 })
+            + self.include_orientation.map(|o| o.float_count()).unwrap_or(0)
+    }
+}
+
+/// Errors the pure IMU transform may return. A dedicated sibling enum (like the
+/// other sensor errors), kept disjoint — not folded into Odom/Lidar/Radar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImuMappingError {
+    /// No feature block selected — the output would be empty.
+    EmptyFeatureSet,
+    /// `Normalized` with a non-finite or `<= 0` scale (`accel_scale`/`gyro_scale`).
+    InvalidNormalizationScale,
+    /// `Compensated` with a non-finite or `<= 0` `gravity_mps2`.
+    InvalidGravity,
+    /// `quat_norm_tolerance` is negative or non-finite.
+    InvalidQuatTolerance,
+    /// A sanity bound is non-finite or `<= 0`.
+    InvalidSanityBound,
+    /// A non-finite (`NaN`/`inf`) acceleration, gyro, or quaternion component —
+    /// the whole transform is rejected so one bad field can't corrupt output.
+    NonFiniteSample,
+    /// `include_orientation` is set but the sample has no orientation. Never
+    /// fabricated as identity (that silently asserts "level + facing forward").
+    OrientationRequiredButMissing,
+    /// `Compensated` but the sample has no orientation — cannot remove gravity
+    /// without attitude.
+    GravityCompensationNeedsOrientation,
+    /// The orientation quaternion is not unit-norm within tolerance. Rejected,
+    /// never silently re-normalized (that would mask a sensor fault).
+    NonUnitQuaternion,
+    /// `|linear_acceleration|` exceeds the configured sanity bound.
+    ImplausibleAcceleration,
+    /// `|angular_velocity|` exceeds the configured sanity bound.
+    ImplausibleAngularVelocity,
+}
+
+/// Pure IMU → state-vector tensor mapping. Cloning is cheap.
+#[derive(Debug, Clone)]
+pub struct ImuMapping {
+    config: ImuConfig,
+}
+
+impl ImuMapping {
+    #[must_use]
+    pub fn new(config: ImuConfig) -> Self {
+        Self { config }
+    }
+
+    fn validate_config(&self) -> Result<(), ImuMappingError> {
+        let c = &self.config;
+        if c.vector_len() == 0 {
+            return Err(ImuMappingError::EmptyFeatureSet);
+        }
+        if c.normalization == ImuNormalization::Normalized
+            && (!c.accel_scale.is_finite() || c.accel_scale <= 0.0
+                || !c.gyro_scale.is_finite() || c.gyro_scale <= 0.0)
+        {
+            return Err(ImuMappingError::InvalidNormalizationScale);
+        }
+        if c.gravity_policy == GravityPolicy::Compensated
+            && (!c.gravity_mps2.is_finite() || c.gravity_mps2 <= 0.0)
+        {
+            return Err(ImuMappingError::InvalidGravity);
+        }
+        if !c.quat_norm_tolerance.is_finite() || c.quat_norm_tolerance < 0.0 {
+            return Err(ImuMappingError::InvalidQuatTolerance);
+        }
+        if let Some(s) = c.sanity {
+            if !s.max_accel_mps2.is_finite() || s.max_accel_mps2 <= 0.0
+                || !s.max_gyro_rad_s.is_finite() || s.max_gyro_rad_s <= 0.0
+            {
+                return Err(ImuMappingError::InvalidSanityBound);
+            }
+        }
+        Ok(())
+    }
+
+    /// World-up unit vector expressed in the body frame for orientation `q`
+    /// (= `R(q)ᵀ · ẑ_world`). Used to subtract gravity in the body frame.
+    fn world_up_in_body(q: Quaternion) -> [f32; 3] {
+        [
+            2.0 * (q.x * q.z - q.w * q.y),
+            2.0 * (q.y * q.z + q.w * q.x),
+            1.0 - 2.0 * (q.x * q.x + q.y * q.y),
+        ]
+    }
+
+    /// The pure transform. Same sample → same tensor, every call, no I/O.
+    pub fn to_tensor(&self, sample: &ImuSample) -> Result<TensorBatch<'static>, ImuMappingError> {
+        let c = &self.config;
+        self.validate_config()?;
+
+        // Non-finite rejection (accel, gyro, and the quaternion if present).
+        let any_nonfinite_vec3 = |v: &[f32; 3]| v.iter().any(|x| !x.is_finite());
+        if any_nonfinite_vec3(&sample.linear_acceleration)
+            || any_nonfinite_vec3(&sample.angular_velocity)
+            || sample
+                .orientation
+                .map(|q| !(q.x.is_finite() && q.y.is_finite() && q.z.is_finite() && q.w.is_finite()))
+                .unwrap_or(false)
+        {
+            return Err(ImuMappingError::NonFiniteSample);
+        }
+
+        // Orientation availability (fail-closed; never fabricate identity).
+        if c.include_orientation.is_some() && sample.orientation.is_none() {
+            return Err(ImuMappingError::OrientationRequiredButMissing);
+        }
+        if c.gravity_policy == GravityPolicy::Compensated && sample.orientation.is_none() {
+            return Err(ImuMappingError::GravityCompensationNeedsOrientation);
+        }
+
+        // Validate the quaternion's unit-norm whenever it will be USED (for an
+        // orientation feature OR for gravity compensation). Reject, never
+        // re-normalize.
+        let quat_used = c.include_orientation.is_some()
+            || c.gravity_policy == GravityPolicy::Compensated;
+        if quat_used {
+            if let Some(q) = sample.orientation {
+                if (q.norm() - 1.0).abs() > c.quat_norm_tolerance {
+                    return Err(ImuMappingError::NonUnitQuaternion);
+                }
+            }
+        }
+
+        // Sanity fault gate (reject, never clip).
+        if let Some(s) = c.sanity {
+            let a = sample.linear_acceleration;
+            let g = sample.angular_velocity;
+            let accel_mag = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+            let gyro_mag = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+            if accel_mag > s.max_accel_mps2 {
+                return Err(ImuMappingError::ImplausibleAcceleration);
+            }
+            if gyro_mag > s.max_gyro_rad_s {
+                return Err(ImuMappingError::ImplausibleAngularVelocity);
+            }
+        }
+
+        // Gravity policy → the acceleration that enters the feature vector.
+        let accel = match c.gravity_policy {
+            GravityPolicy::Raw => sample.linear_acceleration,
+            GravityPolicy::Compensated => {
+                // orientation guaranteed Some by the check above.
+                let q = sample.orientation.expect("checked present");
+                let up = Self::world_up_in_body(q);
+                // a_true = measured − gravity · (world-up in body).
+                [
+                    sample.linear_acceleration[0] - c.gravity_mps2 * up[0],
+                    sample.linear_acceleration[1] - c.gravity_mps2 * up[1],
+                    sample.linear_acceleration[2] - c.gravity_mps2 * up[2],
+                ]
+            }
+        };
+
+        // Build the state vector in the fixed documented order.
+        let mut out: Vec<f32> = Vec::with_capacity(c.vector_len());
+        let scale_accel = |x: f32| match c.normalization {
+            ImuNormalization::Raw => x,
+            ImuNormalization::Normalized => x / c.accel_scale,
+        };
+        let scale_gyro = |x: f32| match c.normalization {
+            ImuNormalization::Raw => x,
+            ImuNormalization::Normalized => x / c.gyro_scale,
+        };
+
+        if c.include_acceleration {
+            out.push(scale_accel(accel[0]));
+            out.push(scale_accel(accel[1]));
+            out.push(scale_accel(accel[2]));
+        }
+        if c.include_angular_velocity {
+            out.push(scale_gyro(sample.angular_velocity[0]));
+            out.push(scale_gyro(sample.angular_velocity[1]));
+            out.push(scale_gyro(sample.angular_velocity[2]));
+        }
+        if let Some(repr) = c.include_orientation {
+            // orientation guaranteed Some by the availability check above.
+            let q = sample.orientation.expect("checked present");
+            match repr {
+                OdomOrientation::Quaternion => {
+                    out.push(q.x);
+                    out.push(q.y);
+                    out.push(q.z);
+                    out.push(q.w);
+                }
+                OdomOrientation::FullEuler => {
+                    // Reuse odom's quaternion→Euler (ROS x,y,z,w; ZYX).
+                    let (roll, pitch, yaw) =
+                        quat_to_euler(q.x as f64, q.y as f64, q.z as f64, q.w as f64);
+                    out.push(roll as f32);
+                    out.push(pitch as f32);
+                    out.push(yaw as f32);
+                }
+                OdomOrientation::Yaw => {
+                    let (_, _, yaw) =
+                        quat_to_euler(q.x as f64, q.y as f64, q.z as f64, q.w as f64);
+                    out.push(yaw as f32);
+                }
+            }
+        }
+
+        let mut named = HashMap::new();
+        named.insert(c.tensor_name.clone(), TensorStorage::Owned(out));
+        Ok(TensorBatch { named_tensors: named, metadata: HashMap::new() })
+    }
+}
+
+// ===========================================================================
 // Camera + Odom — tests
 // ===========================================================================
 
@@ -2513,6 +2869,282 @@ mod radar_tests {
             for slot in (k * RADAR_FEATURES)..(8 * RADAR_FEATURES) {
                 prop_assert_eq!(grid[slot], 0.0);
             }
+        }
+    }
+}
+// ===========================================================================
+// IMU — tests
+// ===========================================================================
+
+#[cfg(test)]
+mod imu_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::f32::consts::FRAC_PI_4;
+
+    const G: f32 = 9.80665;
+
+    fn quat(x: f32, y: f32, z: f32, w: f32) -> Quaternion {
+        Quaternion { x, y, z, w }
+    }
+    fn identity() -> Quaternion {
+        quat(0.0, 0.0, 0.0, 1.0)
+    }
+
+    /// All blocks on, Raw, no sanity. Tests clone and tweak.
+    fn base_cfg() -> ImuConfig {
+        ImuConfig {
+            include_acceleration: true,
+            include_angular_velocity: true,
+            include_orientation: Some(OdomOrientation::Quaternion),
+            gravity_policy: GravityPolicy::Raw,
+            gravity_mps2: G,
+            normalization: ImuNormalization::Raw,
+            accel_scale: 1.0,
+            gyro_scale: 1.0,
+            quat_norm_tolerance: 1e-3,
+            sanity: None,
+            tensor_name: "imu".to_string(),
+        }
+    }
+
+    fn sample(accel: [f32; 3], gyro: [f32; 3], q: Option<Quaternion>) -> ImuSample {
+        ImuSample { linear_acceleration: accel, angular_velocity: gyro, orientation: q }
+    }
+
+    fn out(cfg: ImuConfig, s: &ImuSample) -> Vec<f32> {
+        ImuMapping::new(cfg)
+            .to_tensor(s)
+            .expect("valid")
+            .named_tensors
+            .get("imu")
+            .unwrap()
+            .as_slice()
+            .to_vec()
+    }
+
+    // -- Gravity (the headline) -----------------------------------------
+
+    /// GRAVITY VERIFIED, not assumed: a stationary LEVEL IMU under `Raw` shows
+    /// `+G` on the +z (up) axis, passed through verbatim.
+    #[test]
+    fn gravity_raw_includes_gravity_on_up_axis() {
+        let cfg = ImuConfig {
+            include_angular_velocity: false,
+            include_orientation: None,
+            ..base_cfg()
+        };
+        let s = sample([0.0, 0.0, G], [0.0, 0.0, 0.0], None);
+        assert_eq!(out(cfg, &s), vec![0.0, 0.0, G]);
+    }
+
+    /// `Compensated` with a LEVEL orientation removes gravity → ~0 on every axis.
+    #[test]
+    fn gravity_compensated_level_removes_gravity() {
+        let cfg = ImuConfig {
+            include_angular_velocity: false,
+            include_orientation: None,
+            gravity_policy: GravityPolicy::Compensated,
+            ..base_cfg()
+        };
+        let s = sample([0.0, 0.0, G], [0.0, 0.0, 0.0], Some(identity()));
+        let o = out(cfg, &s);
+        assert!(o.iter().all(|x| x.abs() < 1e-4), "expected ~0, got {o:?}");
+    }
+
+    /// `Compensated` USES the orientation: rolled 90° about x, the stationary
+    /// reading is gravity on body +y, and compensation still yields ~0 —
+    /// verifying the rotation, not just the identity case.
+    #[test]
+    fn gravity_compensated_rolled_uses_orientation() {
+        // roll +90° about x: q = (sin45, 0, 0, cos45).
+        let q = quat(FRAC_PI_4.sin(), 0.0, 0.0, FRAC_PI_4.cos());
+        let cfg = ImuConfig {
+            include_angular_velocity: false,
+            include_orientation: None,
+            gravity_policy: GravityPolicy::Compensated,
+            ..base_cfg()
+        };
+        // gravity now reads on body +y for a rolled-90° stationary IMU.
+        let s = sample([0.0, G, 0.0], [0.0, 0.0, 0.0], Some(q));
+        let o = out(cfg, &s);
+        assert!(o.iter().all(|x| x.abs() < 1e-4), "rolled compensation expected ~0, got {o:?}");
+    }
+
+    // -- Orientation / quaternion ---------------------------------------
+
+    #[test]
+    fn quaternion_orientation_passes_through() {
+        let cfg = ImuConfig {
+            include_acceleration: false,
+            include_angular_velocity: false,
+            ..base_cfg()
+        };
+        let q = quat(0.0, 0.0, FRAC_PI_4.sin(), FRAC_PI_4.cos()); // yaw 90°, unit
+        let s = sample([0.0; 3], [0.0; 3], Some(q));
+        assert_eq!(out(cfg, &s), vec![q.x, q.y, q.z, q.w]);
+    }
+
+    /// Yaw representation reuses odom's `quat_to_euler` — a yaw-90° quaternion
+    /// yields ~π/2.
+    #[test]
+    fn yaw_orientation_matches_quat_to_euler() {
+        let cfg = ImuConfig {
+            include_acceleration: false,
+            include_angular_velocity: false,
+            include_orientation: Some(OdomOrientation::Yaw),
+            ..base_cfg()
+        };
+        let q = quat(0.0, 0.0, FRAC_PI_4.sin(), FRAC_PI_4.cos());
+        let o = out(cfg, &s_with(q));
+        assert!((o[0] - std::f32::consts::FRAC_PI_2).abs() < 1e-5, "yaw got {}", o[0]);
+        assert_eq!(o.len(), 1);
+    }
+    fn s_with(q: Quaternion) -> ImuSample {
+        sample([0.0; 3], [0.0; 3], Some(q))
+    }
+
+    #[test]
+    fn non_unit_quaternion_rejected() {
+        let cfg = ImuConfig { include_acceleration: false, include_angular_velocity: false, ..base_cfg() };
+        let s = sample([0.0; 3], [0.0; 3], Some(quat(0.0, 0.0, 0.0, 2.0))); // norm 2
+        let err = ImuMapping::new(cfg).to_tensor(&s).unwrap_err();
+        assert_eq!(err, ImuMappingError::NonUnitQuaternion);
+    }
+
+    #[test]
+    fn orientation_required_but_missing_rejected() {
+        let cfg = ImuConfig { include_acceleration: false, include_angular_velocity: false, ..base_cfg() };
+        let s = sample([0.0; 3], [0.0; 3], None);
+        let err = ImuMapping::new(cfg).to_tensor(&s).unwrap_err();
+        assert_eq!(err, ImuMappingError::OrientationRequiredButMissing);
+    }
+
+    #[test]
+    fn compensated_without_orientation_rejected() {
+        let cfg = ImuConfig {
+            include_angular_velocity: false,
+            include_orientation: None, // so the orientation-required check doesn't fire first
+            gravity_policy: GravityPolicy::Compensated,
+            ..base_cfg()
+        };
+        let s = sample([0.0, 0.0, G], [0.0; 3], None);
+        let err = ImuMapping::new(cfg).to_tensor(&s).unwrap_err();
+        assert_eq!(err, ImuMappingError::GravityCompensationNeedsOrientation);
+    }
+
+    // -- Dims / normalization / determinism -----------------------------
+
+    #[test]
+    fn output_dims_match_config() {
+        // accel(3) + gyro(3) + quaternion(4) = 10.
+        let s = sample([1.0, 2.0, 3.0], [0.1, 0.2, 0.3], Some(identity()));
+        assert_eq!(out(base_cfg(), &s).len(), 10);
+        // yaw-only orientation → accel(3)+gyro(3)+1 = 7.
+        let cfg = ImuConfig { include_orientation: Some(OdomOrientation::Yaw), ..base_cfg() };
+        assert_eq!(out(cfg, &s).len(), 7);
+    }
+
+    #[test]
+    fn normalized_scales_accel_and_gyro_not_orientation() {
+        let cfg = ImuConfig {
+            normalization: ImuNormalization::Normalized,
+            accel_scale: 10.0,
+            gyro_scale: 2.0,
+            ..base_cfg()
+        };
+        let s = sample([10.0, 20.0, 30.0], [2.0, 4.0, 6.0], Some(identity()));
+        // accel/10, gyro/2, quaternion unchanged.
+        assert_eq!(out(cfg, &s), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn is_deterministic() {
+        let s = sample([0.5, -1.0, G], [0.1, -0.2, 0.3], Some(identity()));
+        assert_eq!(out(base_cfg(), &s), out(base_cfg(), &s));
+    }
+
+    // -- Fail-closed -----------------------------------------------------
+
+    #[test]
+    fn non_finite_sample_rejected() {
+        let cfgs_samples = [
+            sample([f32::NAN, 0.0, 0.0], [0.0; 3], Some(identity())),
+            sample([0.0; 3], [0.0, f32::INFINITY, 0.0], Some(identity())),
+            sample([0.0; 3], [0.0; 3], Some(quat(f32::NAN, 0.0, 0.0, 1.0))),
+        ];
+        for s in cfgs_samples {
+            let err = ImuMapping::new(base_cfg()).to_tensor(&s).unwrap_err();
+            assert_eq!(err, ImuMappingError::NonFiniteSample);
+        }
+    }
+
+    #[test]
+    fn malformed_config_rejected() {
+        let s = sample([0.0, 0.0, G], [0.0; 3], Some(identity()));
+
+        let c = ImuConfig {
+            include_acceleration: false, include_angular_velocity: false, include_orientation: None,
+            ..base_cfg()
+        };
+        assert_eq!(ImuMapping::new(c).to_tensor(&s).unwrap_err(), ImuMappingError::EmptyFeatureSet);
+
+        let c = ImuConfig { normalization: ImuNormalization::Normalized, accel_scale: 0.0, ..base_cfg() };
+        assert_eq!(ImuMapping::new(c).to_tensor(&s).unwrap_err(), ImuMappingError::InvalidNormalizationScale);
+
+        let c = ImuConfig { gravity_policy: GravityPolicy::Compensated, gravity_mps2: 0.0, ..base_cfg() };
+        assert_eq!(ImuMapping::new(c).to_tensor(&s).unwrap_err(), ImuMappingError::InvalidGravity);
+
+        let c = ImuConfig { quat_norm_tolerance: -1.0, ..base_cfg() };
+        assert_eq!(ImuMapping::new(c).to_tensor(&s).unwrap_err(), ImuMappingError::InvalidQuatTolerance);
+
+        let c = ImuConfig { sanity: Some(ImuSanityBound { max_accel_mps2: 0.0, max_gyro_rad_s: 1.0 }), ..base_cfg() };
+        assert_eq!(ImuMapping::new(c).to_tensor(&s).unwrap_err(), ImuMappingError::InvalidSanityBound);
+    }
+
+    #[test]
+    fn sanity_bound_rejects_implausible() {
+        let cfg = ImuConfig {
+            sanity: Some(ImuSanityBound { max_accel_mps2: 50.0, max_gyro_rad_s: 10.0 }),
+            ..base_cfg()
+        };
+        // 200 m/s² accel magnitude >> 50 → rejected, NOT clipped.
+        let s = sample([200.0, 0.0, 0.0], [0.0; 3], Some(identity()));
+        assert_eq!(ImuMapping::new(cfg.clone()).to_tensor(&s).unwrap_err(), ImuMappingError::ImplausibleAcceleration);
+        // huge gyro.
+        let s2 = sample([0.0, 0.0, G], [100.0, 0.0, 0.0], Some(identity()));
+        assert_eq!(ImuMapping::new(cfg).to_tensor(&s2).unwrap_err(), ImuMappingError::ImplausibleAngularVelocity);
+    }
+
+    // -- Field-fidelity invariant (property) -----------------------------
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// LOAD-BEARING INVARIANT (state-vector analog of the spatial in-bounds
+        /// invariant): every selected input component appears at its correct
+        /// output index, carried through faithfully — nothing lost, swapped, or
+        /// corrupted. Raw + no compensation + quaternion repr makes the output
+        /// exactly [accel(3), gyro(3), quat(4)] verbatim.
+        #[test]
+        fn prop_field_fidelity(
+            ax in -50.0_f32..50.0, ay in -50.0_f32..50.0, az in -50.0_f32..50.0,
+            gx in -20.0_f32..20.0, gy in -20.0_f32..20.0, gz in -20.0_f32..20.0,
+            qx in -1.0_f32..1.0, qy in -1.0_f32..1.0, qz in -1.0_f32..1.0, qw in 0.5_f32..1.5,
+        ) {
+            // Normalize to a unit quaternion (norm > 0.5 by construction).
+            let n = (qx*qx + qy*qy + qz*qz + qw*qw).sqrt();
+            let q = quat(qx/n, qy/n, qz/n, qw/n);
+            let s = sample([ax, ay, az], [gx, gy, gz], Some(q));
+            let o = out(base_cfg(), &s);
+            prop_assert_eq!(o.len(), 10);
+            // accel verbatim at 0..3
+            prop_assert_eq!(o[0], ax); prop_assert_eq!(o[1], ay); prop_assert_eq!(o[2], az);
+            // gyro verbatim at 3..6
+            prop_assert_eq!(o[3], gx); prop_assert_eq!(o[4], gy); prop_assert_eq!(o[5], gz);
+            // quaternion verbatim at 6..10 (unit, passes validation)
+            prop_assert_eq!(o[6], q.x); prop_assert_eq!(o[7], q.y);
+            prop_assert_eq!(o[8], q.z); prop_assert_eq!(o[9], q.w);
         }
     }
 }
