@@ -182,32 +182,35 @@ jobs:
           set -euo pipefail
           OPENVINO_VER="2025.1"        # pinned minor (>= 2025.1 satisfies openvino-rs#167)
           OPENVINO_DIST="ubuntu24"     # runs-on: ubuntu-latest == ubuntu-24.04
-          OPENVINO_FULLVER="2025.1.0.18503"
-          BASE="https://storage.openvinotoolkit.org/repositories/openvino/packages/${OPENVINO_VER}/linux"
-          URL="${BASE}/openvino_toolkit_${OPENVINO_DIST}_${OPENVINO_FULLVER}_x86_64.tgz"
-          # DIAGNOSTIC: the prior run got a 1061-byte HTTP-200 body for BOTH the
-          # directory and the tarball URL (a soft-404 / landing / block page, not
-          # a file) — `curl -f` can't catch that (it's a 200), and `tar` failed
-          # "not in gzip format". Capture the server's ACTUAL response (status,
-          # type, size, final URL, body head) so the correct path/build — or a
-          # host-side block — is visible, and only proceed if the bytes are a
-          # real gzip. A browser UA rules out a trivial UA block.
-          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-          echo "== Directory: ${BASE}/ =="
-          curl -sSL -A "${UA}" -o /tmp/ov_dir.txt \
-            -w "  HTTP %{http_code} type=%{content_type} size=%{size_download} final=%{url_effective}\n" \
-            "${BASE}/" || true
-          echo "  ---- body head ----"; head -c 1200 /tmp/ov_dir.txt; echo; echo "  ----"
-          echo "== Tarball: ${URL} =="
-          curl -sSL -A "${UA}" -o /tmp/openvino.tgz \
-            -w "  HTTP %{http_code} type=%{content_type} size=%{size_download} final=%{url_effective}\n" \
-            "${URL}" || true
+          HOST="https://storage.openvinotoolkit.org"
+          PREFIX="repositories/openvino/packages/${OPENVINO_VER}/linux/"
+          # storage.openvinotoolkit.org is an S3 bucket fronted by a JS directory
+          # browser (list.js): a plain GET of a directory OR a non-existent key
+          # returns a 1061-byte index.html with HTTP 200 — not a listing/file —
+          # so there is no server-side index to grep and `curl -f` can't detect a
+          # wrong key. Enumerate REAL object keys via the S3 ListObjects v2 API
+          # (what list.js itself uses), then download by exact key.
+          echo "S3 ListObjects: ${HOST}/?prefix=${PREFIX}"
+          XML="$(curl -sSL "${HOST}/?list-type=2&prefix=${PREFIX}&max-keys=1000" || true)"
+          KEY="$(printf '%s' "${XML}" \
+            | grep -oE "${PREFIX}(l_)?openvino_toolkit_${OPENVINO_DIST}_[0-9][0-9.]*_x86_64\.tgz" \
+            | sort -V | tail -n1 || true)"
+          if [ -z "${KEY}" ]; then
+            echo "::error::No ${OPENVINO_DIST} OpenVINO tarball found under ${PREFIX}"
+            echo "  ---- object keys for this prefix ----"
+            printf '%s' "${XML}" | grep -oE "<Key>[^<]+</Key>" | head -40 || true
+            echo "  ---- available package version dirs (fix OPENVINO_VER if needed) ----"
+            curl -sSL "${HOST}/?list-type=2&prefix=repositories/openvino/packages/&delimiter=/" \
+              | grep -oE "<Prefix>[^<]+</Prefix>" | head -60 || true
+            exit 1
+          fi
+          URL="${HOST}/${KEY}"
+          echo "Resolved key: ${KEY}"
+          curl -fL -o /tmp/openvino.tgz "${URL}"
           MAGIC="$(head -c2 /tmp/openvino.tgz | od -An -tx1 | tr -d ' \n')"
           if [ "${MAGIC}" != "1f8b" ]; then
-            echo "::error::Downloaded content is NOT a gzip archive (magic=${MAGIC}) — soft-404/landing/block page, not the tarball."
-            echo "  ---- response body head ----"; head -c 1200 /tmp/openvino.tgz; echo; echo "  ----"
-            echo "  Use the body/headers above to pin the correct URL (dir/version/build/prefix),"
-            echo "  or confirm storage.openvinotoolkit.org blocks the runner."
+            echo "::error::Resolved object is not gzip (magic=${MAGIC}). Body head:"
+            head -c 600 /tmp/openvino.tgz; echo
             exit 1
           fi
           echo "Got a real gzip archive — proceeding."
