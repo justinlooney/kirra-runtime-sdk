@@ -28,7 +28,7 @@ Do not edit by hand — re-run the script.
 | SG3 | `src/gateway/kinematics_contract.rs:399` | steering-rate-ceiling | test_excessive_steering_rate_triggers_steering_clamp |
 | SG3 | `src/gateway/kinematics_contract.rs:413` | lateral-accel-envelope | test_high_speed_lateral_acceleration_forces_steering_clamp,prop_clamp_steering_satisfies_lateral_accel_invariant,test_mrc_lateral_limit_is_tighter_than_nominal |
 | SG7 | `crates/kirra-ros2-adapter/src/validation.rs:297` | fast-loop-trajectory-conformance | test_conforming_command_passes,test_overspeed_command_mrcs,test_stale_trajectory_mrcs,test_no_trajectory_mrcs |
-| SG7 | `src/gateway/policy.rs:17` | doer-agnostic-classification | sg7_doer_agnostic_verdict_byte_identical_across_ingress_paths,test_safety_goal_sg_006_unknown_command_denial |
+| SG7 | `src/gateway/policy.rs:17` | doer-agnostic-classification,unknown-path-denied-allowlist | sg7_doer_agnostic_verdict_byte_identical_across_ingress_paths,test_safety_goal_sg_006_unknown_command_denial,test_unrecognized_write_path_is_unknown,test_known_write_paths_preserved |
 | SG7 | `src/gateway/policy_layer.rs:466` | doer-agnostic-verdict | sg7_doer_agnostic_verdict_byte_identical_across_ingress_paths |
 | SG8 | `crates/kirra-ros2-adapter/src/config.rs:183` | mrc-derated-contract-shape | to_mrc_kinematics_contract_keeps_geometry_swaps_dynamic,to_mrc_kinematics_contract_preserves_odd_cap |
 | SG8 | `crates/kirra-ros2-adapter/src/posture_source.rs:85` | posture-source-fail-closed-transport | docs/safety/OCCY_131_OPTIONB_DESIGN.md§8b (integration; transport runs only with ros2 feature + a live verifier) |
@@ -56,7 +56,7 @@ Do not edit by hand — re-run the script.
 | SG9 | `src/bin/kirra_verifier_service.rs:309` | attestation-node-proven-identity | valid_signature_verifies,legacy_admin_token_hmac_proof_is_rejected,absent_registered_key_fails_closed,wrong_key_is_rejected |
 | SG9 | `src/gateway/cmd_vel.rs:30` | cmd-vel-finite-and-bounded | test_cmd_vel_within_bounds,test_cmd_vel_exceeds_linear_x |
 | SG9 | `src/gateway/kinematics_contract.rs:284` | fail-closed-nonfinite | test_nan_linear_velocity_is_denied_before_any_arithmetic,test_nan_current_velocity_is_denied_with_specific_code,test_nan_steering_angle_is_denied_with_specific_code,prop_nan_in_any_field_produces_deny_breach |
-| SG9 | `src/gateway/policy.rs:17` | doer-agnostic-classification | sg7_doer_agnostic_verdict_byte_identical_across_ingress_paths,test_safety_goal_sg_006_unknown_command_denial |
+| SG9 | `src/gateway/policy.rs:17` | doer-agnostic-classification,unknown-path-denied-allowlist | sg7_doer_agnostic_verdict_byte_identical_across_ingress_paths,test_safety_goal_sg_006_unknown_command_denial,test_unrecognized_write_path_is_unknown,test_known_write_paths_preserved |
 | SG9 | `src/gateway/policy_layer.rs:46` | posture-resolve-fails-closed-locked-out | test_none_cache_denies_all_commands,test_empty_posture_cache_fails_closed_as_locked_out |
 | SG9 | `src/posture_cache.rs:132` | ttl-staleness-detection | test_entry_beyond_ttl_is_stale,test_entry_exactly_at_ttl_boundary_is_stale |
 | SG9 | `src/posture_cache.rs:200` | unknown-command-denied | test_unknown_command_denied_before_posture_check,test_safety_goal_sg_006_unknown_command_denial |
