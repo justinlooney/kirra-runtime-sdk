@@ -157,26 +157,25 @@ class CmdVelInterceptor(Node):
 
             if resp.status_code == 200:
                 result = resp.json()
+                # A 200 carries the canonical enforcement schema. `action` is
+                # only ever Allow / ClampLinear / ClampSteering — denials arrive
+                # as HTTP 400 and lockouts as 403 (handled below), never as a
+                # 200 body, so there is no DenyBreach branch here. The gateway
+                # now emits these keys for real; the `.get(..., original)`
+                # fallbacks only apply to a (malformed) response missing them,
+                # in which case forwarding the original would be unsafe — but
+                # the gateway contract guarantees them on a 200.
                 action = result.get('action', 'Allow')
                 enforced_v = result.get('enforced_linear_velocity_mps', proposed['linear_velocity_mps'])
                 enforced_s = result.get('enforced_steering_angle_deg', proposed['steering_angle_deg'])
 
-                if action == 'DenyBreach':
-                    reason = result.get('reason', 'UNKNOWN')
-                    self._publish_stop(reason)
-                    self._publish_action(f'DENIED:{reason}')
-                    self.get_logger().warn(
-                        f'Kirra denied cmd_vel: {reason} '
-                        f'(requested v={proposed["linear_velocity_mps"]:.2f} m/s)'
-                    )
-                else:
-                    safe_twist = self._build_safe_twist(msg, enforced_v, enforced_s)
-                    self._pub_safe.publish(safe_twist)
-                    self._publish_action(f'{action}:v={enforced_v:.2f}')
+                safe_twist = self._build_safe_twist(msg, enforced_v, enforced_s)
+                self._pub_safe.publish(safe_twist)
+                self._publish_action(f'{action}:v={enforced_v:.2f}')
 
-                    with self._lock:
-                        self._current_velocity_mps = enforced_v
-                        self._current_steering_deg = enforced_s
+                with self._lock:
+                    self._current_velocity_mps = enforced_v
+                    self._current_steering_deg = enforced_s
 
             elif resp.status_code in (403, 503):
                 # Fleet locked out or Kirra down -- fail closed
