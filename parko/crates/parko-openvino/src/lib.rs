@@ -25,10 +25,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use openvino::{Core, CompiledModel, DeviceType, ElementType, Shape, Tensor};
+use openvino::{Core, CompiledModel, DeviceType, ElementType, RwPropertyKey, Shape, Tensor};
 
 use parko_core::backend::{
-    BackendCapabilities, BackendDescriptor, BackendError, InferenceBackend,
+    BackendCapabilities, BackendDescriptor, BackendError, InferenceBackend, InferenceThreads,
     ModelHandle, PrecisionMode, TensorBatch, TensorStorage,
 };
 
@@ -74,13 +74,61 @@ impl OvBackend {
     /// pairs, this constructor expects the `.xml` path; the
     /// weights-path argument is empty when the model is single-file
     /// like ONNX.)
+    /// Construct with the default execution posture (single-threaded,
+    /// bitwise-reproducible). Thread count is the only configurable knob; see
+    /// [`OvBackend::with_threads`].
     pub fn new(model_path: &str) -> Result<Self, BackendError> {
+        Self::with_threads(model_path, InferenceThreads::default())
+    }
+
+    /// Construct with an explicit [`InferenceThreads`]. `num_threads` is the
+    /// SOLE configurable setting; ACCURACY / f32 / LATENCY are fixed production
+    /// posture. The thread count MUST come from the same `InferenceThreads` the
+    /// ORT backend reads (`parko_core::InferenceThreads`) — building both
+    /// backends from one value is the structural guard against the execution
+    /// asymmetry the #152 investigation diagnosed.
+    pub fn with_threads(
+        model_path: &str,
+        threads: InferenceThreads,
+    ) -> Result<Self, BackendError> {
         let mut core = Core::new()
             .map_err(|e| BackendError::InitializationError(
                 format!("openvino Core::new failed: {e:?} \
                          (is libopenvino_c.so installed and discoverable? \
                          Try setting OPENVINO_LIB_PATH.)")
             ))?;
+
+        // Deterministic, max-accuracy CPU inference posture, mirroring the
+        // OrtBackend's `with_intra_threads(num_threads)` + opt-disable.
+        //
+        // WHY: ORT was pinned to deterministic single-threaded execution, but
+        // OpenVINO ran with defaults (multi-threaded, perf-optimized, with
+        // possible bf16/f16 downcast on capable CPUs). The two diverged ~2e-3 on
+        // MNIST logits and the diff wobbled run-to-run with the runner CPU +
+        // thread scheduling — the cross-backend equivalence flakiness. These
+        // properties bring OpenVINO to ORT's posture:
+        //   EXECUTION_MODE_HINT = ACCURACY  — no accuracy-affecting optimizations
+        //       (the OpenVINO analog of ORT's opt-disable); full precision. FIXED.
+        //   INFERENCE_PRECISION_HINT = f32  — explicit fp32, never bf16/f16. FIXED.
+        //   PERFORMANCE_HINT = LATENCY      — single-stream. FIXED.
+        //   INFERENCE_NUM_THREADS = threads.num_threads — the ONLY knob; default
+        //       1 (deterministic accumulation order, matches ORT). Raising it is
+        //       a logged production choice (see the init log below).
+        let num_threads_str = threads.num_threads.to_string();
+        for (key, value) in [
+            (RwPropertyKey::HintExecutionMode, "ACCURACY"),
+            (RwPropertyKey::HintInferencePrecision, "f32"),
+            (RwPropertyKey::HintPerformanceMode, "LATENCY"),
+            (RwPropertyKey::InferenceNumThreads, num_threads_str.as_str()),
+        ] {
+            let key_name = key.as_ref().to_string();
+            core.set_property(&DeviceType::CPU, &key, value).map_err(|e| {
+                BackendError::InitializationError(format!(
+                    "openvino set_property({key_name}={value}) failed: {e:?}"
+                ))
+            })?;
+        }
+
         // ONNX files are self-contained — pass an empty weights path.
         // OpenVINO recognises the .onnx extension and uses its ONNX
         // frontend.
@@ -106,6 +154,17 @@ impl OvBackend {
                 format!("openvino: model {model_path} has zero inputs")
             ));
         }
+
+        // Record the execution posture (determinism status is audit-relevant).
+        tracing::info!(
+            backend = "openvino",
+            num_threads = threads.num_threads,
+            execution_mode = "ACCURACY",
+            precision = "f32",
+            performance_hint = "LATENCY",
+            bitwise_reproducible = threads.bitwise_reproducible(),
+            "OvBackend execution posture"
+        );
 
         let state = Arc::new(Mutex::new(OvState { core, compiled }));
 

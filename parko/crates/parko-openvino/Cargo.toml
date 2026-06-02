@@ -25,6 +25,9 @@ parko-core = { path = "../parko-core" }
 # the crate dlopens it at runtime. This matches the parko-onnx
 # layout where the workspace builds without the runtime installed.
 openvino   = { version = "0.11", features = ["runtime-linking"] }
+# Structured logging of the execution posture (thread count + reproducibility)
+# at backend init — mirrors the parko-ros2 tracing style.
+tracing    = "0.1"
 
 [dev-dependencies]
 # The cross-backend equivalence test loads the same MNIST ONNX file
