@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 use parko_core::backend::{
     BackendCapabilities, BackendDescriptor, BackendError,
-    InferenceBackend, TensorBatch, TensorStorage,
+    InferenceBackend, InferenceThreads, TensorBatch, TensorStorage,
 };
 use parko_onnx::OrtBackend;
 use parko_openvino::OvBackend;
@@ -145,11 +145,15 @@ fn ort_ov_output_equivalence_on_mnist() {
     // wise within `EQUIV_TOL`. Seeds the model-validation tooling
     // (a parko follow-up: a generic harness that swaps any two
     // InferenceBackend impls and runs this comparison).
-    let ort = OrtBackend::new(MNIST_PATH).unwrap_or_else(|e|
-        panic!("OrtBackend::new failed: {e:?}. Is libonnxruntime.so installed? \
+    // SYMMETRY: build BOTH backends from ONE `InferenceThreads` so their thread
+    // counts can never diverge — the structural guard for the #152 asymmetry
+    // (the equivalence claim is only valid when both run the same posture).
+    let threads = InferenceThreads::default(); // single-threaded, reproducible
+    let ort = OrtBackend::with_threads(MNIST_PATH, threads).unwrap_or_else(|e|
+        panic!("OrtBackend::with_threads failed: {e:?}. Is libonnxruntime.so installed? \
                 Set ORT_DYLIB_PATH or run via the parko-onnx README."));
-    let ov  = OvBackend::new(MNIST_PATH).unwrap_or_else(|e|
-        panic!("OvBackend::new failed: {e:?}. Is libopenvino_c.so installed?"));
+    let ov  = OvBackend::with_threads(MNIST_PATH, threads).unwrap_or_else(|e|
+        panic!("OvBackend::with_threads failed: {e:?}. Is libopenvino_c.so installed?"));
 
     let ort_model = ort.load_model(MNIST_PATH).expect("ort load_model");
     let ov_model  = ov.load_model(MNIST_PATH).expect("ov load_model");

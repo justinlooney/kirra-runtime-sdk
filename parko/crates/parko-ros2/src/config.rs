@@ -42,6 +42,15 @@ pub struct ParkoNodeConfig {
     /// integrator may override (e.g. a controlled-deceleration
     /// MRC instead of a pure stop) without forking the node.
     pub mrc_command: OutgoingTwistDefaults,
+
+    /// Inference thread count — the ONLY configurable execution-posture knob
+    /// (fp32 / ACCURACY / LATENCY are fixed). **Default 1**: bitwise-reproducible
+    /// inference on the robot's fixed SoC. Raising it trades that determinism
+    /// for latency headroom and is a logged production choice. The binary
+    /// threads `inference_threads()` into BOTH the ORT and OpenVINO backends
+    /// from this one value, so their thread counts cannot diverge (the #152
+    /// cross-backend asymmetry guard).
+    pub num_threads: usize,
 }
 
 /// Placeholder for an MRC fallback override. Today's MRC is always
@@ -59,6 +68,7 @@ impl Default for ParkoNodeConfig {
             tick_period_s: 0.05,
             sensor_staleness_budget_ms: 200,
             mrc_command: OutgoingTwistDefaults,
+            num_threads: 1,
         }
     }
 }
@@ -67,6 +77,14 @@ impl ParkoNodeConfig {
     #[must_use]
     pub fn tick_period(&self) -> Duration {
         Duration::from_secs_f64(self.tick_period_s.max(0.001))
+    }
+
+    /// The single inference-thread configuration the binary threads into BOTH
+    /// backends — one source, so ORT and OpenVINO can never run different
+    /// thread counts.
+    #[must_use]
+    pub fn inference_threads(&self) -> parko_core::InferenceThreads {
+        parko_core::InferenceThreads::new(self.num_threads)
     }
 }
 
@@ -79,6 +97,24 @@ mod tests {
         let cfg = ParkoNodeConfig::default();
         assert!((cfg.tick_period_s - 0.05).abs() < 1e-9);
         assert_eq!(cfg.tick_period(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn default_num_threads_is_single_threaded_reproducible() {
+        let cfg = ParkoNodeConfig::default();
+        assert_eq!(cfg.num_threads, 1, "default must be single-threaded (preserves #152)");
+        // The ONE source both backends read.
+        let t = cfg.inference_threads();
+        assert_eq!(t.num_threads, 1);
+        assert!(t.bitwise_reproducible());
+    }
+
+    #[test]
+    fn inference_threads_reflects_configured_count() {
+        let cfg = ParkoNodeConfig { num_threads: 4, ..ParkoNodeConfig::default() };
+        assert_eq!(cfg.inference_threads().num_threads, 4);
+        assert!(!cfg.inference_threads().bitwise_reproducible(),
+            "raising threads gives up bitwise reproducibility");
     }
 
     #[test]

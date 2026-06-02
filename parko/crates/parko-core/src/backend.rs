@@ -137,9 +137,66 @@ pub trait InferenceBackend: Send + Sync {
     }
 }
 
+/// The SINGLE source of inference thread count, shared by every inference
+/// backend (parko-onnx `OrtBackend`, parko-openvino `OvBackend`).
+///
+/// WHY ONE TYPE: the #152 investigation found the cross-backend equivalence
+/// drift came from an execution ASYMMETRY — ORT pinned to a single thread while
+/// OpenVINO ran multi-threaded. Both backends reading this same value from one
+/// place is the structural guard against that recurring: a comparison must
+/// build both backends from the SAME `InferenceThreads`, so their thread counts
+/// cannot diverge.
+///
+/// DEFAULT is 1 — inference is bitwise-reproducible on fixed hardware (the
+/// production robot's one SoC): a single thread fixes the floating-point
+/// accumulation order. Raising it trades that determinism for latency headroom,
+/// which is why the active value is LOGGED at backend init (audit-relevant, not
+/// a silent function of a config value). The other three settings
+/// (fp32 / ACCURACY / LATENCY) are fixed production posture and are NOT
+/// configurable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferenceThreads {
+    pub num_threads: usize,
+}
+
+impl Default for InferenceThreads {
+    /// Single-threaded: bitwise-reproducible inference.
+    fn default() -> Self {
+        Self { num_threads: 1 }
+    }
+}
+
+impl InferenceThreads {
+    #[must_use]
+    pub fn new(num_threads: usize) -> Self {
+        Self { num_threads }
+    }
+
+    /// True iff inference is bitwise-reproducible on fixed hardware (single
+    /// thread → deterministic accumulation order). Recorded at backend init.
+    #[must_use]
+    pub fn bitwise_reproducible(self) -> bool {
+        self.num_threads == 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inference_threads_default_is_single_threaded_reproducible() {
+        let t = InferenceThreads::default();
+        assert_eq!(t.num_threads, 1, "default must be 1 (preserves the #152 experiment)");
+        assert!(t.bitwise_reproducible(), "single thread → bitwise reproducible");
+    }
+
+    #[test]
+    fn inference_threads_reproducible_flag_tracks_count() {
+        assert!(InferenceThreads::new(1).bitwise_reproducible());
+        assert!(!InferenceThreads::new(2).bitwise_reproducible());
+        assert!(!InferenceThreads::new(8).bitwise_reproducible());
+    }
 
     #[test]
     fn borrowed_storage_returns_pointer_to_original_buffer() {

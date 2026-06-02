@@ -27,6 +27,7 @@ pub use backend::{
     BackendDescriptor,
     BackendError,
     InferenceBackend,
+    InferenceThreads,
     ModelHandle,
     PrecisionMode,
     TensorBatch,

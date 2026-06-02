@@ -9,8 +9,8 @@ use ort::{
 };
 
 use parko_core::backend::{
-    BackendCapabilities, BackendError, InferenceBackend, ModelHandle, PrecisionMode,
-    TensorBatch, TensorStorage,
+    BackendCapabilities, BackendError, InferenceBackend, InferenceThreads, ModelHandle,
+    PrecisionMode, TensorBatch, TensorStorage,
 };
 
 pub struct OrtBackend {
@@ -18,15 +18,39 @@ pub struct OrtBackend {
 }
 
 impl OrtBackend {
+    /// Construct with the default execution posture (single-threaded,
+    /// bitwise-reproducible). The thread count is the only configurable knob;
+    /// see [`OrtBackend::with_threads`].
     pub fn new(model_path: &str) -> Result<Self, BackendError> {
+        Self::with_threads(model_path, InferenceThreads::default())
+    }
+
+    /// Construct with an explicit [`InferenceThreads`]. `num_threads` is the
+    /// sole configurable setting; the optimization level (`Disable`, the
+    /// determinism posture mirrored by parko-openvino's ACCURACY mode) is
+    /// fixed. The thread count MUST come from the same `InferenceThreads` the
+    /// OpenVINO backend reads — see `parko_core::InferenceThreads`.
+    pub fn with_threads(
+        model_path: &str,
+        threads: InferenceThreads,
+    ) -> Result<Self, BackendError> {
         let session = Session::builder()
             .map_err(|e| BackendError::InitializationError(format!("ort builder error: {:?}", e)))?
-            .with_intra_threads(1)
+            .with_intra_threads(threads.num_threads)
             .map_err(|e| BackendError::InitializationError(format!("ort intra_threads error: {:?}", e)))?
             .with_optimization_level(GraphOptimizationLevel::Disable)
             .map_err(|e| BackendError::InitializationError(format!("ort opt_level error: {:?}", e)))?
             .commit_from_file(model_path)
             .map_err(|e| BackendError::InitializationError(format!("ort session init error: {:?}", e)))?;
+
+        // Record the execution posture (determinism status is audit-relevant).
+        tracing::info!(
+            backend = "ort",
+            num_threads = threads.num_threads,
+            optimization = "disabled",
+            bitwise_reproducible = threads.bitwise_reproducible(),
+            "OrtBackend execution posture"
+        );
 
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
