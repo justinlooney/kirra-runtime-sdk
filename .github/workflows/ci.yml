@@ -117,11 +117,23 @@ jobs:
         # gate above continues to gate on its own — but the safety
         # gate must NEVER be made non-gating.
         #
-        # FAST-FAIL: `ort 2.0.0-rc.12` can DEADLOCK in its error path,
-        # hanging the test binary indefinitely (observed: the job ran for
-        # >1h with no progress). `timeout-minutes` converts that 6h hang
-        # into a fast, visible failure WITHOUT making the job non-gating
-        # (no continue-on-error — a real failure still blocks). A healthy
+        # `--test-threads=1` (#144): all THREE parko-onnx tests hang at
+        # `OrtBackend::new` *simultaneously*, including a trivial descriptor
+        # read — the signature of a concurrent global-environment-init
+        # deadlock, not an error-path bug. `cargo test` runs tests in
+        # parallel by default, so all three race to initialize ORT's global
+        # environment at once. ort's own changelog confirms this class of
+        # bug: rc.11 added "Make environment initialization thread-safe to
+        # eliminate segfaults when running tests concurrently" + "Fix global
+        # environment thread pools". Serializing the ORT-touching tests
+        # initializes the global environment exactly once, before any other
+        # test runs. This keeps the known-ABI-compatible rc.12 + ONNX Runtime
+        # 1.24.2 pair (a version downgrade would force a matching runtime
+        # install that can't be validated outside CI) and is fully reversible.
+        #
+        # FAST-FAIL: `timeout-minutes` still converts any residual hang into a
+        # fast, visible failure WITHOUT making the job non-gating (no
+        # continue-on-error — a real failure still blocks). A healthy
         # compile+run finishes well inside the budget. `--nocapture` +
         # backtrace surface the panic reason inline so a fast-failed run is
         # diagnosable (the captured "failures:" section never prints when the
@@ -131,19 +143,21 @@ jobs:
         env:
           ORT_DYLIB_PATH: ${{ env.HOME }}/.local/onnxruntime/lib/libonnxruntime.so
           RUST_BACKTRACE: "1"
-        run: cargo test -p parko-onnx -- --nocapture
+        run: cargo test -p parko-onnx -- --nocapture --test-threads=1
 
   parko-openvino:
     name: Parko OpenVINO Backend Tests (pip openvino-2025.1)
     runs-on: ubuntu-latest
-    # NON-GATING for now (#143). Kept continue-on-error: true while this archive
-    # install is validated by the REAL CI run — it can't be proven green locally
-    # (this change was authored 403-blocked from storage.openvinotoolkit.org, so
-    # the URL/install is unverified here). Remove it only AFTER the OpenVINO-only
-    # tests (smoke / descriptor / capabilities) are confirmed green in CI AND the
-    # equivalence test's ort #144 deadlock coupling is resolved or gated
-    # separately. `parko-safety` remains the gating safety check regardless.
-    continue-on-error: true
+    # This job is now SPLIT into two test steps (see below):
+    #   1. OpenVINO-only tests — GATING. Confirmed green in CI once the pip
+    #      wheel install + bare-symlink fix landed (#143 resolved); they failed
+    #      before only because OvBackend::new was rejected as "version too old".
+    #   2. Cross-backend equivalence test — isolated, step-level
+    #      continue-on-error (#144), because it hangs on the same ort
+    #      2.0.0-rc.12 init deadlock as parko-onnx.
+    # The job-level continue-on-error is REMOVED so the OpenVINO backend is now
+    # genuinely gated; only the equivalence step (#144) remains non-gating.
+    # `parko-safety` remains the primary gating safety check regardless.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -180,7 +194,7 @@ jobs:
         # crate dlopens at OvBackend::new — and is exactly version-pinnable.
         #
         # A venv avoids PEP-668 "externally-managed-environment" on the runner's
-        # system python. (continue-on-error stays on; validated by this CI run.)
+        # system python.
         run: |
           set -euo pipefail
           python3 -m venv "$HOME/ovenv"
@@ -215,35 +229,43 @@ jobs:
           # Per-step shells don't share env: expose the lib dir to the cargo step
           # via $GITHUB_ENV (openvino-finder probes LD_LIBRARY_PATH).
           echo "LD_LIBRARY_PATH=${OV_LIBDIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "${GITHUB_ENV}"
-      - name: parko-openvino tests
-        # OpenVINO-dependent. Same flakiness disposition as
-        # parko-onnx: if this job becomes unreliable in CI (Intel apt
-        # outage, future Ubuntu ABI break), it MAY be flipped to
-        # `continue-on-error: true`. The parko-safety gate above must
-        # remain gating regardless.
-        #
-        # EXPECTED OUTCOME of the archive fix: the OpenVINO-only tests
-        # (openvino_smoke_mnist_inference_runs_and_outputs_finite,
-        # openvino_descriptor_is_intel_openvino,
-        # openvino_capabilities_match_cpu_baseline) should now PASS — they failed
-        # only because OvBackend::new was rejected as "version too old". The
-        # cross-backend `ort_ov_output_equivalence_on_mnist` test will STILL hang
-        # on the separate ort 2.0.0-rc.12 init deadlock (#144) and is caught by
-        # `timeout-minutes`; that is NOT a failure of this fix. `--nocapture` +
-        # backtrace keep the output diagnosable on the fast-fail.
+      - name: parko-openvino OpenVINO-only tests (GATING)
+        # The OpenVINO backend tests proper — they exercise OvBackend through
+        # the pip-installed OpenVINO 2025.1 runtime and do NOT touch ort:
+        #   - openvino_smoke_mnist_inference_runs_and_outputs_finite
+        #   - openvino_descriptor_is_intel_openvino
+        #   - openvino_capabilities_match_cpu_baseline
+        #   - openvino_missing_model_returns_initialization_error_not_panic
+        #   - equivalence_input_is_deterministic_and_in_unit_range (pure)
+        # All confirmed green in CI once the pip wheel + bare-symlink install
+        # landed. `--skip ort_ov_output_equivalence_on_mnist` excludes ONLY the
+        # cross-backend test (run separately below) so the ort #144 deadlock
+        # cannot infect this gating step. No continue-on-error: a real OpenVINO
+        # regression now blocks. LD_LIBRARY_PATH comes from the install step via
+        # $GITHUB_ENV (a step-level `env:` value would override it).
         timeout-minutes: 10
         working-directory: parko
         env:
-          # ONNX runtime for the cross-backend equivalence test (parko-onnx
-          # `OrtBackend`, ort load-dynamic).
-          ORT_DYLIB_PATH: ${{ env.HOME }}/.local/onnxruntime/lib/libonnxruntime.so
-          # NOTE: LD_LIBRARY_PATH / INTEL_OPENVINO_DIR are provided by the
-          # archive install step via $GITHUB_ENV (from `setupvars.sh`); they are
-          # intentionally NOT set here, because a step-level `env:` value would
-          # OVERRIDE the $GITHUB_ENV one. The old apt-discovery OPENVINO_LIBDIR
-          # override is removed.
           RUST_BACKTRACE: "1"
-        run: cargo test -p parko-openvino -- --nocapture
+        run: cargo test -p parko-openvino -- --nocapture --skip ort_ov_output_equivalence_on_mnist
+      - name: parko-openvino cross-backend equivalence test (non-gating, ort #144)
+        # `ort_ov_output_equivalence_on_mnist` loads the SAME MNIST model
+        # through parko-onnx's OrtBackend and compares it to OpenVINO's. It
+        # hangs on the identical ort 2.0.0-rc.12 init deadlock as the parko-onnx
+        # job (#144). `--test-threads=1` is the same surgical fix attempt being
+        # made there; if it greens this test we can promote the step to gating.
+        # Until then it is ISOLATED in its own STEP-LEVEL continue-on-error so
+        # the #144 deadlock cannot block the now-gating OpenVINO-only step
+        # above. `timeout-minutes` fast-fails any residual hang. ORT_DYLIB_PATH
+        # points OrtBackend's load-dynamic at libonnxruntime.so; LD_LIBRARY_PATH
+        # (OpenVINO) still comes from the install step via $GITHUB_ENV.
+        continue-on-error: true
+        timeout-minutes: 10
+        working-directory: parko
+        env:
+          ORT_DYLIB_PATH: ${{ env.HOME }}/.local/onnxruntime/lib/libonnxruntime.so
+          RUST_BACKTRACE: "1"
+        run: cargo test -p parko-openvino ort_ov_output_equivalence_on_mnist -- --nocapture --test-threads=1
 
 
   static-analysis:
