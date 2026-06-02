@@ -80,36 +80,56 @@ jobs:
         # regression to e.g. the H1 angular cap would land on main with
         # CI green.
         #
-        # `--exclude parko-onnx` keeps this job ORT-free (the
-        # parko-onnx tests need libonnxruntime + ORT_DYLIB_PATH; see
-        # the parko-onnx job below). Future parko crates added to the
-        # sub-workspace (parko-ros2 already, anything else later) are
-        # picked up automatically by `--workspace`.
+        # `--exclude parko-onnx --exclude parko-openvino` keeps this job
+        # runtime-free: BOTH backend crates dlopen a native inference runtime
+        # at OvBackend/OrtBackend::new (libopenvino_c.so / libonnxruntime.so)
+        # and panic without it, so their tests belong to the dedicated
+        # parko-onnx / parko-openvino jobs that install those runtimes. This
+        # job must gate purely on the runtime-free safety logic — without the
+        # parko-openvino exclude it ran the OpenVINO backend tests here and
+        # failed on "Unable to find the openvino_c library" (the crate was
+        # added in e4df0fa without updating this exclude). Future parko crates
+        # added to the sub-workspace are picked up automatically by
+        # `--workspace`; add an `--exclude` here only for runtime-dependent
+        # backends.
         working-directory: parko
-        run: cargo test --workspace --exclude parko-onnx
+        run: cargo test --workspace --exclude parko-onnx --exclude parko-openvino
 
   parko-onnx:
-    name: Parko ONNX Backend Tests (ORT v1.24.2)
+    name: Parko ONNX Backend Tests (ORT v1.23.2)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install ONNX Runtime v1.24.2
-        # Exact version match: `ort 2.0.0-rc.12` (pinned in
-        # parko-onnx/Cargo.toml) is compiled against
-        # ORT_API_VERSION = 24, which requires ONNX Runtime v1.24.x.
-        # The matching minor is v1.24.2 per parko/README.md §"Building
-        # and testing parko-onnx" — older runtimes deadlock in the ort
-        # error path (documented upstream bug in 2.0.0-rc.12).
+      - name: Install ONNX Runtime v1.23.2
+        # Exact version match: `ort 2.0.0-rc.11` (pinned in
+        # parko-onnx/Cargo.toml) is compiled against ORT_API_VERSION = 23,
+        # which requires ONNX Runtime v1.23.x. The matching minor is v1.23.2.
+        #
+        # Downgraded from rc.12 / ONNX Runtime 1.24.2 (#144): rc.12 DEADLOCKS
+        # at OrtBackend::new in this CI environment even when fully serialized
+        # (--test-threads=1: the first and only running test hung before
+        # printing anything, then hit the 10-min timeout — a single-init
+        # deadlock, not a concurrency race). rc.11 + ONNX Runtime 1.23.2 must
+        # move in lockstep.
         run: |
           set -euo pipefail
-          curl -L -o /tmp/onnxruntime-1.24.2.tgz \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz
+          curl -L -o /tmp/onnxruntime-1.23.2.tgz \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-linux-x64-1.23.2.tgz
           mkdir -p "$HOME/.local/onnxruntime"
-          tar -xzf /tmp/onnxruntime-1.24.2.tgz \
+          tar -xzf /tmp/onnxruntime-1.23.2.tgz \
             -C "$HOME/.local/onnxruntime" --strip-components=1
           test -f "$HOME/.local/onnxruntime/lib/libonnxruntime.so" \
             || (echo "libonnxruntime.so missing after install"; exit 1)
+          # Export ORT_DYLIB_PATH here, in the shell, so $HOME expands
+          # correctly. It must NOT be set as a step-level `env:` value using
+          # ${{ env.HOME }} — the Actions expression `env` context does NOT
+          # contain the runner's system HOME, so it expands to EMPTY and ort
+          # then dlopens "/.local/.../libonnxruntime.so" and fails ("dlopen
+          # failed"). That empty-HOME load failure is exactly what manifested
+          # as the #144 "init deadlock" under rc.12 (whose dylib-load error
+          # path deadlocks); rc.11 surfaces it as a clean panic.
+          echo "ORT_DYLIB_PATH=$HOME/.local/onnxruntime/lib/libonnxruntime.so" >> "$GITHUB_ENV"
       - name: parko-onnx tests
         # ORT-dependent. If this job proves flaky in CI (network
         # download, ABI mismatch on a future Ubuntu image, etc.), it
@@ -117,11 +137,19 @@ jobs:
         # gate above continues to gate on its own — but the safety
         # gate must NEVER be made non-gating.
         #
-        # FAST-FAIL: `ort 2.0.0-rc.12` can DEADLOCK in its error path,
-        # hanging the test binary indefinitely (observed: the job ran for
-        # >1h with no progress). `timeout-minutes` converts that 6h hang
-        # into a fast, visible failure WITHOUT making the job non-gating
-        # (no continue-on-error — a real failure still blocks). A healthy
+        # FIX ATTEMPT for the #144 init deadlock: pin ort 2.0.0-rc.11 (ONNX
+        # Runtime 1.23.2) instead of rc.12 (1.24.2). The surgical alternative
+        # — serializing with --test-threads=1 — was REFUTED: the binary hung
+        # at the very first OrtBackend::new with one thread, proving a genuine
+        # single-init deadlock in the rc.12 + 1.24.2 pair rather than a
+        # concurrent-init race. rc.11 added "immediate dylib loading with
+        # error detection", so if it still can't initialize it should fail
+        # fast instead of hanging. Cannot be validated outside CI (no ORT in
+        # the authoring sandbox), so this is proven by the CI run itself.
+        #
+        # FAST-FAIL: `timeout-minutes` converts any residual hang into a fast,
+        # visible failure WITHOUT making the job non-gating (no
+        # continue-on-error — a real failure still blocks). A healthy
         # compile+run finishes well inside the budget. `--nocapture` +
         # backtrace surface the panic reason inline so a fast-failed run is
         # diagnosable (the captured "failures:" section never prints when the
@@ -129,103 +157,143 @@ jobs:
         timeout-minutes: 10
         working-directory: parko
         env:
-          ORT_DYLIB_PATH: ${{ env.HOME }}/.local/onnxruntime/lib/libonnxruntime.so
+          # ORT_DYLIB_PATH is exported from the install step via $GITHUB_ENV
+          # (shell $HOME). It is intentionally NOT set here: a step-level
+          # `env:` value would override the $GITHUB_ENV one, and the only way
+          # to reference HOME in an Actions expression (${{ env.HOME }}) yields
+          # an empty string → a "/.local/..." dlopen failure.
           RUST_BACKTRACE: "1"
         run: cargo test -p parko-onnx -- --nocapture
 
   parko-openvino:
-    name: Parko OpenVINO Backend Tests (apt openvino-2024)
+    name: Parko OpenVINO Backend Tests (pip openvino-2025.1)
     runs-on: ubuntu-latest
+    # This job is SPLIT into two test steps (see below), BOTH gating:
+    #   1. OpenVINO-only tests — exercise OvBackend through the pip OpenVINO
+    #      2025.1 wheel (#143 resolved by the wheel + bare-symlink install).
+    #   2. Cross-backend equivalence test — exercises OrtBackend + OvBackend
+    #      together. Was briefly non-gating while the apparent ort "init
+    #      deadlock" (#144) was diagnosed as the empty-$HOME ORT_DYLIB_PATH
+    #      bug; now fixed, so this step is gating again.
+    # No continue-on-error anywhere in this job; `parko-safety` remains the
+    # primary gating safety check.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install ONNX Runtime v1.24.2 (cross-backend equivalence test)
+      - name: Install ONNX Runtime v1.23.2 (cross-backend equivalence test)
         # The OpenVINO test suite includes a cross-backend equivalence
         # test (`ort_ov_output_equivalence_on_mnist`) that loads the SAME
         # MNIST model through parko-onnx's `OrtBackend` and compares its
         # output to OpenVINO's. That backend dlopens libonnxruntime.so at
         # runtime (ort `load-dynamic`), so this job needs the ONNX runtime
-        # too — identical install to the parko-onnx job. Without it the
+        # too — identical install to the parko-onnx job (ort 2.0.0-rc.11 →
+        # ONNX Runtime 1.23.2, kept in lockstep; see #144). Without it the
         # equivalence test panics ("Is libonnxruntime.so installed?").
         run: |
           set -euo pipefail
-          curl -L -o /tmp/onnxruntime-1.24.2.tgz \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz
+          curl -L -o /tmp/onnxruntime-1.23.2.tgz \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-linux-x64-1.23.2.tgz
           mkdir -p "$HOME/.local/onnxruntime"
-          tar -xzf /tmp/onnxruntime-1.24.2.tgz \
+          tar -xzf /tmp/onnxruntime-1.23.2.tgz \
             -C "$HOME/.local/onnxruntime" --strip-components=1
           test -f "$HOME/.local/onnxruntime/lib/libonnxruntime.so" \
             || (echo "libonnxruntime.so missing after install"; exit 1)
-      - name: Install OpenVINO runtime (Intel apt repo, 2024.x)
-        # The `openvino = "0.11"` crate links against OpenVINO 2024.x.
-        # Intel ships a Debian package via their public apt repo —
-        # this is the upstream-supported install path. The
-        # `runtime-linking` feature means the crate dlopens
-        # libopenvino_c.so at backend construction (OvBackend::new)
-        # rather than at build time; the build never needed this,
-        # but the integration tests do.
+          # Export ORT_DYLIB_PATH in the shell so $HOME expands (see the
+          # parko-onnx job: a step-level ${{ env.HOME }} expands to empty and
+          # breaks the dlopen). The cross-backend equivalence step below reads
+          # it from $GITHUB_ENV.
+          echo "ORT_DYLIB_PATH=$HOME/.local/onnxruntime/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+      - name: Install OpenVINO runtime (pip wheel, >= 2025.1)
+        # openvino-rs REQUIRES OpenVINO >= 2025.1: `ov_element_type_e` changed
+        # incompatibly in 2025.1, so the crate REJECTS older runtimes as "version
+        # too old" (openvino-rs#167) to avoid silently creating wrong-type
+        # tensors. That gate is PROTECTIVE — we SATISFY it (>= 2025.1), never
+        # bypass it (no OPENVINO_SKIP_LINKING / force-accept).
+        #
+        # Why pip, not the apt package or the .tgz archive: the apt 2024.5 build
+        # fails the gate, and storage.openvinotoolkit.org (the archive host) is an
+        # S3 *website* endpoint that serves index.html for any path and only
+        # cleanly exposes non-reproducible NIGHTLY builds — no pinnable GA URL
+        # (proven across prior runs on this PR). The PyPI `openvino` wheel ships
+        # the GA runtime (libopenvino_c.so + CPU plugin + TBB) — exactly what the
+        # crate dlopens at OvBackend::new — and is exactly version-pinnable.
+        #
+        # A venv avoids PEP-668 "externally-managed-environment" on the runner's
+        # system python.
         run: |
           set -euo pipefail
-          # Intel public GPG key + apt repo (per
-          # https://docs.openvino.ai/2024/get-started/install-openvino/install-openvino-linux.html).
-          wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
-            | sudo gpg --dearmor -o /usr/share/keyrings/intel.gpg
-          echo "deb [signed-by=/usr/share/keyrings/intel.gpg] https://apt.repos.intel.com/openvino/2024 ubuntu22 main" \
-            | sudo tee /etc/apt/sources.list.d/intel-openvino-2024.list
-          sudo apt-get update
-          sudo apt-get install -y openvino-2024.5.0
-          # DISCOVER the runtime location instead of ASSUMING it. The Intel
-          # apt package's actual install path has proven not to be the
-          # standalone-archive `/opt/intel/...` layout NOR the distro-DEB
-          # `/usr/lib/x86_64-linux-gnu` FHS path, so we locate libopenvino_c.so
-          # wherever the package placed it and export that dir for the test
-          # step's LD_LIBRARY_PATH (which openvino-finder probes first). If the
-          # library is genuinely absent, fail loudly with package diagnostics
-          # so the real layout is visible in the log.
-          echo "Locating libopenvino_c.so after apt install ..."
-          OPENVINO_LIBDIR="$(dirname "$(find /usr /opt /lib -name 'libopenvino_c.so*' -print 2>/dev/null | head -n1)")"
-          if [ -z "${OPENVINO_LIBDIR}" ] || [ "${OPENVINO_LIBDIR}" = "." ]; then
-            echo "::error::libopenvino_c.so not found under /usr /opt /lib after apt install of openvino-2024.5.0"
-            echo "--- installed openvino packages ---"
-            dpkg -l | grep -i openvino || true
-            echo "--- .so files owned by those packages ---"
-            dpkg -l | awk '/^ii/ && /openvino/ {print $2}' \
-              | while read -r p; do echo "== ${p} =="; dpkg -L "${p}" 2>/dev/null | grep -E '\.so' || true; done
-            echo "--- ldconfig cache (openvino) ---"
-            ldconfig -p | grep -i openvino || true
+          python3 -m venv "$HOME/ovenv"
+          "$HOME/ovenv/bin/pip" install --quiet --upgrade pip
+          "$HOME/ovenv/bin/pip" install "openvino==2025.1.0"
+          OV_PKG="$("$HOME/ovenv/bin/python" -c 'import openvino, os; print(os.path.dirname(openvino.__file__))')"
+          echo "openvino package dir: ${OV_PKG}"
+          # The wheel bundles native libs under openvino/libs (or a sibling
+          # openvino.libs). Locate libopenvino_c.so* wherever it landed.
+          LIB="$(find "${OV_PKG}" "${OV_PKG}.libs" -name 'libopenvino_c.so*' 2>/dev/null | head -n1 || true)"
+          if [ -z "${LIB}" ]; then
+            echo "::error::libopenvino_c.so not found in the openvino wheel (auditwheel may have hash-mangled the name)."
+            echo "  ---- .so files in the wheel ----"
+            find "${OV_PKG}" "${OV_PKG}.libs" -name '*.so*' 2>/dev/null | sort | head -60 || true
             exit 1
           fi
-          echo "OpenVINO C runtime found in: ${OPENVINO_LIBDIR}"
-          ls -1 "${OPENVINO_LIBDIR}"/libopenvino_c.so*
-          # Export for subsequent steps (GitHub Actions step-to-step env).
-          echo "OPENVINO_LIBDIR=${OPENVINO_LIBDIR}" >> "${GITHUB_ENV}"
-      - name: parko-openvino tests
-        # OpenVINO-dependent. Same flakiness disposition as
-        # parko-onnx: if this job becomes unreliable in CI (Intel apt
-        # outage, future Ubuntu ABI break), it MAY be flipped to
-        # `continue-on-error: true`. The parko-safety gate above must
-        # remain gating regardless.
-        #
-        # FAST-FAIL (same rationale as parko-onnx): the cross-backend
-        # equivalence test uses ORT, whose 2.0.0-rc.12 error-path deadlock
-        # hangs the binary indefinitely; `timeout-minutes` makes that a fast,
-        # visible failure while the job stays GATING (no continue-on-error).
-        # `--nocapture` + backtrace surface why the OvBackend tests fail (the
-        # 3 `OvBackend::new(...).expect(...)` panics) inline, since a hung
-        # binary never prints the captured failures section.
+          OV_LIBDIR="$(dirname "${LIB}")"
+          echo "OpenVINO runtime libs in: ${OV_LIBDIR}"
+          ls -1 "${OV_LIBDIR}"/libopenvino_c.so*
+          # The wheel ships only the versioned SONAME (e.g. libopenvino_c.so.2510)
+          # with no bare dev symlink. openvino-finder matches the EXACT name
+          # "libopenvino_c.so" when scanning LD_LIBRARY_PATH (it only does
+          # version-suffix scanning for SYSTEM dirs, NOT LD_LIBRARY_PATH), so it
+          # otherwise reports "Unable to find the openvino_c library". Create the
+          # bare symlink; the dynamic linker still resolves the versioned deps
+          # (libopenvino.so.X, plugins, libtbb) in this same dir via their SONAME.
+          if [ ! -e "${OV_LIBDIR}/libopenvino_c.so" ]; then
+            ln -s "$(basename "${LIB}")" "${OV_LIBDIR}/libopenvino_c.so"
+            echo "Created bare symlink: libopenvino_c.so -> $(basename "${LIB}")"
+          fi
+          ls -l "${OV_LIBDIR}/libopenvino_c.so"
+          # Per-step shells don't share env: expose the lib dir to the cargo step
+          # via $GITHUB_ENV (openvino-finder probes LD_LIBRARY_PATH).
+          echo "LD_LIBRARY_PATH=${OV_LIBDIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "${GITHUB_ENV}"
+      - name: parko-openvino OpenVINO-only tests (GATING)
+        # The OpenVINO backend tests proper — they exercise OvBackend through
+        # the pip-installed OpenVINO 2025.1 runtime and do NOT touch ort:
+        #   - openvino_smoke_mnist_inference_runs_and_outputs_finite
+        #   - openvino_descriptor_is_intel_openvino
+        #   - openvino_capabilities_match_cpu_baseline
+        #   - openvino_missing_model_returns_initialization_error_not_panic
+        #   - equivalence_input_is_deterministic_and_in_unit_range (pure)
+        # All confirmed green in CI once the pip wheel + bare-symlink install
+        # landed. `--skip ort_ov_output_equivalence_on_mnist` excludes ONLY the
+        # cross-backend test (run separately below) so the ort #144 deadlock
+        # cannot infect this gating step. No continue-on-error: a real OpenVINO
+        # regression now blocks. LD_LIBRARY_PATH comes from the install step via
+        # $GITHUB_ENV (a step-level `env:` value would override it).
         timeout-minutes: 10
         working-directory: parko
         env:
-          # ONNX runtime for the cross-backend equivalence test (parko-onnx
-          # `OrtBackend`, ort load-dynamic).
-          ORT_DYLIB_PATH: ${{ env.HOME }}/.local/onnxruntime/lib/libonnxruntime.so
-          # OpenVINO runtime dir discovered by the install step above (the apt
-          # package's real location, not an assumed path). openvino-finder
-          # checks LD_LIBRARY_PATH before its built-in dir list, so this makes
-          # the runtime discoverable wherever apt put it.
-          LD_LIBRARY_PATH: ${{ env.OPENVINO_LIBDIR }}
           RUST_BACKTRACE: "1"
-        run: cargo test -p parko-openvino -- --nocapture
+        run: cargo test -p parko-openvino -- --nocapture --skip ort_ov_output_equivalence_on_mnist
+      - name: parko-openvino cross-backend equivalence test (GATING)
+        # `ort_ov_output_equivalence_on_mnist` loads the SAME MNIST model
+        # through parko-onnx's OrtBackend and compares it to OpenVINO's, so it
+        # exercises BOTH runtimes together. It was previously isolated under
+        # step-level continue-on-error while the apparent ort "init deadlock"
+        # (#144) was diagnosed; that turned out to be the empty-$HOME
+        # ORT_DYLIB_PATH bug, now fixed, and this test passes cleanly in CI
+        # (rc.11 + ONNX Runtime 1.23.2). It is therefore GATING again — no
+        # continue-on-error — so a real cross-backend divergence blocks.
+        # `timeout-minutes` keeps a fast-fail guard. ORT_DYLIB_PATH (OrtBackend
+        # load-dynamic) and LD_LIBRARY_PATH (OpenVINO) come from the install
+        # steps via $GITHUB_ENV.
+        timeout-minutes: 10
+        working-directory: parko
+        env:
+          # ORT_DYLIB_PATH (for OrtBackend's load-dynamic) and LD_LIBRARY_PATH
+          # (for OpenVINO) both come from the install steps via $GITHUB_ENV;
+          # neither is set here, because a step-level `env:` value would
+          # override $GITHUB_ENV and ${{ env.HOME }} expands to empty.
+          RUST_BACKTRACE: "1"
+        run: cargo test -p parko-openvino ort_ov_output_equivalence_on_mnist -- --nocapture
 
 
   static-analysis:

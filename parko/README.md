@@ -50,7 +50,7 @@ The workspace contains three crates:
 
 | Backend | Crate | Hardware | Runtime install | Status |
 |---|---|---|---|---|
-| ONNX Runtime CPU | `parko-onnx` | any x86 CPU | `libonnxruntime.so` + `ORT_DYLIB_PATH` (v1.24.2) | ✅ full |
+| ONNX Runtime CPU | `parko-onnx` | any x86 CPU | `libonnxruntime.so` + `ORT_DYLIB_PATH` (v1.23.2) | ✅ full |
 | Intel OpenVINO | `parko-openvino` | any x86 Intel CPU | `libopenvino_c.so` from the Intel apt repo (`openvino-2024.x`) | ✅ full (CPU; `cargo build` does not require the toolkit) |
 | TensorRT (NVIDIA) | — | NVIDIA GPU | — | planned (PARK-020) |
 | Qualcomm QNN | — | Qualcomm NPU | — | planned (PARK-027) |
@@ -73,15 +73,17 @@ cargo test --workspace
 
 parko-onnx uses the `ort` crate with the `load-dynamic` feature. This requires `libonnxruntime.so` to be available at runtime, pointed to by `ORT_DYLIB_PATH`.
 
-Version matters. `ort 2.0.0-rc.12` is compiled against `ORT_API_VERSION = 24`. ONNX Runtime follows the convention `v1.N.x → API version N`, so you need ONNX Runtime v1.24.x. Older versions will cause a deadlock in the ort error handling path (a known bug in ort 2.0.0-rc.12 that requires the matching runtime to avoid).
+Version matters. `ort 2.0.0-rc.11` is compiled against `ORT_API_VERSION = 23`. ONNX Runtime follows the convention `v1.N.x → API version N`, so you need ONNX Runtime v1.23.x; the pinned minor is v1.23.2. The `ort`/runtime pair must move in lockstep — a mismatch deadlocks in the ort error path.
 
-Install ONNX Runtime v1.24.2 to a known location:
+> **Note (#144):** the previous pin, `ort 2.0.0-rc.12` + ONNX Runtime 1.24.2, deadlocked at `OrtBackend::new` in CI even single-threaded (a `--test-threads=1` run hung at the first init before printing anything). The downgrade to rc.11 / 1.23.2 is the fix under validation.
+
+Install ONNX Runtime v1.23.2 to a known location:
 
 ```bash
-curl -L -o /tmp/onnxruntime-1.24.2.tgz \
-  https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz
+curl -L -o /tmp/onnxruntime-1.23.2.tgz \
+  https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-linux-x64-1.23.2.tgz
 mkdir -p ~/.local/onnxruntime
-tar -xzf /tmp/onnxruntime-1.24.2.tgz -C ~/.local/onnxruntime --strip-components=1
+tar -xzf /tmp/onnxruntime-1.23.2.tgz -C ~/.local/onnxruntime --strip-components=1
 ```
 
 Run the tests with `ORT_DYLIB_PATH` set:
@@ -254,7 +256,7 @@ If a `SafetyGovernor` is attached via `InferenceLoop::with_governor()`, it runs 
 - Thermal monitoring reads `/sys/class/thermal/thermal_zone0/temp` and returns `None` on platforms without that path. Non-Linux platforms have no thermal awareness today.
 - The built-in degraded-mode policy clamps linear velocity to a hardcoded ceiling (1.5 m/s) when no `SafetyGovernor` is attached. When a governor is attached via `with_governor()`, the built-in clamp is suppressed and the governor has full authority over command modification.
 - The `Mutex<Session>` serialization means parko-onnx is single-inference-at-a-time per backend instance. Multiple models or concurrent inference would require multiple backend instances.
-- ONNX Runtime via `ort 2.0.0-rc.12` has a re-entrant Once-lock deadlock in its error handling path when `ORT_API_VERSION` mismatch occurs. Pinning to the matching runtime version (v1.24.x) avoids triggering it, but the bug exists.
+- ONNX Runtime via `ort` is sensitive to the `ort`/runtime version pair: an `ORT_API_VERSION` mismatch deadlocks in the error path, and `ort 2.0.0-rc.12` + ONNX Runtime 1.24.2 additionally deadlocked at init in CI (#144). The pin is now `ort 2.0.0-rc.11` + ONNX Runtime v1.23.x (v1.23.2), kept in lockstep.
 - parko-kirra bridges only the linear velocity dimension to the Kirra kinematics contract. Angular velocity is not currently enforced. See `crates/parko-kirra/README.md` for details.
 
 ## License

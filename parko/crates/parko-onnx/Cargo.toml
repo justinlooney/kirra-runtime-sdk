@@ -7,4 +7,15 @@ license = "Apache-2.0"
 
 [dependencies]
 parko-core = { path = "../parko-core" }
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+# ort 2.0.0-rc.11 (ONNX Runtime 1.23.2, ORT_API_VERSION = 23). Downgraded
+# from rc.12 (ONNX Runtime 1.24.x): rc.12 DEADLOCKS at OrtBackend::new in CI
+# even single-threaded (one test, --test-threads=1, hangs before any output)
+# — see #144. rc.11 added "immediate dylib loading with error detection" and
+# is the next-newest release; the ci.yml ONNX Runtime install is pinned to the
+# matching 1.23.2 in lockstep.
+#
+# The `=` is REQUIRED, not stylistic: a caret requirement ("2.0.0-rc.11")
+# matches any *higher* pre-release of the same 2.0.0 (Cargo pre-release
+# semantics), so it silently resolves back to rc.12 on a fresh CI checkout
+# (parko/Cargo.lock is gitignored). `=2.0.0-rc.11` forces exactly rc.11.
+ort = { version = "=2.0.0-rc.11", features = ["load-dynamic"] }
