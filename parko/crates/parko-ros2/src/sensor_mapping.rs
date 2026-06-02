@@ -575,6 +575,361 @@ fn quat_to_euler(qx: f64, qy: f64, qz: f64, qw: f64) -> (f64, f64, f64) {
 }
 
 // ===========================================================================
+// LiDAR mapping  (point cloud → BEV grid tensor)
+// ===========================================================================
+//
+// SAFETY FRAMING. Sensor mapping is UPSTREAM of the governor's guarantee. The
+// governor bounds the OUTPUT command but cannot detect a wrong-but-in-bounds
+// command produced from mis-mapped input: a LiDAR mapping that mis-places,
+// drops, or mis-frames points feeds the model corrupted spatial geometry, and
+// the resulting command can be confidently wrong AND within the envelope the
+// governor passes. So this transform's contract is correctness —
+// deterministic, frame-correct, fail-closed on malformed input — not
+// convenience.
+//
+// REPRESENTATION (FLAGGED — architect's call; see the PR/report). A cloud can
+// be mapped to several model-input representations; the right one depends on
+// the perception model that consumes it:
+//   - BEV grid  — occupancy / max-height / density / intensity channels over
+//     an X–Y grid; the PointPillars/CenterPoint family input class.
+//   - Range image (spherical projection: azimuth × elevation) — RangeNet /
+//     SalsaNext class.
+//   - Point list (N×[x,y,z,intensity], sampled/padded) — PointNet class.
+// BEV is IMPLEMENTED as a reasonable DEFAULT (the most common AV 3D-detection
+// input, fully deterministic) — but treat it as a PLACEHOLDER pending Parko's
+// actual model. This is the PARKO path: Parko runs its OWN perception model
+// here; this mapping is NOT shared with Occy's Autoware detector, so "Autoware
+// uses BEV" is explicitly NOT the rationale. When Parko's model is chosen,
+// RE-CONFIRM it wants BEV rather than a range image or point list. The choice
+// is the architect's; the config makes it explicit, and the enum + exhaustive
+// `to_tensor` match make switching to a sibling representation clean.
+// Only `BevGrid` is implemented; `RangeImage` / `PointList` are the documented
+// sibling variants + transforms to add then.
+//
+// COORDINATE FRAME (FLAGGED). This pure transform ASSUMES the input cloud is
+// ALREADY in the model's target frame (ego / base_link), in metres. It does
+// NOT apply an extrinsic. A wrong sensor→ego transform places obstacles in the
+// wrong location undetectably, so the extrinsic is a SEPARATE, explicit
+// concern handled upstream (the deferred ROS shim or a dedicated transform
+// stage) — never buried in this mapping.
+//
+// AXIS CONVENTION (EXPLICIT — spatial meaning must not be implicit). The BEV
+// grid is row-major, `[rows(H) × cols(W)]`:
+//   col = floor((x − x_min) / resolution)   — increases with +x
+//   row = floor((y − y_min) / resolution)   — increases with +y
+// so cell (row 0, col 0) is the (x_min, y_min) corner. The integrator MUST
+// reconcile this with their model's expected BEV axis convention (some models
+// flip Y); it is documented, not assumed.
+//
+// ROS SHIM — DEFERRED. Parsing `sensor_msgs/PointCloud2` (the binary blob, via
+// per-field offsets/datatypes) into `Vec<LidarPoint>`, and the
+// `SensorInputMapping` trait impl that drives it, are the ros2-gated
+// integration layer — exactly like the camera/odom shims. PLANNED, not
+// implemented here.
+
+/// A single LiDAR return, in the model's TARGET frame (see the frame
+/// assumption above), metres + raw intensity. NOT the ROS message — that is
+/// the deferred shim's input.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LidarPoint {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub intensity: f32,
+}
+
+/// Which model-input representation the cloud is mapped to. Only `BevGrid` is
+/// implemented; `RangeImage` / `PointList` are the flagged alternatives (see
+/// the module docs), added as sibling variants + transforms when needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LidarRepresentation {
+    /// Bird's-eye-view feature grid over the X–Y plane.
+    BevGrid,
+}
+
+/// One BEV feature channel. The OUTPUT channel order is exactly the order of
+/// `LidarConfig.channels` — no implicit reordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BevChannel {
+    /// `1.0` if the cell holds ≥1 in-ROI point, else `0.0`.
+    Occupancy,
+    /// Maximum point height (z) among the cell's points. Empty cell → `0.0`.
+    MaxHeight,
+    /// Number of in-ROI points in the cell.
+    Density,
+    /// Mean intensity of the cell's points. Empty cell → `0.0`.
+    MeanIntensity,
+}
+
+/// How BEV channel values are scaled — explicit so a channel's numeric meaning
+/// never changes silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BevNormalization {
+    /// Physical units: `MaxHeight` in metres, `Density` a raw count,
+    /// `MeanIntensity` in raw intensity units, `Occupancy` 0/1.
+    Raw,
+    /// Scaled toward `[0,1]` using the configured ranges:
+    /// `MaxHeight → clamp((z−z_min)/(z_max−z_min),0,1)`,
+    /// `Density → min(count/density_norm,1)`,
+    /// `MeanIntensity → min(intensity/intensity_max,1)`, `Occupancy → 0/1`.
+    Normalized,
+}
+
+/// Policy for points OUTSIDE the configured ROI
+/// (`[x_min,x_max) × [y_min,y_max) × [z_min,z_max]`).
+///
+/// There is deliberately NO "clip to bounds" option: clamping an out-of-ROI
+/// point to the nearest edge cell FABRICATES a false obstacle at the ROI
+/// boundary — precisely the wrong-but-in-bounds geometry the governor cannot
+/// catch. Out-of-ROI points are dropped or rejected, never relocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutOfBoundsPolicy {
+    /// Exclude out-of-ROI points. NORMAL for BEV (a 360° scan sees far beyond
+    /// the grid). Chosen deliberately via config so the data loss is
+    /// intentional, not accidental.
+    Drop,
+    /// Any out-of-ROI point is a structured error (`OutOfRoiPoint`). Use when
+    /// the input is expected pre-cropped to the ROI, so an out-of-ROI point
+    /// signals a frame/extrinsic bug rather than a normal far return.
+    Error,
+}
+
+/// BEV LiDAR mapping configuration. Everything that affects spatial meaning is
+/// explicit; no hidden default can silently move, drop, or rescale a point.
+#[derive(Debug, Clone)]
+pub struct LidarConfig {
+    /// Output representation. `BevGrid` is the only implemented value.
+    pub representation: LidarRepresentation,
+    /// ROI X extent in metres, `[x_min, x_max)`. Maps to grid COLUMNS (width).
+    pub x_min: f32,
+    pub x_max: f32,
+    /// ROI Y extent in metres, `[y_min, y_max)`. Maps to grid ROWS (height).
+    pub y_min: f32,
+    pub y_max: f32,
+    /// ROI Z (height) extent in metres, `[z_min, z_max]` inclusive. Points
+    /// outside are out-of-ROI (the height-of-interest filter).
+    pub z_min: f32,
+    pub z_max: f32,
+    /// Square cell size, metres per cell. Must be finite and `> 0`. Each of the
+    /// X and Y extents must be an integer multiple of this (validated) so every
+    /// in-`[min,max)` coordinate maps to exactly one valid cell.
+    pub resolution_m: f32,
+    /// Ordered BEV channels → output channel dimension `C`. Must be non-empty.
+    pub channels: Vec<BevChannel>,
+    /// Channel value scaling. See `BevNormalization`.
+    pub normalization: BevNormalization,
+    /// Under `Normalized`, the per-cell point count that maps `Density` to
+    /// `1.0`. Must be finite and `> 0` when `Normalized` is used.
+    pub density_norm: f32,
+    /// Under `Normalized`, the intensity that maps `MeanIntensity` to `1.0`.
+    /// Must be finite and `> 0` when `Normalized` is used.
+    pub intensity_max: f32,
+    /// Output tensor layout (NCHW = `[C,H,W]`, NHWC = `[H,W,C]`). Reuses the
+    /// camera layout enum.
+    pub layout: CameraLayout,
+    /// How to handle points outside the ROI. See `OutOfBoundsPolicy`.
+    pub out_of_bounds: OutOfBoundsPolicy,
+    /// Tensor name inside the produced `TensorBatch`. Must match the model's
+    /// input-node name.
+    pub tensor_name: String,
+}
+
+/// Errors the pure LiDAR transform may return. Mirrors `CameraMappingError`'s
+/// fail-closed discipline (structured, comparable, returned by the pure
+/// transform so direct callers can assert refusal). A dedicated enum rather
+/// than overloading the camera type — the variants are LiDAR-specific and the
+/// "Camera" name would not fit them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LidarMappingError {
+    /// `resolution_m` is non-finite or `<= 0`.
+    InvalidResolution,
+    /// A bound is non-finite, or an extent is inverted/zero
+    /// (`x_max <= x_min`, `y_max <= y_min`, or `z_max <= z_min`).
+    InvalidBounds,
+    /// The X or Y extent is not an integer multiple of `resolution_m`, so the
+    /// grid would not tile the ROI exactly. Rejected to keep cell assignment
+    /// exact and total (no fractional edge cell silently dropping points).
+    GridExtentNotDivisible,
+    /// `channels` is empty — the output would have zero channels.
+    EmptyChannelSet,
+    /// `Normalized` selected with a non-finite or `<= 0` scale
+    /// (`density_norm` / `intensity_max`).
+    InvalidNormalizationScale,
+    /// The cloud is empty. Returned rather than emitting a silently-zero grid.
+    EmptyCloud,
+    /// Point `index` has a non-finite (`NaN`/`inf`) coordinate or intensity —
+    /// rejected so one bad return can never silently corrupt the grid.
+    NonFinitePoint { index: usize },
+    /// Point `index` is outside the ROI and `out_of_bounds == Error`.
+    OutOfRoiPoint { index: usize },
+}
+
+/// Pure LiDAR-cloud → BEV-grid tensor mapping. Cloning is cheap.
+#[derive(Debug, Clone)]
+pub struct LidarMapping {
+    config: LidarConfig,
+}
+
+impl LidarMapping {
+    #[must_use]
+    pub fn new(config: LidarConfig) -> Self {
+        Self { config }
+    }
+
+    /// Validate the config independently of any cloud and return the derived
+    /// grid `(n_cols, n_rows)`. Fail-closed; returns the first structured
+    /// violation. Called before any point is processed.
+    fn validate_config(&self) -> Result<(usize, usize), LidarMappingError> {
+        let c = &self.config;
+        if !c.resolution_m.is_finite() || c.resolution_m <= 0.0 {
+            return Err(LidarMappingError::InvalidResolution);
+        }
+        if !c.x_min.is_finite() || !c.x_max.is_finite()
+            || !c.y_min.is_finite() || !c.y_max.is_finite()
+            || !c.z_min.is_finite() || !c.z_max.is_finite()
+            || c.x_max <= c.x_min || c.y_max <= c.y_min || c.z_max <= c.z_min
+        {
+            return Err(LidarMappingError::InvalidBounds);
+        }
+        if c.channels.is_empty() {
+            return Err(LidarMappingError::EmptyChannelSet);
+        }
+        if c.normalization == BevNormalization::Normalized
+            && (!c.density_norm.is_finite() || c.density_norm <= 0.0
+                || !c.intensity_max.is_finite() || c.intensity_max <= 0.0)
+        {
+            return Err(LidarMappingError::InvalidNormalizationScale);
+        }
+        // Extents must tile the ROI exactly: (extent / res) must be a whole
+        // number, so every in-[min,max) coordinate maps to a valid cell.
+        let cols_f = (c.x_max - c.x_min) / c.resolution_m;
+        let rows_f = (c.y_max - c.y_min) / c.resolution_m;
+        if (cols_f - cols_f.round()).abs() > 1e-4 || (rows_f - rows_f.round()).abs() > 1e-4 {
+            return Err(LidarMappingError::GridExtentNotDivisible);
+        }
+        let (n_cols, n_rows) = (cols_f.round() as usize, rows_f.round() as usize);
+        if n_cols == 0 || n_rows == 0 {
+            return Err(LidarMappingError::InvalidBounds);
+        }
+        Ok((n_cols, n_rows))
+    }
+
+    /// The pure transform. Same cloud → same tensor, every call, no I/O.
+    pub fn to_tensor(
+        &self,
+        cloud: &[LidarPoint],
+    ) -> Result<TensorBatch<'static>, LidarMappingError> {
+        let c = &self.config;
+        // Exhaustive so a future representation can't compile until its
+        // transform is implemented (the config stays explicit, never silent).
+        match c.representation {
+            LidarRepresentation::BevGrid => {}
+        }
+        let (n_cols, n_rows) = self.validate_config()?;
+
+        if cloud.is_empty() {
+            return Err(LidarMappingError::EmptyCloud);
+        }
+
+        let n_cells = n_cols * n_rows;
+        // Per-cell accumulators.
+        let mut count = vec![0u32; n_cells];
+        let mut max_z = vec![f32::NEG_INFINITY; n_cells];
+        let mut sum_intensity = vec![0.0_f32; n_cells];
+
+        for (idx, p) in cloud.iter().enumerate() {
+            if !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite() || !p.intensity.is_finite()
+            {
+                return Err(LidarMappingError::NonFinitePoint { index: idx });
+            }
+            let in_roi = p.x >= c.x_min && p.x < c.x_max
+                && p.y >= c.y_min && p.y < c.y_max
+                && p.z >= c.z_min && p.z <= c.z_max;
+            // Cell indices for in-ROI points; the divisibility guarantee keeps
+            // these in range. The `>= n_*` guard is defensive against float
+            // edges so we NEVER write out of bounds — treat as out-of-ROI.
+            let col = ((p.x - c.x_min) / c.resolution_m).floor();
+            let row = ((p.y - c.y_min) / c.resolution_m).floor();
+            let in_grid = in_roi
+                && col >= 0.0
+                && row >= 0.0
+                && (col as usize) < n_cols
+                && (row as usize) < n_rows;
+            if !in_grid {
+                match c.out_of_bounds {
+                    OutOfBoundsPolicy::Drop => continue,
+                    OutOfBoundsPolicy::Error => {
+                        return Err(LidarMappingError::OutOfRoiPoint { index: idx });
+                    }
+                }
+            }
+            let cell = (row as usize) * n_cols + (col as usize);
+            count[cell] += 1;
+            if p.z > max_z[cell] {
+                max_z[cell] = p.z;
+            }
+            sum_intensity[cell] += p.intensity;
+        }
+
+        // Assemble the output tensor in the configured layout.
+        let n_ch = c.channels.len();
+        let mut out = vec![0.0_f32; n_ch * n_cells];
+        for (ci, ch) in c.channels.iter().enumerate() {
+            for row in 0..n_rows {
+                for col in 0..n_cols {
+                    let cell = row * n_cols + col;
+                    let n = count[cell];
+                    let value = match ch {
+                        BevChannel::Occupancy => {
+                            if n > 0 { 1.0 } else { 0.0 }
+                        }
+                        BevChannel::MaxHeight => {
+                            if n == 0 {
+                                0.0
+                            } else {
+                                match c.normalization {
+                                    BevNormalization::Raw => max_z[cell],
+                                    BevNormalization::Normalized => {
+                                        ((max_z[cell] - c.z_min) / (c.z_max - c.z_min))
+                                            .clamp(0.0, 1.0)
+                                    }
+                                }
+                            }
+                        }
+                        BevChannel::Density => match c.normalization {
+                            BevNormalization::Raw => n as f32,
+                            BevNormalization::Normalized => (n as f32 / c.density_norm).min(1.0),
+                        },
+                        BevChannel::MeanIntensity => {
+                            if n == 0 {
+                                0.0
+                            } else {
+                                let mean = sum_intensity[cell] / n as f32;
+                                match c.normalization {
+                                    BevNormalization::Raw => mean,
+                                    BevNormalization::Normalized => {
+                                        (mean / c.intensity_max).min(1.0)
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    let out_idx = match c.layout {
+                        CameraLayout::Nchw => ci * n_cells + row * n_cols + col,
+                        CameraLayout::Nhwc => row * n_cols * n_ch + col * n_ch + ci,
+                    };
+                    out[out_idx] = value;
+                }
+            }
+        }
+
+        let mut named = HashMap::new();
+        named.insert(c.tensor_name.clone(), TensorStorage::Owned(out));
+        Ok(TensorBatch { named_tensors: named, metadata: HashMap::new() })
+    }
+}
+
+// ===========================================================================
 // Camera + Odom — tests
 // ===========================================================================
 
@@ -1102,6 +1457,261 @@ mod property_tests {
                 (-std::f64::consts::PI..=std::f64::consts::PI).contains(&yaw),
                 "yaw {yaw} outside [-π, π]"
             );
+        }
+    }
+}
+
+// ===========================================================================
+// LiDAR — tests
+// ===========================================================================
+
+#[cfg(test)]
+mod lidar_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A 2×2-cell BEV over `[0,2)×[0,2)`, 1 m cells, z∈[0,4], Raw, NCHW.
+    fn cfg_2x2(channels: Vec<BevChannel>, oob: OutOfBoundsPolicy) -> LidarConfig {
+        LidarConfig {
+            representation: LidarRepresentation::BevGrid,
+            x_min: 0.0, x_max: 2.0,
+            y_min: 0.0, y_max: 2.0,
+            z_min: 0.0, z_max: 4.0,
+            resolution_m: 1.0,
+            channels,
+            normalization: BevNormalization::Raw,
+            density_norm: 1.0,
+            intensity_max: 1.0,
+            layout: CameraLayout::Nchw,
+            out_of_bounds: oob,
+            tensor_name: "lidar_bev".to_string(),
+        }
+    }
+
+    fn pt(x: f32, y: f32, z: f32, intensity: f32) -> LidarPoint {
+        LidarPoint { x, y, z, intensity }
+    }
+
+    fn t<'a>(b: &'a TensorBatch<'static>) -> &'a [f32] {
+        b.named_tensors.get("lidar_bev").unwrap().as_slice()
+    }
+
+    /// DETERMINISTIC CORRECTNESS: cell assignment + occupancy/max-height
+    /// verified EXACTLY on a 2×2 grid (cell assignment is checked, not assumed).
+    /// (x,y) → col=floor(x), row=floor(y); NCHW order is cell = row*2 + col.
+    #[test]
+    fn bev_hand_computed_2x2_occupancy_and_maxheight() {
+        let cloud = vec![
+            pt(0.5, 0.5, 1.0, 10.0), // r0c0
+            pt(1.5, 0.5, 2.0, 20.0), // r0c1
+            pt(0.5, 1.5, 3.0, 30.0), // r1c0
+            pt(1.7, 1.2, 2.5, 40.0), // r1c1
+            pt(1.2, 1.9, 0.5, 50.0), // r1c1 (max z stays 2.5)
+        ];
+        let cfg = cfg_2x2(
+            vec![BevChannel::Occupancy, BevChannel::MaxHeight],
+            OutOfBoundsPolicy::Error,
+        );
+        let out = LidarMapping::new(cfg).to_tensor(&cloud).expect("all in-ROI");
+        // [C=2, H=2, W=2]: ch0 occupancy {r0c0,r0c1,r1c0,r1c1}, ch1 max-height.
+        assert_eq!(
+            t(&out),
+            &[
+                1.0, 1.0, 1.0, 1.0, // occupancy: every cell occupied
+                1.0, 2.0, 3.0, 2.5, // max height per cell
+            ]
+        );
+    }
+
+    /// Output length == C × H × W.
+    #[test]
+    fn bev_output_dims_match_config() {
+        let cfg = cfg_2x2(
+            vec![BevChannel::Occupancy, BevChannel::Density, BevChannel::MaxHeight],
+            OutOfBoundsPolicy::Drop,
+        );
+        let out = LidarMapping::new(cfg).to_tensor(&[pt(0.5, 0.5, 1.0, 1.0)]).expect("valid");
+        assert_eq!(t(&out).len(), 3 * 2 * 2);
+    }
+
+    /// Identical cloud → identical tensor, every call.
+    #[test]
+    fn bev_is_deterministic() {
+        let cfg = cfg_2x2(
+            vec![BevChannel::Occupancy, BevChannel::MaxHeight, BevChannel::Density],
+            OutOfBoundsPolicy::Drop,
+        );
+        let cloud = vec![pt(0.3, 1.2, 2.0, 5.0), pt(1.9, 0.1, 0.4, 7.0)];
+        let a = LidarMapping::new(cfg.clone()).to_tensor(&cloud).expect("valid");
+        let b = LidarMapping::new(cfg).to_tensor(&cloud).expect("valid");
+        assert_eq!(t(&a), t(&b));
+    }
+
+    /// NHWC interleaves channels per cell; verify the layout index is honored.
+    #[test]
+    fn bev_nhwc_layout_interleaves_channels() {
+        let mut cfg = cfg_2x2(
+            vec![BevChannel::Occupancy, BevChannel::Density],
+            OutOfBoundsPolicy::Drop,
+        );
+        cfg.layout = CameraLayout::Nhwc;
+        // one point in r0c0 → occ=1, density=1 there; all other cells zero.
+        let out = LidarMapping::new(cfg).to_tensor(&[pt(0.5, 0.5, 1.0, 1.0)]).expect("valid");
+        // NHWC [H,W,C]: cell order (r0c0,r0c1,r1c0,r1c1), 2 channels each.
+        assert_eq!(t(&out), &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    // -- Fail-closed -----------------------------------------------------
+
+    #[test]
+    fn empty_cloud_fails_closed() {
+        let err = LidarMapping::new(cfg_2x2(vec![BevChannel::Occupancy], OutOfBoundsPolicy::Drop))
+            .to_tensor(&[])
+            .unwrap_err();
+        assert_eq!(err, LidarMappingError::EmptyCloud);
+    }
+
+    #[test]
+    fn non_finite_point_fails_closed_at_index() {
+        for bad in [
+            pt(f32::NAN, 0.5, 1.0, 1.0),
+            pt(0.5, f32::INFINITY, 1.0, 1.0),
+            pt(0.5, 0.5, f32::NAN, 1.0),
+            pt(0.5, 0.5, 1.0, f32::NAN),
+        ] {
+            let cloud = vec![pt(0.5, 0.5, 1.0, 1.0), bad];
+            let err = LidarMapping::new(cfg_2x2(vec![BevChannel::Occupancy], OutOfBoundsPolicy::Drop))
+                .to_tensor(&cloud)
+                .unwrap_err();
+            assert_eq!(err, LidarMappingError::NonFinitePoint { index: 1 });
+        }
+    }
+
+    #[test]
+    fn out_of_roi_point_errors_under_error_policy() {
+        let cloud = vec![pt(0.5, 0.5, 1.0, 1.0), pt(5.0, 0.5, 1.0, 1.0)]; // 2nd beyond x_max
+        let err = LidarMapping::new(cfg_2x2(vec![BevChannel::Occupancy], OutOfBoundsPolicy::Error))
+            .to_tensor(&cloud)
+            .unwrap_err();
+        assert_eq!(err, LidarMappingError::OutOfRoiPoint { index: 1 });
+    }
+
+    #[test]
+    fn out_of_roi_point_dropped_under_drop_policy() {
+        // far point dropped; the two near points both land in r0c0.
+        let cloud = vec![
+            pt(0.5, 0.5, 1.0, 1.0),
+            pt(50.0, 50.0, 1.0, 1.0),
+            pt(0.5, 0.5, 1.0, 1.0),
+        ];
+        let out = LidarMapping::new(cfg_2x2(vec![BevChannel::Density], OutOfBoundsPolicy::Drop))
+            .to_tensor(&cloud)
+            .expect("valid");
+        assert_eq!(t(&out), &[2.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// A point outside the Z band is out-of-ROI too (height filter).
+    #[test]
+    fn out_of_z_band_is_out_of_roi() {
+        let cloud = vec![pt(0.5, 0.5, 9.0, 1.0)]; // z above z_max=4
+        let err = LidarMapping::new(cfg_2x2(vec![BevChannel::Occupancy], OutOfBoundsPolicy::Error))
+            .to_tensor(&cloud)
+            .unwrap_err();
+        assert_eq!(err, LidarMappingError::OutOfRoiPoint { index: 0 });
+    }
+
+    #[test]
+    fn malformed_config_fails_closed() {
+        let base = cfg_2x2(vec![BevChannel::Occupancy], OutOfBoundsPolicy::Drop);
+        let cloud = [pt(0.5, 0.5, 1.0, 1.0)];
+
+        let mut c = base.clone();
+        c.resolution_m = 0.0;
+        assert_eq!(
+            LidarMapping::new(c).to_tensor(&cloud).unwrap_err(),
+            LidarMappingError::InvalidResolution
+        );
+
+        let mut c = base.clone();
+        c.x_max = -1.0; // inverted
+        assert_eq!(
+            LidarMapping::new(c).to_tensor(&cloud).unwrap_err(),
+            LidarMappingError::InvalidBounds
+        );
+
+        let mut c = base.clone();
+        c.channels = vec![];
+        assert_eq!(
+            LidarMapping::new(c).to_tensor(&cloud).unwrap_err(),
+            LidarMappingError::EmptyChannelSet
+        );
+
+        let mut c = base.clone();
+        c.x_max = 2.5; // 2.5 / 1.0 not integer
+        assert_eq!(
+            LidarMapping::new(c).to_tensor(&cloud).unwrap_err(),
+            LidarMappingError::GridExtentNotDivisible
+        );
+
+        let mut c = base.clone();
+        c.normalization = BevNormalization::Normalized;
+        c.density_norm = 0.0;
+        assert_eq!(
+            LidarMapping::new(c).to_tensor(&cloud).unwrap_err(),
+            LidarMappingError::InvalidNormalizationScale
+        );
+    }
+
+    // -- Safety invariant (property) -------------------------------------
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// SAFETY INVARIANT — the property the governor CANNOT protect: every
+        /// in-ROI point lands in EXACTLY ONE cell, none silently lost or
+        /// duplicated. With a Raw `Density` channel the grid sum must equal the
+        /// point count, and each point's floor-computed cell must be counted.
+        /// `out_of_bounds = Error` makes any stray out-of-ROI point fail loudly,
+        /// so a green run also proves every generated point was in-ROI.
+        #[test]
+        fn prop_every_in_roi_point_counted_exactly_once(
+            pts in proptest::collection::vec(
+                (0.0_f32..10.0, 0.0_f32..10.0, 0.0_f32..3.0, 0.0_f32..100.0),
+                1..50,
+            ),
+        ) {
+            // ROI [0,10)×[0,10), 2 m cells → 5×5; z∈[0,3]. Generated points are
+            // in-ROI by construction (half-open x,y; z below z_max).
+            let cfg = LidarConfig {
+                representation: LidarRepresentation::BevGrid,
+                x_min: 0.0, x_max: 10.0,
+                y_min: 0.0, y_max: 10.0,
+                z_min: 0.0, z_max: 3.0,
+                resolution_m: 2.0,
+                channels: vec![BevChannel::Density],
+                normalization: BevNormalization::Raw,
+                density_norm: 1.0,
+                intensity_max: 1.0,
+                layout: CameraLayout::Nchw,
+                out_of_bounds: OutOfBoundsPolicy::Error,
+                tensor_name: "lidar_bev".to_string(),
+            };
+            let cloud: Vec<LidarPoint> =
+                pts.iter().map(|&(x, y, z, i)| pt(x, y, z, i)).collect();
+            let out = LidarMapping::new(cfg).to_tensor(&cloud).expect("all in-ROI");
+            let grid = out.named_tensors.get("lidar_bev").unwrap().as_slice();
+
+            // No point lost or duplicated: total count preserved.
+            let total: f32 = grid.iter().sum();
+            prop_assert_eq!(total as usize, cloud.len());
+
+            // Each point counted in its own floor-computed cell.
+            let n_cols = 5usize;
+            for p in &cloud {
+                let col = (p.x / 2.0).floor() as usize;
+                let row = (p.y / 2.0).floor() as usize;
+                prop_assert!(grid[row * n_cols + col] >= 1.0);
+            }
         }
     }
 }
