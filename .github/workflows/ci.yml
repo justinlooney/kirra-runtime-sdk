@@ -89,24 +89,28 @@ jobs:
         run: cargo test --workspace --exclude parko-onnx
 
   parko-onnx:
-    name: Parko ONNX Backend Tests (ORT v1.24.2)
+    name: Parko ONNX Backend Tests (ORT v1.23.2)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install ONNX Runtime v1.24.2
-        # Exact version match: `ort 2.0.0-rc.12` (pinned in
-        # parko-onnx/Cargo.toml) is compiled against
-        # ORT_API_VERSION = 24, which requires ONNX Runtime v1.24.x.
-        # The matching minor is v1.24.2 per parko/README.md §"Building
-        # and testing parko-onnx" — older runtimes deadlock in the ort
-        # error path (documented upstream bug in 2.0.0-rc.12).
+      - name: Install ONNX Runtime v1.23.2
+        # Exact version match: `ort 2.0.0-rc.11` (pinned in
+        # parko-onnx/Cargo.toml) is compiled against ORT_API_VERSION = 23,
+        # which requires ONNX Runtime v1.23.x. The matching minor is v1.23.2.
+        #
+        # Downgraded from rc.12 / ONNX Runtime 1.24.2 (#144): rc.12 DEADLOCKS
+        # at OrtBackend::new in this CI environment even when fully serialized
+        # (--test-threads=1: the first and only running test hung before
+        # printing anything, then hit the 10-min timeout — a single-init
+        # deadlock, not a concurrency race). rc.11 + ONNX Runtime 1.23.2 must
+        # move in lockstep.
         run: |
           set -euo pipefail
-          curl -L -o /tmp/onnxruntime-1.24.2.tgz \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz
+          curl -L -o /tmp/onnxruntime-1.23.2.tgz \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-linux-x64-1.23.2.tgz
           mkdir -p "$HOME/.local/onnxruntime"
-          tar -xzf /tmp/onnxruntime-1.24.2.tgz \
+          tar -xzf /tmp/onnxruntime-1.23.2.tgz \
             -C "$HOME/.local/onnxruntime" --strip-components=1
           test -f "$HOME/.local/onnxruntime/lib/libonnxruntime.so" \
             || (echo "libonnxruntime.so missing after install"; exit 1)
@@ -117,22 +121,18 @@ jobs:
         # gate above continues to gate on its own — but the safety
         # gate must NEVER be made non-gating.
         #
-        # `--test-threads=1` (#144): all THREE parko-onnx tests hang at
-        # `OrtBackend::new` *simultaneously*, including a trivial descriptor
-        # read — the signature of a concurrent global-environment-init
-        # deadlock, not an error-path bug. `cargo test` runs tests in
-        # parallel by default, so all three race to initialize ORT's global
-        # environment at once. ort's own changelog confirms this class of
-        # bug: rc.11 added "Make environment initialization thread-safe to
-        # eliminate segfaults when running tests concurrently" + "Fix global
-        # environment thread pools". Serializing the ORT-touching tests
-        # initializes the global environment exactly once, before any other
-        # test runs. This keeps the known-ABI-compatible rc.12 + ONNX Runtime
-        # 1.24.2 pair (a version downgrade would force a matching runtime
-        # install that can't be validated outside CI) and is fully reversible.
+        # FIX ATTEMPT for the #144 init deadlock: pin ort 2.0.0-rc.11 (ONNX
+        # Runtime 1.23.2) instead of rc.12 (1.24.2). The surgical alternative
+        # — serializing with --test-threads=1 — was REFUTED: the binary hung
+        # at the very first OrtBackend::new with one thread, proving a genuine
+        # single-init deadlock in the rc.12 + 1.24.2 pair rather than a
+        # concurrent-init race. rc.11 added "immediate dylib loading with
+        # error detection", so if it still can't initialize it should fail
+        # fast instead of hanging. Cannot be validated outside CI (no ORT in
+        # the authoring sandbox), so this is proven by the CI run itself.
         #
-        # FAST-FAIL: `timeout-minutes` still converts any residual hang into a
-        # fast, visible failure WITHOUT making the job non-gating (no
+        # FAST-FAIL: `timeout-minutes` converts any residual hang into a fast,
+        # visible failure WITHOUT making the job non-gating (no
         # continue-on-error — a real failure still blocks). A healthy
         # compile+run finishes well inside the budget. `--nocapture` +
         # backtrace surface the panic reason inline so a fast-failed run is
@@ -143,7 +143,7 @@ jobs:
         env:
           ORT_DYLIB_PATH: ${{ env.HOME }}/.local/onnxruntime/lib/libonnxruntime.so
           RUST_BACKTRACE: "1"
-        run: cargo test -p parko-onnx -- --nocapture --test-threads=1
+        run: cargo test -p parko-onnx -- --nocapture
 
   parko-openvino:
     name: Parko OpenVINO Backend Tests (pip openvino-2025.1)
@@ -153,28 +153,29 @@ jobs:
     #      wheel install + bare-symlink fix landed (#143 resolved); they failed
     #      before only because OvBackend::new was rejected as "version too old".
     #   2. Cross-backend equivalence test — isolated, step-level
-    #      continue-on-error (#144), because it hangs on the same ort
-    #      2.0.0-rc.12 init deadlock as parko-onnx.
+    #      continue-on-error (#144), because it shares parko-onnx's ort init
+    #      path (under test via the rc.11 downgrade).
     # The job-level continue-on-error is REMOVED so the OpenVINO backend is now
     # genuinely gated; only the equivalence step (#144) remains non-gating.
     # `parko-safety` remains the primary gating safety check regardless.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install ONNX Runtime v1.24.2 (cross-backend equivalence test)
+      - name: Install ONNX Runtime v1.23.2 (cross-backend equivalence test)
         # The OpenVINO test suite includes a cross-backend equivalence
         # test (`ort_ov_output_equivalence_on_mnist`) that loads the SAME
         # MNIST model through parko-onnx's `OrtBackend` and compares its
         # output to OpenVINO's. That backend dlopens libonnxruntime.so at
         # runtime (ort `load-dynamic`), so this job needs the ONNX runtime
-        # too — identical install to the parko-onnx job. Without it the
+        # too — identical install to the parko-onnx job (ort 2.0.0-rc.11 →
+        # ONNX Runtime 1.23.2, kept in lockstep; see #144). Without it the
         # equivalence test panics ("Is libonnxruntime.so installed?").
         run: |
           set -euo pipefail
-          curl -L -o /tmp/onnxruntime-1.24.2.tgz \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz
+          curl -L -o /tmp/onnxruntime-1.23.2.tgz \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-linux-x64-1.23.2.tgz
           mkdir -p "$HOME/.local/onnxruntime"
-          tar -xzf /tmp/onnxruntime-1.24.2.tgz \
+          tar -xzf /tmp/onnxruntime-1.23.2.tgz \
             -C "$HOME/.local/onnxruntime" --strip-components=1
           test -f "$HOME/.local/onnxruntime/lib/libonnxruntime.so" \
             || (echo "libonnxruntime.so missing after install"; exit 1)
@@ -250,22 +251,23 @@ jobs:
         run: cargo test -p parko-openvino -- --nocapture --skip ort_ov_output_equivalence_on_mnist
       - name: parko-openvino cross-backend equivalence test (non-gating, ort #144)
         # `ort_ov_output_equivalence_on_mnist` loads the SAME MNIST model
-        # through parko-onnx's OrtBackend and compares it to OpenVINO's. It
-        # hangs on the identical ort 2.0.0-rc.12 init deadlock as the parko-onnx
-        # job (#144). `--test-threads=1` is the same surgical fix attempt being
-        # made there; if it greens this test we can promote the step to gating.
-        # Until then it is ISOLATED in its own STEP-LEVEL continue-on-error so
-        # the #144 deadlock cannot block the now-gating OpenVINO-only step
-        # above. `timeout-minutes` fast-fails any residual hang. ORT_DYLIB_PATH
-        # points OrtBackend's load-dynamic at libonnxruntime.so; LD_LIBRARY_PATH
-        # (OpenVINO) still comes from the install step via $GITHUB_ENV.
+        # through parko-onnx's OrtBackend and compares it to OpenVINO's, so it
+        # shares parko-onnx's ort init path (#144). It is kept ISOLATED in its
+        # own STEP-LEVEL continue-on-error so that, until the ort downgrade is
+        # confirmed to clear the init deadlock here too, it cannot block the
+        # now-gating OpenVINO-only step above. Once the rc.11 downgrade is
+        # proven to green this test in CI, this step can be promoted to gating
+        # (drop continue-on-error). `timeout-minutes` fast-fails any residual
+        # hang. ORT_DYLIB_PATH points OrtBackend's load-dynamic at
+        # libonnxruntime.so; LD_LIBRARY_PATH (OpenVINO) still comes from the
+        # install step via $GITHUB_ENV.
         continue-on-error: true
         timeout-minutes: 10
         working-directory: parko
         env:
           ORT_DYLIB_PATH: ${{ env.HOME }}/.local/onnxruntime/lib/libonnxruntime.so
           RUST_BACKTRACE: "1"
-        run: cargo test -p parko-openvino ort_ov_output_equivalence_on_mnist -- --nocapture --test-threads=1
+        run: cargo test -p parko-openvino ort_ov_output_equivalence_on_mnist -- --nocapture
 
 
   static-analysis:
