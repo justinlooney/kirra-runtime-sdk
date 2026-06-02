@@ -80,13 +80,20 @@ jobs:
         # regression to e.g. the H1 angular cap would land on main with
         # CI green.
         #
-        # `--exclude parko-onnx` keeps this job ORT-free (the
-        # parko-onnx tests need libonnxruntime + ORT_DYLIB_PATH; see
-        # the parko-onnx job below). Future parko crates added to the
-        # sub-workspace (parko-ros2 already, anything else later) are
-        # picked up automatically by `--workspace`.
+        # `--exclude parko-onnx --exclude parko-openvino` keeps this job
+        # runtime-free: BOTH backend crates dlopen a native inference runtime
+        # at OvBackend/OrtBackend::new (libopenvino_c.so / libonnxruntime.so)
+        # and panic without it, so their tests belong to the dedicated
+        # parko-onnx / parko-openvino jobs that install those runtimes. This
+        # job must gate purely on the runtime-free safety logic — without the
+        # parko-openvino exclude it ran the OpenVINO backend tests here and
+        # failed on "Unable to find the openvino_c library" (the crate was
+        # added in e4df0fa without updating this exclude). Future parko crates
+        # added to the sub-workspace are picked up automatically by
+        # `--workspace`; add an `--exclude` here only for runtime-dependent
+        # backends.
         working-directory: parko
-        run: cargo test --workspace --exclude parko-onnx
+        run: cargo test --workspace --exclude parko-onnx --exclude parko-openvino
 
   parko-onnx:
     name: Parko ONNX Backend Tests (ORT v1.23.2)
@@ -114,6 +121,15 @@ jobs:
             -C "$HOME/.local/onnxruntime" --strip-components=1
           test -f "$HOME/.local/onnxruntime/lib/libonnxruntime.so" \
             || (echo "libonnxruntime.so missing after install"; exit 1)
+          # Export ORT_DYLIB_PATH here, in the shell, so $HOME expands
+          # correctly. It must NOT be set as a step-level `env:` value using
+          # ${{ env.HOME }} — the Actions expression `env` context does NOT
+          # contain the runner's system HOME, so it expands to EMPTY and ort
+          # then dlopens "/.local/.../libonnxruntime.so" and fails ("dlopen
+          # failed"). That empty-HOME load failure is exactly what manifested
+          # as the #144 "init deadlock" under rc.12 (whose dylib-load error
+          # path deadlocks); rc.11 surfaces it as a clean panic.
+          echo "ORT_DYLIB_PATH=$HOME/.local/onnxruntime/lib/libonnxruntime.so" >> "$GITHUB_ENV"
       - name: parko-onnx tests
         # ORT-dependent. If this job proves flaky in CI (network
         # download, ABI mismatch on a future Ubuntu image, etc.), it
@@ -141,7 +157,11 @@ jobs:
         timeout-minutes: 10
         working-directory: parko
         env:
-          ORT_DYLIB_PATH: ${{ env.HOME }}/.local/onnxruntime/lib/libonnxruntime.so
+          # ORT_DYLIB_PATH is exported from the install step via $GITHUB_ENV
+          # (shell $HOME). It is intentionally NOT set here: a step-level
+          # `env:` value would override the $GITHUB_ENV one, and the only way
+          # to reference HOME in an Actions expression (${{ env.HOME }}) yields
+          # an empty string → a "/.local/..." dlopen failure.
           RUST_BACKTRACE: "1"
         run: cargo test -p parko-onnx -- --nocapture
 
@@ -179,6 +199,11 @@ jobs:
             -C "$HOME/.local/onnxruntime" --strip-components=1
           test -f "$HOME/.local/onnxruntime/lib/libonnxruntime.so" \
             || (echo "libonnxruntime.so missing after install"; exit 1)
+          # Export ORT_DYLIB_PATH in the shell so $HOME expands (see the
+          # parko-onnx job: a step-level ${{ env.HOME }} expands to empty and
+          # breaks the dlopen). The cross-backend equivalence step below reads
+          # it from $GITHUB_ENV.
+          echo "ORT_DYLIB_PATH=$HOME/.local/onnxruntime/lib/libonnxruntime.so" >> "$GITHUB_ENV"
       - name: Install OpenVINO runtime (pip wheel, >= 2025.1)
         # openvino-rs REQUIRES OpenVINO >= 2025.1: `ov_element_type_e` changed
         # incompatibly in 2025.1, so the crate REJECTS older runtimes as "version
@@ -265,7 +290,10 @@ jobs:
         timeout-minutes: 10
         working-directory: parko
         env:
-          ORT_DYLIB_PATH: ${{ env.HOME }}/.local/onnxruntime/lib/libonnxruntime.so
+          # ORT_DYLIB_PATH (for OrtBackend's load-dynamic) and LD_LIBRARY_PATH
+          # (for OpenVINO) both come from the install steps via $GITHUB_ENV;
+          # neither is set here, because a step-level `env:` value would
+          # override $GITHUB_ENV and ${{ env.HOME }} expands to empty.
           RUST_BACKTRACE: "1"
         run: cargo test -p parko-openvino ort_ov_output_equivalence_on_mnist -- --nocapture
 
