@@ -200,9 +200,20 @@ jobs:
           OV_LIBDIR="$(dirname "${LIB}")"
           echo "OpenVINO runtime libs in: ${OV_LIBDIR}"
           ls -1 "${OV_LIBDIR}"/libopenvino_c.so*
+          # The wheel ships only the versioned SONAME (e.g. libopenvino_c.so.2510)
+          # with no bare dev symlink. openvino-finder matches the EXACT name
+          # "libopenvino_c.so" when scanning LD_LIBRARY_PATH (it only does
+          # version-suffix scanning for SYSTEM dirs, NOT LD_LIBRARY_PATH), so it
+          # otherwise reports "Unable to find the openvino_c library". Create the
+          # bare symlink; the dynamic linker still resolves the versioned deps
+          # (libopenvino.so.X, plugins, libtbb) in this same dir via their SONAME.
+          if [ ! -e "${OV_LIBDIR}/libopenvino_c.so" ]; then
+            ln -s "$(basename "${LIB}")" "${OV_LIBDIR}/libopenvino_c.so"
+            echo "Created bare symlink: libopenvino_c.so -> $(basename "${LIB}")"
+          fi
+          ls -l "${OV_LIBDIR}/libopenvino_c.so"
           # Per-step shells don't share env: expose the lib dir to the cargo step
-          # via $GITHUB_ENV. openvino-finder probes LD_LIBRARY_PATH first and
-          # handles versioned SONAMEs (e.g. libopenvino_c.so.2510).
+          # via $GITHUB_ENV (openvino-finder probes LD_LIBRARY_PATH).
           echo "LD_LIBRARY_PATH=${OV_LIBDIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "${GITHUB_ENV}"
       - name: parko-openvino tests
         # OpenVINO-dependent. Same flakiness disposition as
