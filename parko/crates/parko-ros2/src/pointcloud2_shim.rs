@@ -32,22 +32,10 @@
 //     >= width*point_step; a smaller value (rows would overlap) is rejected.
 //     `row_step == 0` is treated as the packed `width*point_step`.
 
-/// One decoded LiDAR return — the LiDAR transform's input point.
-///
-/// MERGE NOTE: this MIRRORS `crate::sensor_mapping::LidarPoint`
-/// (`x, y, z, intensity: f32`), which lives on the (unmerged) LiDAR-mapping
-/// branch. It is defined here so the decode core compiles standalone off
-/// `main`. When the LiDAR mapping lands, DELETE this struct and
-/// `use crate::sensor_mapping::LidarPoint;` so the decoder outputs the
-/// transform's EXACT type — the two definitions are byte-identical, so it is a
-/// one-line reconciliation (same shape as the radar branch's `OutOfBoundsPolicy`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LidarPoint {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-    pub intensity: f32,
-}
+// The decoder outputs the LiDAR transform's EXACT input point. LiDAR mapping
+// landed in main (#150), so this references `sensor_mapping::LidarPoint`
+// directly — the prior byte-identical mirror has been collapsed away.
+use crate::sensor_mapping::LidarPoint;
 
 // sensor_msgs/PointField datatype codes.
 pub const INT8: u8 = 1;
