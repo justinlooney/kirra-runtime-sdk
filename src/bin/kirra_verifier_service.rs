@@ -1940,6 +1940,45 @@ async fn main() {
     println!("Kirra Verifier Service listening on {listen_addr} (db: {db_path})");
     let listener = tokio::net::TcpListener::bind(&listen_addr).await
         .expect("failed to bind listener");
-    axum::serve(listener, app).await
+
+    // #74: on safe-stop / shutdown, force a durable checkpoint so the audit chain
+    // (and any NORMAL-connection writes) are fsync'd to disk — durable at the
+    // moment that matters most (the incident preceding the stop). The HA epoch
+    // and federation nonce burns are already FULL-synced per-commit.
+    let shutdown_state = Arc::clone(&svc_state.app);
+    let shutdown = async move {
+        shutdown_signal().await;
+        match shutdown_state.store.lock() {
+            Ok(store) => match store.durable_checkpoint() {
+                Ok(()) => tracing::info!("audit: durable checkpoint flushed on shutdown"),
+                Err(e) => tracing::error!(error = %e, "audit: durable checkpoint FAILED on shutdown"),
+            },
+            Err(_) => tracing::error!("audit: durable checkpoint skipped — store lock poisoned at shutdown"),
+        }
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
         .expect("server error");
+}
+
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM — the safe-stop / shutdown signals.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }

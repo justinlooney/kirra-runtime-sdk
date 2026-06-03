@@ -41,7 +41,18 @@ pub struct AuditExportPage {
 }
 
 pub struct VerifierStore {
+    /// Hot/read connection — `synchronous=NORMAL`. Carries the verdict-adjacent
+    /// per-command audit (no fsync; throughput-safe at 20 Hz+).
     conn: Connection,
+    /// Durable connection — `synchronous=FULL` (fsync per commit). Carries
+    /// durability-critical writes whose loss is a CORRECTNESS or anti-replay
+    /// bug (#74): the HA epoch CAS and the federation nonce burn. `synchronous`
+    /// is per-connection, so this second handle to the SAME WAL DB force-syncs
+    /// while the hot path stays NORMAL. `None` for in-memory stores (no
+    /// power-loss semantics, and a 2nd `:memory:` open is a DISTINCT db) — there
+    /// durability-critical writes fall back to `conn`. This is the reusable
+    /// durable-write seam #165 (active-key + genesis persistence) extends.
+    durable_conn: Option<Connection>,
     pub signing_key: Option<ed25519_dalek::SigningKey>,
 }
 
@@ -215,7 +226,48 @@ impl VerifierStore {
                 ON fabric_causal_log(timestamp_ms);"
         )?;
 
-        Ok(Self { conn, signing_key: None })
+        // Durable (force-synced) connection for the fence-correctness + anti-
+        // replay writes (#74). Same WAL DB file; `synchronous=FULL` fsyncs every
+        // commit. In-memory stores have no power-loss semantics and a second
+        // `:memory:` open would be a separate database, so we skip it there and
+        // fall back to `conn` for those writes (a no-op durability-wise).
+        let durable_conn = if path == ":memory:" {
+            None
+        } else {
+            let dc = Connection::open(path)?;
+            dc.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+            Some(dc)
+        };
+
+        Ok(Self { conn, durable_conn, signing_key: None })
+    }
+
+    /// Durability-critical read/single-write connection: the FULL handle when
+    /// present (file-backed), else the main connection (in-memory fallback).
+    fn durable_ref(&self) -> &Connection {
+        self.durable_conn.as_ref().unwrap_or(&self.conn)
+    }
+
+    /// Durability-critical transaction connection (mutable): FULL handle when
+    /// present, else the main connection.
+    fn durable_mut(&mut self) -> &mut Connection {
+        match self.durable_conn {
+            Some(ref mut c) => c,
+            None => &mut self.conn,
+        }
+    }
+
+    /// Force a durable checkpoint: `wal_checkpoint(TRUNCATE)` on the FULL
+    /// connection fsyncs the shared WAL into the main DB file, making ALL
+    /// committed data durable — including the per-command audit rows written on
+    /// the NORMAL connection. Call on safe-stop / shutdown (and optionally
+    /// periodically) to bound the audit loss window WITHOUT per-row fsync. No-op
+    /// for in-memory stores. Idempotent and cheap when the WAL is already small.
+    pub fn durable_checkpoint(&self) -> Result<()> {
+        if let Some(dc) = &self.durable_conn {
+            dc.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
+        Ok(())
     }
 
     pub fn set_signing_key(&mut self, key: ed25519_dalek::SigningKey) {
@@ -523,7 +575,13 @@ impl VerifierStore {
         report: &FederatedTrustReport,
         received_at_ms: u64,
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        // #74: route the whole federation commit — report + NONCE BURN + audit —
+        // through the FULL (force-synced) connection. A burned nonce must survive
+        // power-loss or anti-replay is defeated (the 5 s freshness window only
+        // partially bounds replay). Federation reports are rare, so the per-commit
+        // fsync is off the hot path and inconsequential to throughput.
+        let signing_key = self.signing_key.clone(); // durable_mut() borrows self
+        let tx = self.durable_mut().transaction()?;
 
         let posture_json = serde_json::to_string(&report.posture)
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
@@ -558,7 +616,7 @@ impl VerifierStore {
             "FEDERATED_TRUST_REPORT_ACCEPTED",
             &audit.to_string(),
             received_at_ms as i64,
-            self.signing_key.as_ref(),
+            signing_key.as_ref(),
         )?;
 
         tx.commit()
@@ -1336,7 +1394,12 @@ impl VerifierStore {
         instance_id: &str,
         now_ms: u64,
     ) -> Result<Option<u64>> {
-        let n = self.conn.execute(
+        // #74 CORRECTNESS FIX: the epoch CAS goes through the FULL (force-synced)
+        // connection, so the claim is DURABLE (fsync'd) before this returns —
+        // and the caller (standby_monitor) only sets the in-memory held_epoch /
+        // acts as Active AFTER this returns. A claimed epoch can no longer
+        // regress on power-loss recovery, closing the split-brain window.
+        let n = self.durable_ref().execute(
             "UPDATE ha_state SET epoch = epoch + 1, active_instance_id = ?2, updated_at_ms = ?3 \
              WHERE id = 1 AND epoch = ?1",
             params![observed as i64, instance_id, now_ms as i64],
@@ -2048,5 +2111,133 @@ mod audit_key_rotation_tests {
         let r = s.verify_audit_chain_full(Some(&a.verifying_key())).unwrap();
         assert!(!r.signature_valid, "unknown key_id must fail closed, not skip");
         assert_eq!(r.first_invalid_signature_index, Some(0));
+    }
+}
+
+/// Issue #74 — SQLite durability at power-loss: durable (FULL) connection
+/// routing, epoch non-regression (the fence-correctness proof), nonce
+/// durability, the in-memory fallback, and the shutdown checkpoint.
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CTR: AtomicU64 = AtomicU64::new(0);
+
+    /// Temp DB file (+ -wal/-shm) cleaned up on drop.
+    struct TmpDb(String);
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            let n = CTR.fetch_add(1, Ordering::SeqCst);
+            let p = std::env::temp_dir()
+                .join(format!("kirra74_{tag}_{}_{n}.db", std::process::id()));
+            TmpDb(p.to_string_lossy().into_owned())
+        }
+        fn path(&self) -> &str { &self.0 }
+    }
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{}", self.0, ext));
+            }
+        }
+    }
+
+    fn pragma_synchronous(c: &Connection) -> i64 {
+        c.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap()
+    }
+
+    fn report(nonce: &str) -> crate::federation::FederatedTrustReport {
+        crate::federation::FederatedTrustReport {
+            source_controller_id: "ctrl-A".to_string(),
+            asset_id: "asset-1".to_string(),
+            posture: crate::verifier::FleetPosture::Nominal,
+            issued_at_ms: 1_000,
+            expires_at_ms: 9_000,
+            nonce_hex: nonce.to_string(),
+            signature_b64: "sig".to_string(),
+        }
+    }
+
+    /// DURABLE ROUTING + config: a file-backed store has a FULL durable
+    /// connection distinct from the NORMAL main connection.
+    #[test]
+    fn durable_connection_is_full_main_is_normal() {
+        let db = TmpDb::new("routing");
+        let s = VerifierStore::new(db.path()).unwrap();
+        assert_eq!(pragma_synchronous(&s.conn), 1, "main conn is NORMAL (1)");
+        let dc = s.durable_conn.as_ref().expect("file store must have a durable connection");
+        assert_eq!(pragma_synchronous(dc), 2, "durable conn is FULL (2)");
+    }
+
+    /// IN-MEMORY FALLBACK: no separate durable conn (a 2nd :memory: open would be
+    /// a distinct db), and epoch/nonce still work via the main connection.
+    #[test]
+    fn memory_store_has_no_durable_conn_but_works() {
+        let mut s = VerifierStore::new(":memory:").unwrap();
+        assert!(s.durable_conn.is_none(), ":memory: must fall back to the main conn");
+        assert_eq!(s.try_claim_epoch(0, "A", 1).unwrap(), Some(1));
+        s.save_federated_report_chained(&report("aa"), 2_000).unwrap();
+        assert!(s.has_seen_federation_nonce("aa").unwrap());
+    }
+
+    /// EPOCH NON-REGRESSION (the fence-correctness core of #74): a claim
+    /// committed via the FULL path survives a store reopen ("recovery") and does
+    /// NOT regress — a stale-observed re-claim then fails (no double-claim).
+    #[test]
+    fn epoch_claim_durable_across_reopen_and_fence_holds() {
+        let db = TmpDb::new("epoch");
+        {
+            let mut s = VerifierStore::new(db.path()).unwrap();
+            assert_eq!(s.try_claim_epoch(0, "primary", 100).unwrap(), Some(1),
+                "primary claims epoch 1 (FULL-synced)");
+        } // drop → simulate process loss; the claim was fsync'd on its FULL commit.
+
+        // Recover: reopen the SAME file.
+        let mut s2 = VerifierStore::new(db.path()).unwrap();
+        assert_eq!(s2.try_claim_epoch(0, "ghost", 200).unwrap(), None,
+            "a stale-observed (epoch 0) re-claim MUST fail — the epoch did not regress to 0");
+        assert_eq!(s2.try_claim_epoch(1, "standby", 300).unwrap(), Some(2),
+            "the durable epoch is 1; the legitimate next claim advances to 2 (fence intact)");
+    }
+
+    /// NONCE DURABILITY: a burned federation nonce survives reopen → no replay.
+    #[test]
+    fn nonce_burn_durable_across_reopen() {
+        let db = TmpDb::new("nonce");
+        {
+            let mut s = VerifierStore::new(db.path()).unwrap();
+            s.save_federated_report_chained(&report("deadbeef"), 2_000).unwrap();
+            assert!(s.has_seen_federation_nonce("deadbeef").unwrap(), "burned before reopen");
+        } // drop → simulate process loss.
+        let s2 = VerifierStore::new(db.path()).unwrap();
+        assert!(s2.has_seen_federation_nonce("deadbeef").unwrap(),
+            "burned nonce must survive recovery — no replay window");
+    }
+
+    /// AUDIT-CHAIN INTEGRITY + shutdown checkpoint: appends stay sequenced and
+    /// hash-linked under the dual-connection setup; durable_checkpoint() flushes
+    /// without breaking verification.
+    #[test]
+    fn audit_chain_intact_after_checkpoint() {
+        use ed25519_dalek::SigningKey;
+        let db = TmpDb::new("audit");
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut s = VerifierStore::new(db.path()).unwrap();
+        s.set_signing_key(key.clone());
+        // Append a few chained rows via a real store write path.
+        for i in 0..3 {
+            s.save_posture_event_chained("n", "EVT", "{}", None, 100 + i).unwrap();
+        }
+        // Force the shutdown-style durable checkpoint.
+        s.durable_checkpoint().unwrap();
+        let r = s.verify_audit_chain_full(Some(&key.verifying_key())).unwrap();
+        assert!(r.chain_intact, "hash chain intact across the dual-conn + checkpoint");
+        assert!(r.signature_valid, "signatures verify");
+        // Reopen and re-verify — checkpointed rows are durable.
+        drop(s);
+        let s2 = VerifierStore::new(db.path()).unwrap();
+        let r2 = s2.verify_audit_chain_full(Some(&key.verifying_key())).unwrap();
+        assert!(r2.chain_intact && r2.signed_entries >= 3, "rows durable + intact after reopen");
     }
 }
