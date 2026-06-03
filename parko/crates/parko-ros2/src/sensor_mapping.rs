@@ -476,6 +476,13 @@ pub struct OdomConfig {
     pub include_linear_velocity:  bool,
     pub include_angular_velocity: bool,
     pub tensor_name: String,
+    /// Unit-norm tolerance for the orientation quaternion. The orientation
+    /// quaternion is REJECTED (fail-closed, never re-normalized) when
+    /// `|‖q‖ - 1|` exceeds this. Mirrors `ImuConfig::quat_norm_tolerance` — the
+    /// same fail-closed unit-norm convention, as a per-sensor field. Validated
+    /// finite and `>= 0` at transform entry (a negative/non-finite value is
+    /// itself rejected, mirroring IMU's `InvalidQuatTolerance`).
+    pub quat_norm_tolerance: f32,
 }
 
 impl OdomConfig {
@@ -487,6 +494,23 @@ impl OdomConfig {
             + (if self.include_linear_velocity  { 3 } else { 0 })
             + (if self.include_angular_velocity { 3 } else { 0 })
     }
+}
+
+/// Fail-closed rejection reasons for `OdomMapping::to_tensor`. Disjoint from the
+/// other sensors' error enums (Imu/Lidar/Radar/Camera), mirroring their style.
+/// Before this guard odom was infallible and fed `quat_to_euler` unvalidated,
+/// producing silent garbage Euler on a non-unit/near-zero/non-finite quaternion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OdomMappingError {
+    /// `quat_norm_tolerance` is negative or non-finite (mirrors IMU).
+    InvalidQuatTolerance,
+    /// A non-finite (`NaN`/`inf`) orientation quaternion component — rejected so
+    /// it can't reach `quat_to_euler`.
+    NonFiniteQuaternion,
+    /// The orientation quaternion is not unit-norm within `quat_norm_tolerance`.
+    /// Rejected, never silently re-normalized (that would mask an upstream
+    /// sensor/frame fault); fail-closed surfaces it. Mirrors IMU's guard.
+    NonUnitQuaternion,
 }
 
 /// One odometry observation. ROS quaternion convention: `(x, y, z, w)`.
@@ -510,8 +534,32 @@ impl OdomMapping {
         Self { config }
     }
 
-    /// The pure transform.
-    pub fn to_tensor(&self, sample: &OdomSample) -> TensorBatch<'static> {
+    /// The pure transform. Fail-closed: when an orientation feature is
+    /// requested, the orientation quaternion is validated for finiteness and
+    /// unit-norm at THIS entry (one shared guard covering both the FullEuler and
+    /// Yaw `quat_to_euler` call sites) and REJECTED — never re-normalized, never
+    /// fed to `quat_to_euler` to produce silent garbage Euler.
+    pub fn to_tensor(&self, sample: &OdomSample) -> Result<TensorBatch<'static>, OdomMappingError> {
+        // Config: the tolerance itself must be finite and non-negative (mirrors
+        // ImuMapping's InvalidQuatTolerance gate).
+        if !self.config.quat_norm_tolerance.is_finite() || self.config.quat_norm_tolerance < 0.0 {
+            return Err(OdomMappingError::InvalidQuatTolerance);
+        }
+
+        // Orientation quaternion guard — only when an orientation feature is
+        // requested (it is the only consumer of the quaternion). REJECT a
+        // non-finite or non-unit quaternion before any quat_to_euler call.
+        if self.config.include_orientation.is_some() {
+            let [qx, qy, qz, qw] = sample.orientation_xyzw;
+            if !(qx.is_finite() && qy.is_finite() && qz.is_finite() && qw.is_finite()) {
+                return Err(OdomMappingError::NonFiniteQuaternion);
+            }
+            let norm = (qx * qx + qy * qy + qz * qz + qw * qw).sqrt();
+            if (norm - 1.0).abs() > self.config.quat_norm_tolerance as f64 {
+                return Err(OdomMappingError::NonUnitQuaternion);
+            }
+        }
+
         let mut v: Vec<f32> = Vec::with_capacity(self.config.vector_len());
 
         if self.config.include_position {
@@ -551,7 +599,7 @@ impl OdomMapping {
 
         let mut named = HashMap::new();
         named.insert(self.config.tensor_name.clone(), TensorStorage::Owned(v));
-        TensorBatch { named_tensors: named, metadata: HashMap::new() }
+        Ok(TensorBatch { named_tensors: named, metadata: HashMap::new() })
     }
 }
 
@@ -559,9 +607,29 @@ impl SensorInputMapping for OdomMapping {
     type Sample = OdomSample;
 
     fn to_frame(&self, frame_id: u64, timestamp_ms: u64, sample: &OdomSample) -> SensorFrame {
-        SensorFrame {
-            frame_id, timestamp_ms,
-            payload: self.to_tensor(sample),
+        // The trait can't surface errors. On a rejected quaternion (non-unit /
+        // non-finite), emit a structured log + a zero tensor; the tick
+        // pipeline's staleness/governor MRC path catches the downstream
+        // consequence. Mirrors CameraMapping::to_frame — fail-closed surfaces
+        // the fault rather than feeding garbage Euler forward.
+        match self.to_tensor(sample) {
+            Ok(batch) => SensorFrame { frame_id, timestamp_ms, payload: batch },
+            Err(err) => {
+                tracing::error!(
+                    ?err, frame_id, timestamp_ms,
+                    "OdomMapping::to_frame received an invalid orientation quaternion; \
+                     emitting zero tensor (downstream MRC will fire)"
+                );
+                let mut named = HashMap::new();
+                named.insert(
+                    self.config.tensor_name.clone(),
+                    TensorStorage::Owned(vec![0.0_f32; self.config.vector_len()]),
+                );
+                SensorFrame {
+                    frame_id, timestamp_ms,
+                    payload: TensorBatch { named_tensors: named, metadata: HashMap::new() },
+                }
+            }
         }
     }
 }
@@ -570,6 +638,13 @@ impl SensorInputMapping for OdomMapping {
 /// Tait–Bryan ZYX intrinsic convention (yaw about Z, then pitch about Y,
 /// then roll about X). The same convention `kirra-ros2-adapter::geometry::quat_to_yaw`
 /// uses, so adapter + parko-ros2 agree on what "yaw" means.
+///
+/// PRECONDITION — UNIT NORM. The formulas (`1 - 2(qx²+qy²)`, …) assume a unit
+/// quaternion; a non-unit or near-zero input yields silently-wrong (often
+/// out-of-range) Euler. This is a pure shared helper and does NOT validate —
+/// callers MUST reject non-unit input first. Both consumers do: `ImuMapping`
+/// (norm vs `quat_norm_tolerance`) and `OdomMapping` (the entry guard returning
+/// `OdomMappingError::NonUnitQuaternion`).
 fn quat_to_euler(qx: f64, qy: f64, qz: f64, qw: f64) -> (f64, f64, f64) {
     // roll (x-axis rotation)
     let sinr_cosp = 2.0 * (qw * qx + qy * qz);
@@ -1946,6 +2021,7 @@ mod odom_tests {
             include_linear_velocity: true,
             include_angular_velocity: true,
             tensor_name: "odom".to_string(),
+            quat_norm_tolerance: 1e-3,
         }
     }
 
@@ -1972,8 +2048,9 @@ mod odom_tests {
             include_linear_velocity: false,
             include_angular_velocity: false,
             tensor_name: "odom".to_string(),
+            quat_norm_tolerance: 1e-3,
         };
-        let out = OdomMapping::new(cfg).to_tensor(&sample);
+        let out = OdomMapping::new(cfg).to_tensor(&sample).expect("valid odom sample");
         let v = s_get(&out);
         assert_eq!(v.len(), 1);
         assert!((v[0] - theta as f32).abs() < 1e-5,
@@ -1997,8 +2074,9 @@ mod odom_tests {
             include_linear_velocity: false,
             include_angular_velocity: false,
             tensor_name: "odom".to_string(),
+            quat_norm_tolerance: 1e-3,
         };
-        let out = OdomMapping::new(cfg).to_tensor(&sample);
+        let out = OdomMapping::new(cfg).to_tensor(&sample).expect("valid odom sample");
         let v = s_get(&out);
         assert!((v[0] - theta as f32).abs() < 1e-5);
     }
@@ -2012,7 +2090,7 @@ mod odom_tests {
             linear_velocity:  [4.0, 5.0, 6.0],
             angular_velocity: [7.0, 8.0, 9.0],
         };
-        let out = OdomMapping::new(all_on(OdomOrientation::Yaw)).to_tensor(&sample);
+        let out = OdomMapping::new(all_on(OdomOrientation::Yaw)).to_tensor(&sample).expect("valid odom sample");
         let v = s_get(&out);
         assert_eq!(v.len(), 10);
         assert_eq!(v, &[1.0, 2.0, 3.0, /*yaw*/ 0.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
@@ -2034,9 +2112,10 @@ mod odom_tests {
             include_linear_velocity: true,
             include_angular_velocity: false,
             tensor_name: "odom".to_string(),
+            quat_norm_tolerance: 1e-3,
         };
         assert_eq!(cfg.vector_len(), 6);
-        let out = OdomMapping::new(cfg).to_tensor(&sample);
+        let out = OdomMapping::new(cfg).to_tensor(&sample).expect("valid odom sample");
         let v = s_get(&out);
         assert_eq!(v.len(), 6);
         assert_eq!(v, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -2057,9 +2136,10 @@ mod odom_tests {
             include_linear_velocity: false,
             include_angular_velocity: false,
             tensor_name: "odom".to_string(),
+            quat_norm_tolerance: 1e-3,
         };
         assert_eq!(cfg.vector_len(), 3);
-        let out = OdomMapping::new(cfg).to_tensor(&sample);
+        let out = OdomMapping::new(cfg).to_tensor(&sample).expect("valid odom sample");
         let v = s_get(&out);
         assert_eq!(v.len(), 3);
         assert_eq!(v, &[0.0, 0.0, 0.0]); // identity quaternion
@@ -2070,7 +2150,7 @@ mod odom_tests {
     fn raw_quaternion_passthrough() {
         let sample = OdomSample {
             position:         [0.0; 3],
-            orientation_xyzw: [0.1, 0.2, 0.3, 0.4],
+            orientation_xyzw: [0.182_574_2, 0.365_148_4, 0.547_722_6, 0.730_296_8], // unit norm
             linear_velocity:  [0.0; 3],
             angular_velocity: [0.0; 3],
         };
@@ -2080,10 +2160,129 @@ mod odom_tests {
             include_linear_velocity: false,
             include_angular_velocity: false,
             tensor_name: "odom".to_string(),
+            quat_norm_tolerance: 1e-3,
         };
-        let out = OdomMapping::new(cfg).to_tensor(&sample);
+        let out = OdomMapping::new(cfg).to_tensor(&sample).expect("valid odom sample");
         let v = s_get(&out);
-        assert_eq!(v, &[0.1_f32, 0.2, 0.3, 0.4]);
+        assert_eq!(v, &[0.182_574_2_f32, 0.365_148_4, 0.547_722_6, 0.730_296_8]);
+    }
+
+    // -- Quaternion-norm fail-closed guard (mirrors IMU; the odom gap) --------
+
+    fn odom_with_quat(q: [f64; 4], repr: OdomOrientation) -> (OdomMapping, OdomSample) {
+        let cfg = OdomConfig {
+            include_position: false,
+            include_orientation: Some(repr),
+            include_linear_velocity: false,
+            include_angular_velocity: false,
+            tensor_name: "odom".to_string(),
+            quat_norm_tolerance: 1e-3,
+        };
+        let sample = OdomSample {
+            position: [0.0; 3],
+            orientation_xyzw: q,
+            linear_velocity: [0.0; 3],
+            angular_velocity: [0.0; 3],
+        };
+        (OdomMapping::new(cfg), sample)
+    }
+
+    /// A NON-UNIT quaternion (norm 2.0) is REJECTED across the full, yaw, and
+    /// raw-quaternion orientation reprs — never fed to quat_to_euler.
+    #[test]
+    fn non_unit_quaternion_is_rejected_all_reprs() {
+        let non_unit = [0.0, 0.0, 0.0, 2.0]; // norm 2.0
+        for repr in [OdomOrientation::FullEuler, OdomOrientation::Yaw, OdomOrientation::Quaternion] {
+            let (m, s) = odom_with_quat(non_unit, repr);
+            assert_eq!(m.to_tensor(&s).unwrap_err(), OdomMappingError::NonUnitQuaternion, "repr {repr:?}");
+        }
+    }
+
+    /// A near-zero / all-zero quaternion (norm ~0) is REJECTED (it would make
+    /// quat_to_euler produce garbage).
+    #[test]
+    fn near_zero_quaternion_is_rejected() {
+        let (m, s) = odom_with_quat([0.0, 0.0, 0.0, 0.0], OdomOrientation::Yaw);
+        assert_eq!(m.to_tensor(&s).unwrap_err(), OdomMappingError::NonUnitQuaternion);
+    }
+
+    /// A non-finite (NaN) quaternion component is REJECTED before quat_to_euler.
+    #[test]
+    fn non_finite_quaternion_is_rejected() {
+        let (m, s) = odom_with_quat([f64::NAN, 0.0, 0.0, 1.0], OdomOrientation::FullEuler);
+        assert_eq!(m.to_tensor(&s).unwrap_err(), OdomMappingError::NonFiniteQuaternion);
+    }
+
+    /// A unit quaternion, and one slightly off but WITHIN tolerance, are ACCEPTED
+    /// and produce the correct yaw.
+    #[test]
+    fn unit_and_within_tolerance_quaternion_accepted() {
+        let theta = std::f64::consts::FRAC_PI_4;
+        let half = theta / 2.0;
+        // Exact unit.
+        let (m, s) = odom_with_quat([0.0, 0.0, half.sin(), half.cos()], OdomOrientation::Yaw);
+        let out = m.to_tensor(&s).expect("unit quaternion accepted");
+        assert!((s_get(&out)[0] - theta as f32).abs() < 1e-5);
+
+        // Slightly off but within 1e-3 tolerance (scale by 1.0005 → norm 1.0005).
+        let off = [0.0, 0.0, half.sin() * 1.0005, half.cos() * 1.0005];
+        let (m2, s2) = odom_with_quat(off, OdomOrientation::Yaw);
+        assert!(m2.to_tensor(&s2).is_ok(), "within-tolerance quaternion must be accepted");
+    }
+
+    /// NEGATIVE CONTROL — the UNGUARDED computation WOULD have produced
+    /// wrong Euler for the non-unit input the guard now rejects. The delta
+    /// (guard rejects vs unguarded garbage) is the evidence the guard changed the
+    /// outcome.
+    #[test]
+    fn negative_control_unguarded_quat_to_euler_would_be_garbage() {
+        // A pure-yaw rotation of 45° is (0, 0, sin(22.5°), cos(22.5°)); SCALED by
+        // 2 it has norm 2.0 but the same intended attitude. quat_to_euler is NOT
+        // scale-invariant — the atan2 denominator (1 - 2(qy²+qz²)) is wrong for
+        // the scaled input, so the UNGUARDED path (what odom used to do) yields a
+        // grossly WRONG yaw; the unit form recovers 45°.
+        let theta = std::f64::consts::FRAC_PI_4; // 45°
+        let half = theta / 2.0;
+        let q_unit = [0.0, 0.0, half.sin(), half.cos()];
+        let q_nonunit = [0.0, 0.0, 2.0 * half.sin(), 2.0 * half.cos()]; // norm 2.0
+        let (_, _, correct_yaw) = quat_to_euler(q_unit[0], q_unit[1], q_unit[2], q_unit[3]);
+        let (_, _, garbage_yaw) =
+            quat_to_euler(q_nonunit[0], q_nonunit[1], q_nonunit[2], q_nonunit[3]);
+        assert!((correct_yaw - theta).abs() < 1e-5, "unit form recovers 45°, got {correct_yaw}");
+        assert!(
+            (garbage_yaw - correct_yaw).abs() > 1e-2,
+            "unguarded non-unit quaternion must produce a WRONG yaw (garbage {garbage_yaw} vs correct {correct_yaw})"
+        );
+        // And the guard now REJECTS exactly that input instead of emitting garbage.
+        let (m, s) = odom_with_quat(q_nonunit, OdomOrientation::Yaw);
+        assert_eq!(m.to_tensor(&s).unwrap_err(), OdomMappingError::NonUnitQuaternion);
+    }
+
+    /// Config: a negative or non-finite tolerance is itself REJECTED (mirrors
+    /// ImuMappingError::InvalidQuatTolerance).
+    #[test]
+    fn invalid_quat_tolerance_is_rejected() {
+        for bad in [-1.0_f32, f32::NAN, f32::INFINITY] {
+            let cfg = OdomConfig {
+                include_position: false,
+                include_orientation: Some(OdomOrientation::Yaw),
+                include_linear_velocity: false,
+                include_angular_velocity: false,
+                tensor_name: "odom".to_string(),
+                quat_norm_tolerance: bad,
+            };
+            let sample = OdomSample {
+                position: [0.0; 3],
+                orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                linear_velocity: [0.0; 3],
+                angular_velocity: [0.0; 3],
+            };
+            assert_eq!(
+                OdomMapping::new(cfg).to_tensor(&sample).unwrap_err(),
+                OdomMappingError::InvalidQuatTolerance,
+                "tolerance {bad} must be rejected"
+            );
+        }
     }
 }
 
