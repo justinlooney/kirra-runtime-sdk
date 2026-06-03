@@ -19,6 +19,20 @@ on a fault, not after recovery. The design prioritizes safety over availability,
 and this document characterizes the availability cost so it is understood rather
 than surprising.
 
+**HA durability boundary (#74).** The HA **epoch fence** — the mechanism behind
+"at most one effective writer across partition / skew / restart" — is now backed
+against hard power-loss: the epoch claim (`try_claim_epoch`) commits on a
+`synchronous=FULL` connection (fsync per commit), so a claimed epoch cannot
+regress on recovery and the split-brain window is closed even across an OS crash.
+(Before #74 the claim was persisted but only `synchronous=NORMAL`-durable, so a
+power-loss at commit time could drop it — the "across restart" property had a
+power-loss hole, now closed.) The federation **nonce burn** (anti-replay) is
+likewise `synchronous=FULL`. The **audit ledger** tail is durable to the last
+checkpoint (fsync'd on graceful safe-stop/shutdown + SQLite auto-checkpoint); the
+final rows before an *ungraceful* power cut may be lost — a forensic gap, not a
+safety-state gap (the verdict path is store-free). See
+`docs/safety/CODING_GUIDELINES.md` INV-12 for the precise statement.
+
 ---
 
 ## 2. Governor fault model

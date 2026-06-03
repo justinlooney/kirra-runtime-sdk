@@ -263,6 +263,18 @@ impl VerifierStore {
     /// the NORMAL connection. Call on safe-stop / shutdown (and optionally
     /// periodically) to bound the audit loss window WITHOUT per-row fsync. No-op
     /// for in-memory stores. Idempotent and cheap when the WAL is already small.
+    ///
+    /// DURABILITY BOUNDARY (#74) — by design, NOT a bug: the audit-chain tail is
+    /// durable only to the LAST checkpoint. The HA epoch claim and federation
+    /// nonce burn are `synchronous=FULL` (fsync per commit, survive a hard power
+    /// loss); the audit chain stays `synchronous=NORMAL` (no per-row fsync —
+    /// throughput-safe at 20 Hz+) and relies on this checkpoint (graceful
+    /// safe-stop/shutdown + SQLite auto-checkpoint). So the final audit rows
+    /// before an UNGRACEFUL power cut may be lost — a forensic gap, never a
+    /// safety-state gap (the verdict path is store-free). Do NOT assume the audit
+    /// tail is hard-power-loss-durable. Tighter durability (a periodic fsync'd
+    /// checkpoint) is an available future knob, off by default. See
+    /// docs/safety/CODING_GUIDELINES.md INV-12.
     pub fn durable_checkpoint(&self) -> Result<()> {
         if let Some(dc) = &self.durable_conn {
             dc.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;

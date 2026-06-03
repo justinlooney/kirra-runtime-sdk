@@ -319,6 +319,13 @@ All axum route handlers must use `State<Arc<ServiceState>>` as the state extract
 
 In `persist_and_insert_node` and all equivalent persistence-then-memory operations, the SQLite write (`save_node`) must occur before the in-memory insert (`nodes.insert`). Reversing this order would allow in-memory state to diverge from persisted state on crash, creating an inconsistent trust state on restart.
 
+**Ordering vs durability — keep these distinct (#74).** INV-12 is a write-**ordering** invariant (disk row before in-memory mutation); it is unchanged. **Durability** — surviving an OS crash / power loss at commit time — is a separate property with a precise, deliberate boundary:
+
+- **HA epoch claim** (`try_claim_epoch`) and **federation nonce burn** (`save_federated_report_chained`) commit on a dedicated `synchronous=FULL` connection → **fsync-durable**, so they survive a hard power-loss. This closes the split-brain window (a claimed epoch cannot regress on recovery) and the anti-replay gap.
+- **Audit-chain rows** are **durable to the last checkpoint**: the per-command path stays `synchronous=NORMAL` (no per-row fsync — throughput-safe), and `durable_checkpoint()` fsyncs the WAL on graceful safe-stop / shutdown (SIGINT/SIGTERM), in addition to SQLite's auto-checkpoint. The **final pre-power-loss audit rows MAY be lost on an *ungraceful* cut** (no SIGTERM runs the checkpoint). This is the accepted loss window — chosen over a 20 Hz per-row fsync.
+- **Verdict path** is store-free → nothing to lose; WCET unaffected.
+- A periodic fsync'd audit checkpoint is an available future tightening (off by default) if tighter audit durability is later required.
+
 ### INV-13: No std::env::set_var in Multithreaded Context (Mandatory)
 
 `std::env::set_var()` is not thread-safe on POSIX systems and shall never be called after the tokio runtime starts. All environment variable reads shall occur at startup via `std::env::var()` and be stored in the application state. See Rule CONC-002.
