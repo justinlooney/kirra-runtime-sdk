@@ -181,6 +181,21 @@ jobs:
           RUST_BACKTRACE: "1"
         run: cargo test -p parko-onnx -- --nocapture
 
+      - name: parko-tensorrt fail-closed test (PARK-021, GATING)
+        # Reuses the CPU-only ONNX Runtime installed above (ORT_DYLIB_PATH from
+        # $GITHUB_ENV). This build of ORT has NO TensorRT execution provider, so
+        # registering the TRT EP (with `.error_on_failure()`) must make
+        # TrtBackend::with_config return Err — proving the safety-critical
+        # "no silent CPU fallback" on the very environment that lacks TensorRT.
+        # The test self-skips only when the ORT lib FILE is absent (it is present
+        # here), so it asserts in this job. Real TRT inference is Jetson-gated and
+        # not run on CI; the TensorRTStubBackend remains the CI runtime fallback.
+        timeout-minutes: 10
+        working-directory: parko
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test -p parko-tensorrt --test fail_closed -- --nocapture
+
   parko-openvino:
     name: Parko OpenVINO Backend Tests (pip openvino-2025.1)
     runs-on: ubuntu-latest
