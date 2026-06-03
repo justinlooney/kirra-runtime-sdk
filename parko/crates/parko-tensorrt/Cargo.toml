@@ -1,0 +1,20 @@
+[package]
+name = "parko-tensorrt"
+version = "0.1.0"
+edition = "2021"
+description = "TensorRT (NVIDIA Jetson) backend for parko-core via ort's TensorRT execution provider"
+license = "Apache-2.0"
+
+[dependencies]
+parko-core = { path = "../parko-core" }
+# Shared ORT session + load_model/run core, extracted from parko-onnx (PARK-021,
+# A1). parko-tensorrt differs from parko-onnx ONLY in the EP/precision config; the
+# inference path is identical, so it is reused, not duplicated.
+parko-onnx = { path = "../parko-onnx" }
+# Same ort + load-dynamic as parko-onnx. load-dynamic pulls ort-sys/disable-linking,
+# so this compiles with NO CUDA/TensorRT libraries present (CI has no GPU). The TRT
+# execution provider is registered at runtime against the dlopened libonnxruntime.so;
+# on a CPU-only ORT lib that registration FAILS (fail-closed), and on the Jetson's
+# TensorRT-enabled ORT it succeeds.
+ort = { version = "=2.0.0-rc.11", features = ["load-dynamic"] }
+tracing = "0.1"
