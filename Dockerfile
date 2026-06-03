@@ -1,3 +1,18 @@
+# This image builds the GATEWAY (kirra_verifier_service) only — target-agnostic
+# and unchanged. The Parko inference BACKENDS run on a per-target base-image
+# matrix (one framework, per-target base), using the same target names as
+# scripts/install-parko-backend.sh and the scheduler descriptor strings:
+#
+#   ort-cpu    → this CPU base is fine (ONNX Runtime CPU)
+#   openvino   → an Intel / OpenVINO runtime base
+#   tensorrt   → an NVIDIA L4T / JetPack base (TensorRT-enabled ORT, aarch64/Jetson)
+#   qnn / ti-tidl / amd-vitis → vendor-SDK bases (gated; slots, not yet real)
+#
+# Do NOT fork this file per target. The per-target backend layer installs via
+# scripts/install-parko-backend.sh (host or container); per-target base images
+# are documented in INSTALL.md "Multi-Backend / Multi-Chipset Install". One
+# gateway image + one target-parameterized backend flow.
+
 # ── Stage 1: build ───────────────────────────────────────────────────────────
 FROM rust:1-alpine AS builder
 

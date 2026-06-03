@@ -125,6 +125,12 @@ for arg in "$@"; do
             echo "  KIRRA_PORT         Listen port (default: 8090)"
             echo "  KIRRA_DB_PATH      Database path (default: /var/lib/kirra/kirra.db)"
             echo "  KIRRA_VERIFIER_MODE active or passive_standby (default: active)"
+            echo ""
+            echo "This installs the GATEWAY (kirra_verifier_service) only. To install a"
+            echo "Parko inference BACKEND for a silicon target (composes with this gateway"
+            echo "install), use the companion target-aware layer:"
+            echo "  sudo bash scripts/install-parko-backend.sh --target <ort-cpu|openvino|tensorrt|qnn|ti-tidl|amd-vitis>"
+            echo "See INSTALL.md 'Multi-Backend / Multi-Chipset Install'."
             exit 0
             ;;
         *)
