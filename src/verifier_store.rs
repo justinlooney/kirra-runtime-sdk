@@ -112,6 +112,83 @@ fn extend_keyring_from_rotation(
     }
 }
 
+// --- #165 durable audit-key trust map helpers ------------------------------
+
+/// Outcome of admitting the env-loaded signing key against the durable ledger
+/// at boot. The bin maps the `*Rejected`/`Mismatch` variants to a fatal,
+/// fail-closed startup error (refuse to sign); the others proceed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyAdmission {
+    /// Env key matches the durable active key — normal resume.
+    Resumed,
+    /// No durable anchor existed; first-boot backfill wrote the anchor + a
+    /// genesis ledger row (and reconciled any pre-existing in-chain rotations
+    /// into forensic `backfill` ledger rows). Env key adopted as genesis/active.
+    BackfilledGenesis,
+    /// Anchor existed; env key was a NEW id and an explicit adopt signal was
+    /// present, so a durable `reanchor` ledger row was recorded and the env key
+    /// adopted as active. (Gap-2 operator env-rotation, consented.)
+    AdoptedReanchor,
+    /// FAIL-CLOSED: env key is present in the ledger but is NOT the active key
+    /// (a restart reverted to a retired key). The store does NOT adopt it.
+    RetiredKeyRejected,
+    /// FAIL-CLOSED: env key is a NEW id not in the ledger and no explicit adopt
+    /// signal was present (anti-silent-re-root). The store does NOT adopt it.
+    UnadoptedNewKeyRejected,
+    /// FAIL-CLOSED: a config-pinned genesis key-id did not match the durable
+    /// anchor's genesis.
+    GenesisPinMismatch,
+}
+
+/// Canonical, versioned signing payload for an `audit_key_ledger` row. The NEW
+/// key signs this to bind `key_id ↔ pubkey` (and its place in the chain). `seq`
+/// is deliberately excluded — it is a local ordering PK, not security-relevant;
+/// the binding is over the content-addressed identity, predecessor, role and ts.
+fn ledger_signing_payload(
+    key_id: &str,
+    prev_key_id: Option<&str>,
+    role: &str,
+    pubkey_b64: &str,
+    created_at_ms: i64,
+) -> String {
+    format!(
+        "KIRRA_KEY_LEDGER_V1|{key_id}|{prev}|{role}|{pubkey_b64}|{created_at_ms}",
+        prev = prev_key_id.unwrap_or("")
+    )
+}
+
+/// A decoded `audit_key_ledger` row.
+struct LedgerRow {
+    key_id: String,
+    role: String,
+    pubkey_b64: String,
+    signature_b64: String,
+    prev_key_id: Option<String>,
+    created_at_ms: i64,
+}
+
+/// True iff a ledger row is content-addressed AND carries a valid self-signature
+/// by its own key — the condition for trusting it as a verification key. The
+/// forensic `backfill` rows (empty signature) are intentionally NOT trusted here
+/// (their keys are reachable via the in-chain KEY_ROTATION replay instead).
+fn ledger_row_is_self_attested(r: &LedgerRow) -> bool {
+    if r.signature_b64.is_empty() {
+        return false;
+    }
+    let Some(vk) = audit_decode_vk(&r.pubkey_b64) else { return false };
+    if crate::audit_chain::verifying_key_id(&vk) != r.key_id {
+        return false; // content-addressing violated
+    }
+    let payload = ledger_signing_payload(
+        &r.key_id,
+        r.prev_key_id.as_deref(),
+        &r.role,
+        &r.pubkey_b64,
+        r.created_at_ms,
+    );
+    audit_verify_sig(&vk, &payload, &r.signature_b64)
+}
+
 impl VerifierStore {
     pub fn new(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -192,6 +269,42 @@ impl VerifierStore {
         conn.execute(
             "INSERT OR IGNORE INTO ha_state (id, epoch, active_instance_id, updated_at_ms)
              VALUES (1, 0, NULL, 0)",
+            [],
+        )?;
+
+        // --- Durable audit-key trust map (#165) --------------------------------
+        // A write-once trust ANCHOR (durable genesis fingerprint) + an append-only
+        // signed key LEDGER. Together they make signing-key rotation durable across
+        // restart and pin the verification root to a DURABLE anchor (not the
+        // mutable env key). All writes ride the `synchronous=FULL` durable_conn
+        // (see record_key_rotation / admit_signing_key) so they inherit #74's
+        // hard-power-loss durability.
+        //
+        // GENERIC SHAPE (reused by #164's hmac_salt_ledger): the pair is a
+        // "versioned-secret" pattern — a write-once anchor singleton naming the
+        // root version, plus an append-only ledger of {version-id, prev-id, role,
+        // material, self-attestation, ts}. The audit-key specialization fills
+        // `pubkey_b64` + `signature_b64` (Ed25519 self-signature); a symmetric
+        // secret (HMAC salt) would carry a salt fingerprint instead of a pubkey
+        // and an HMAC tag instead of a signature. The skeleton is identical.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS audit_trust_anchor (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                genesis_key_id  TEXT    NOT NULL,
+                created_at_ms   INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS audit_key_ledger (
+                seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_id         TEXT    NOT NULL,
+                prev_key_id    TEXT,
+                role           TEXT    NOT NULL,   -- 'genesis' | 'rotation' | 'reanchor' | 'backfill'
+                pubkey_b64     TEXT    NOT NULL,
+                signature_b64  TEXT    NOT NULL,   -- self-signature by this key ('' for forensic 'backfill')
+                created_at_ms  INTEGER NOT NULL
+            )",
             [],
         )?;
 
@@ -284,6 +397,277 @@ impl VerifierStore {
 
     pub fn set_signing_key(&mut self, key: ed25519_dalek::SigningKey) {
         self.signing_key = Some(key);
+    }
+
+    // --- #165 durable audit-key trust map -----------------------------------
+
+    /// The durable trust anchor's genesis key-id, if an anchor has been written.
+    pub fn audit_trust_anchor_genesis_id(&self) -> Result<Option<String>> {
+        let r = self.durable_ref().query_row(
+            "SELECT genesis_key_id FROM audit_trust_anchor WHERE id = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        );
+        match r {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// All ledger rows in `seq` order.
+    fn audit_key_ledger_rows(&self) -> Result<Vec<LedgerRow>> {
+        let mut stmt = self.durable_ref().prepare(
+            "SELECT key_id, role, pubkey_b64, signature_b64, prev_key_id, created_at_ms \
+             FROM audit_key_ledger ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(LedgerRow {
+                key_id: row.get(0)?,
+                role: row.get(1)?,
+                pubkey_b64: row.get(2)?,
+                signature_b64: row.get(3)?,
+                prev_key_id: row.get(4)?,
+                created_at_ms: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// The active key-id: the highest-`seq` ledger row that is NOT a forensic
+    /// `backfill` row (those record lost-private-key history, never an active
+    /// signer). `None` when the ledger is empty.
+    pub fn audit_key_ledger_active_id(&self) -> Result<Option<String>> {
+        let r = self.durable_ref().query_row(
+            "SELECT key_id FROM audit_key_ledger WHERE role != 'backfill' \
+             ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        );
+        match r {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Resolve the durable genesis verifying key from the anchor + the ledger's
+    /// genesis row. `None` when no anchor exists (pre-#165 chains).
+    fn audit_genesis_vk(&self) -> Result<Option<ed25519_dalek::VerifyingKey>> {
+        let Some(genesis_id) = self.audit_trust_anchor_genesis_id()? else {
+            return Ok(None);
+        };
+        for r in self.audit_key_ledger_rows()? {
+            if r.key_id == genesis_id {
+                if let Some(vk) = audit_decode_vk(&r.pubkey_b64) {
+                    if crate::audit_chain::verifying_key_id(&vk) == genesis_id {
+                        return Ok(Some(vk));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Seed the per-row verification keyring (#76 + #165): genesis from the
+    /// DURABLE anchor (falling back to `fallback_vk` only when no anchor exists,
+    /// i.e. a pre-#165 chain), plus every self-attested ledger key. Returns the
+    /// keyring and the genesis key-id used to attribute NULL-key_id legacy rows.
+    fn audit_keyring_seed(
+        &self,
+        fallback_vk: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> Result<(std::collections::HashMap<String, ed25519_dalek::VerifyingKey>, Option<String>)> {
+        let mut keyring = std::collections::HashMap::new();
+
+        let durable_genesis = self.audit_genesis_vk()?;
+        let genesis_id = match (&durable_genesis, fallback_vk) {
+            // Durable anchor wins — a mutated env key can never re-root trust.
+            (Some(gvk), _) => {
+                let gid = crate::audit_chain::verifying_key_id(gvk);
+                keyring.insert(gid.clone(), *gvk);
+                Some(gid)
+            }
+            // Pre-#165 fallback: the passed-in (env) key is the genesis.
+            (None, Some(fvk)) => {
+                let gid = crate::audit_chain::verifying_key_id(fvk);
+                keyring.insert(gid.clone(), *fvk);
+                Some(gid)
+            }
+            (None, None) => None,
+        };
+
+        // Extend with every self-attested ledger key (rotations + reanchors +
+        // genesis). Forensic `backfill` rows (no self-signature) are skipped;
+        // their keys remain reachable via the in-chain KEY_ROTATION replay.
+        for r in self.audit_key_ledger_rows()? {
+            if ledger_row_is_self_attested(&r) {
+                if let Some(vk) = audit_decode_vk(&r.pubkey_b64) {
+                    keyring.insert(r.key_id.clone(), vk);
+                }
+            }
+        }
+        Ok((keyring, genesis_id))
+    }
+
+    /// Collect the (key_id, pubkey_b64) of each in-chain KEY_ROTATION event in
+    /// id order — used at first-boot to backfill forensic ledger rows so the
+    /// ledger reflects pre-#165 in-process rotation history.
+    fn collect_chain_key_rotations(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_json FROM audit_log_chain \
+             WHERE event_type = 'KEY_ROTATION' ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for ej in rows {
+            let ej = ej?;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ej) {
+                if let (Some(pk), Some(kid)) =
+                    (v["new_public_key_b64"].as_str(), v["new_key_id"].as_str())
+                {
+                    // Content-addressed sanity: only carry rows whose announced
+                    // id matches the announced pubkey.
+                    if let Some(vk) = audit_decode_vk(pk) {
+                        if crate::audit_chain::verifying_key_id(&vk) == kid {
+                            out.push((kid.to_string(), pk.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Admit the env-loaded signing key against the durable trust map (#165),
+    /// returning a [`KeyAdmission`] the caller acts on. Fail-closed variants do
+    /// NOT set the in-memory signing key. See [`KeyAdmission`] for the cases.
+    ///
+    /// - No anchor → FIRST-BOOT BACKFILL: write anchor{genesis = env} + a
+    ///   self-signed genesis ledger row, and reconcile any pre-existing in-chain
+    ///   KEY_ROTATION rows into forensic `backfill` ledger rows. Adopt env.
+    /// - Anchor + env == active → resume.
+    /// - Anchor + env is a RETIRED ledger id → fail-closed (gap-1).
+    /// - Anchor + env is a NEW id → fail-closed unless `adopt`, in which case a
+    ///   self-signed `reanchor` ledger row is recorded and env adopted (gap-2).
+    /// - `pinned_genesis` (optional) is checked against the anchor; mismatch is
+    ///   fail-closed.
+    ///
+    /// All durable writes ride a single `synchronous=FULL` transaction.
+    pub fn admit_signing_key(
+        &mut self,
+        env_key: ed25519_dalek::SigningKey,
+        adopt: bool,
+        pinned_genesis: Option<&str>,
+        now_ms: u64,
+    ) -> Result<KeyAdmission> {
+        use ed25519_dalek::Signer;
+        let env_vk = env_key.verifying_key();
+        let k_env = crate::audit_chain::verifying_key_id(&env_vk);
+        let env_pub_b64 = b64e.encode(env_vk.as_bytes());
+
+        // Optional operator-pinned genesis check (only meaningful once an anchor
+        // exists; on first boot the pin is established by the backfill below).
+        if let (Some(pin), Some(genesis)) = (pinned_genesis, self.audit_trust_anchor_genesis_id()?) {
+            if pin != genesis {
+                return Ok(KeyAdmission::GenesisPinMismatch);
+            }
+        }
+
+        match self.audit_trust_anchor_genesis_id()? {
+            // ---- FIRST-BOOT BACKFILL (no durable anchor yet) -----------------
+            None => {
+                let genesis_sig = b64e.encode(
+                    env_key
+                        .sign(ledger_signing_payload(&k_env, None, "genesis", &env_pub_b64, now_ms as i64).as_bytes())
+                        .to_bytes(),
+                );
+                let rotations = self.collect_chain_key_rotations()?;
+                let tx = self.durable_mut().transaction()?;
+                tx.execute(
+                    "INSERT INTO audit_trust_anchor (id, genesis_key_id, created_at_ms) \
+                     VALUES (1, ?1, ?2)",
+                    params![k_env, now_ms as i64],
+                )?;
+                tx.execute(
+                    "INSERT INTO audit_key_ledger \
+                     (key_id, prev_key_id, role, pubkey_b64, signature_b64, created_at_ms) \
+                     VALUES (?1, NULL, 'genesis', ?2, ?3, ?4)",
+                    params![k_env, env_pub_b64, genesis_sig, now_ms as i64],
+                )?;
+                // Forensic reconcile of pre-#165 in-process rotations. These keys'
+                // private halves are gone (the very bug #165 closes), so the rows
+                // carry an EMPTY self-signature (role='backfill') — history for
+                // audit, never an active signer. The running env key stays active.
+                let mut prev = k_env.clone();
+                for (kid, pk) in rotations {
+                    if kid == k_env {
+                        continue; // env key already represented by the genesis row
+                    }
+                    tx.execute(
+                        "INSERT INTO audit_key_ledger \
+                         (key_id, prev_key_id, role, pubkey_b64, signature_b64, created_at_ms) \
+                         VALUES (?1, ?2, 'backfill', ?3, '', ?4)",
+                        params![kid, prev, pk, now_ms as i64],
+                    )?;
+                    prev = kid;
+                }
+                tx.commit()?; // FULL → fsync
+                self.signing_key = Some(env_key);
+                Ok(KeyAdmission::BackfilledGenesis)
+            }
+            // ---- ANCHOR EXISTS: strict admission -----------------------------
+            Some(_genesis_id) => {
+                let active = self.audit_key_ledger_active_id()?;
+                if active.as_deref() == Some(k_env.as_str()) {
+                    self.signing_key = Some(env_key);
+                    return Ok(KeyAdmission::Resumed);
+                }
+                // Is the env key present anywhere in the ledger (retired key)?
+                let in_ledger = self
+                    .audit_key_ledger_rows()?
+                    .iter()
+                    .any(|r| r.key_id == k_env);
+                if in_ledger {
+                    // Gap-1: a restart reverted to a retired key. Refuse to sign.
+                    return Ok(KeyAdmission::RetiredKeyRejected);
+                }
+                // New id. Gap-2: only adopt with an explicit operator signal.
+                if !adopt {
+                    return Ok(KeyAdmission::UnadoptedNewKeyRejected);
+                }
+                // Consented re-anchor. We cannot sign an in-chain KEY_ROTATION
+                // under the old active key (its private half is not in env at
+                // boot), so the adopt is recorded as a self-signed `reanchor`
+                // ledger row. Prior rows keep verifying under the durable genesis
+                // anchor; new rows verify under this adopted key (it enters the
+                // keyring via `audit_keyring_seed`'s self-attested-ledger pass).
+                let prev_active = active.clone();
+                let reanchor_sig = b64e.encode(
+                    env_key
+                        .sign(
+                            ledger_signing_payload(
+                                &k_env,
+                                prev_active.as_deref(),
+                                "reanchor",
+                                &env_pub_b64,
+                                now_ms as i64,
+                            )
+                            .as_bytes(),
+                        )
+                        .to_bytes(),
+                );
+                let tx = self.durable_mut().transaction()?;
+                tx.execute(
+                    "INSERT INTO audit_key_ledger \
+                     (key_id, prev_key_id, role, pubkey_b64, signature_b64, created_at_ms) \
+                     VALUES (?1, ?2, 'reanchor', ?3, ?4, ?5)",
+                    params![k_env, prev_active, env_pub_b64, reanchor_sig, now_ms as i64],
+                )?;
+                tx.commit()?; // FULL → fsync
+                self.signing_key = Some(env_key);
+                Ok(KeyAdmission::AdoptedReanchor)
+            }
+        }
     }
 
     pub fn save_node(&self, node: &RegisteredNode) -> Result<()> {
@@ -714,9 +1098,11 @@ impl VerifierStore {
         &self,
         genesis_vk: &ed25519_dalek::VerifyingKey,
     ) -> Result<std::collections::HashMap<String, ed25519_dalek::VerifyingKey>> {
-        let mut keyring = std::collections::HashMap::new();
-        let genesis_id = crate::audit_chain::verifying_key_id(genesis_vk);
-        keyring.insert(genesis_id.clone(), *genesis_vk);
+        // #165: seed genesis from the DURABLE anchor (self-attested ledger keys
+        // included); the passed-in `genesis_vk` is only the pre-#165 fallback.
+        let (mut keyring, genesis_id_opt) = self.audit_keyring_seed(Some(genesis_vk))?;
+        let genesis_id =
+            genesis_id_opt.unwrap_or_else(|| crate::audit_chain::verifying_key_id(genesis_vk));
 
         let mut stmt = self.conn.prepare(
             "SELECT event_json, previous_hash_hex, record_hash_hex, created_at_ms, \
@@ -761,16 +1147,12 @@ impl VerifierStore {
              FROM audit_log_chain ORDER BY id ASC",
         )?;
 
-        // Keyring bootstrapped from the genesis verifying key; extended in id
-        // order as verified KEY_ROTATION rows are encountered. A signed row is
-        // verified under the key its key_id names — old rows under their
-        // ORIGINAL key, never re-signed.
-        let genesis_id = verifying_key.map(crate::audit_chain::verifying_key_id);
-        let mut keyring: std::collections::HashMap<String, ed25519_dalek::VerifyingKey> =
-            std::collections::HashMap::new();
-        if let (Some(gvk), Some(gid)) = (verifying_key, genesis_id.as_ref()) {
-            keyring.insert(gid.clone(), *gvk);
-        }
+        // Keyring seeded from the DURABLE anchor (#165) — genesis from
+        // `audit_trust_anchor` + self-attested ledger keys — falling back to the
+        // passed-in env key only for pre-#165 chains. Extended in id order as
+        // verified KEY_ROTATION rows are encountered. A signed row is verified
+        // under the key its key_id names — old rows under their ORIGINAL key.
+        let (mut keyring, genesis_id) = self.audit_keyring_seed(verifying_key)?;
 
         let mut chain_intact = true;
         let mut total_entries: u64 = 0;
@@ -1024,9 +1406,18 @@ impl VerifierStore {
         reason: &str,
         now_ms: u64,
     ) -> Result<()> {
+        use ed25519_dalek::Signer;
         let new_vk = new_signing_key.verifying_key();
         let new_public_key_b64 = b64e.encode(new_vk.as_bytes());
         let new_key_id = crate::audit_chain::verifying_key_id(&new_vk);
+
+        // The OLD key signs the in-chain KEY_ROTATION row (so it verifies under a
+        // key already trusted). Clone it out before borrowing self mutably for
+        // the durable transaction.
+        let old_key = self.signing_key.clone();
+        let old_key_id = old_key
+            .as_ref()
+            .map(|k| crate::audit_chain::verifying_key_id(&k.verifying_key()));
 
         let payload = serde_json::json!({
             "new_public_key_b64": new_public_key_b64,
@@ -1035,24 +1426,51 @@ impl VerifierStore {
             "rotated_at_ms": now_ms,
         });
 
-        // (a) sign+append the KEY_ROTATION row with the OLD key, committed first.
-        let tx = self.conn.transaction()?;
-        crate::audit_chain::AuditChainLinker::append_audit_event_tx(
-            &tx,
-            "KEY_ROTATION",
-            &payload.to_string(),
-            now_ms as i64,
-            self.signing_key.as_ref(),
-        )?;
-        tx.commit()?;
+        // The NEW key self-signs its ledger row (binds key_id ↔ pubkey).
+        let ledger_sig = b64e.encode(
+            new_signing_key
+                .sign(
+                    ledger_signing_payload(
+                        &new_key_id,
+                        old_key_id.as_deref(),
+                        "rotation",
+                        &new_public_key_b64,
+                        now_ms as i64,
+                    )
+                    .as_bytes(),
+                )
+                .to_bytes(),
+        );
 
-        // (b) swap the in-memory signing key to the NEW key (atomic under the
-        //     store lock the caller holds — no append can interleave).
+        // #165: ONE durable (synchronous=FULL) transaction commits BOTH the
+        // in-chain KEY_ROTATION row (signed by the OLD key) AND the durable
+        // audit_key_ledger row (self-signed by the NEW key). They are atomic and
+        // fsync'd together — both-present-or-neither across a hard restart. Only
+        // this rare, security-critical event rides FULL; the per-command audit
+        // path stays on the NORMAL connection.
+        {
+            let tx = self.durable_mut().transaction()?;
+            crate::audit_chain::AuditChainLinker::append_audit_event_tx(
+                &tx,
+                "KEY_ROTATION",
+                &payload.to_string(),
+                now_ms as i64,
+                old_key.as_ref(),
+            )?;
+            tx.execute(
+                "INSERT INTO audit_key_ledger \
+                 (key_id, prev_key_id, role, pubkey_b64, signature_b64, created_at_ms) \
+                 VALUES (?1, ?2, 'rotation', ?3, ?4, ?5)",
+                params![new_key_id, old_key_id, new_public_key_b64, ledger_sig, now_ms as i64],
+            )?;
+            tx.commit()?; // FULL → fsync; durable active-key record updated
+        }
+
+        // Swap the in-memory signing key to the NEW key AFTER the durable commit
+        // (atomic under the store lock the caller holds — no append interleaves).
+        // The durable ledger — not the dropped advisory engine-state row — is now
+        // the authoritative record of the active key.
         self.signing_key = Some(new_signing_key);
-
-        // (c) advisory engine-state pubkey (not a trust anchor; the chain's
-        //     KEY_ROTATION events are authoritative).
-        self.save_engine_state("audit_signing_public_key", &new_public_key_b64)?;
         Ok(())
     }
 
@@ -2251,5 +2669,247 @@ mod durability_tests {
         let s2 = VerifierStore::new(db.path()).unwrap();
         let r2 = s2.verify_audit_chain_full(Some(&key.verifying_key())).unwrap();
         assert!(r2.chain_intact && r2.signed_entries >= 3, "rows durable + intact after reopen");
+    }
+}
+
+#[cfg(test)]
+mod key_durability_165_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use crate::audit_chain::{verifying_key_id, AuditChainLinker};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CTR: AtomicU64 = AtomicU64::new(0);
+
+    /// Temp DB file (+ -wal/-shm) cleaned up on drop — a file store so the
+    /// FULL durable_conn exists and survives reopen.
+    struct TmpDb(String);
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            let n = CTR.fetch_add(1, Ordering::SeqCst);
+            let p = std::env::temp_dir()
+                .join(format!("kirra165_{tag}_{}_{n}.db", std::process::id()));
+            TmpDb(p.to_string_lossy().into_owned())
+        }
+        fn path(&self) -> &str { &self.0 }
+    }
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{}", self.0, ext));
+            }
+        }
+    }
+
+    fn key(seed: u8) -> SigningKey { SigningKey::from_bytes(&[seed; 32]) }
+    fn kid(k: &SigningKey) -> String { verifying_key_id(&k.verifying_key()) }
+
+    // --- Test 1: DURABLE ROTATION (gap-1 proof) -----------------------------
+    #[test]
+    fn durable_rotation_then_reverted_env_is_fail_closed() {
+        let db = TmpDb::new("g1");
+        let (a, b) = (key(1), key(2));
+        {
+            let mut s = VerifierStore::new(db.path()).unwrap();
+            assert_eq!(
+                s.admit_signing_key(a.clone(), false, None, 1_000).unwrap(),
+                KeyAdmission::BackfilledGenesis
+            );
+            assert_eq!(s.audit_key_ledger_active_id().unwrap().as_deref(), Some(kid(&a).as_str()));
+            s.record_key_rotation(b.clone(), "scheduled", 2_000).unwrap();
+            assert_eq!(s.audit_key_ledger_active_id().unwrap().as_deref(), Some(kid(&b).as_str()));
+        }
+        // Reopen with env reverted to A (the retired key) → FAIL CLOSED.
+        {
+            let mut s = VerifierStore::new(db.path()).unwrap();
+            assert_eq!(s.audit_key_ledger_active_id().unwrap().as_deref(), Some(kid(&b).as_str()),
+                "active=B is durable across reopen");
+            assert_eq!(
+                s.admit_signing_key(a.clone(), false, None, 3_000).unwrap(),
+                KeyAdmission::RetiredKeyRejected
+            );
+            assert!(s.signing_key.is_none(), "must NOT adopt a retired key for signing");
+        }
+        // Reopen with the correct active key B → resume.
+        {
+            let mut s = VerifierStore::new(db.path()).unwrap();
+            assert_eq!(
+                s.admit_signing_key(b.clone(), false, None, 4_000).unwrap(),
+                KeyAdmission::Resumed
+            );
+            assert!(s.signing_key.is_some());
+        }
+    }
+
+    // --- Test 2: ENV-ROTATION (adopt vs fail-closed, gap-2) -----------------
+    #[test]
+    fn env_rotation_new_key_requires_explicit_adopt() {
+        let db = TmpDb::new("g2");
+        let (a, c) = (key(1), key(3));
+        { let mut s = VerifierStore::new(db.path()).unwrap();
+          s.admit_signing_key(a.clone(), false, None, 1_000).unwrap(); }
+        // New env key, NO adopt → fail closed.
+        { let mut s = VerifierStore::new(db.path()).unwrap();
+          assert_eq!(
+              s.admit_signing_key(c.clone(), false, None, 2_000).unwrap(),
+              KeyAdmission::UnadoptedNewKeyRejected);
+          assert!(s.signing_key.is_none()); }
+        // New env key, WITH adopt → records reanchor, adopts C.
+        { let mut s = VerifierStore::new(db.path()).unwrap();
+          assert_eq!(
+              s.admit_signing_key(c.clone(), true, None, 3_000).unwrap(),
+              KeyAdmission::AdoptedReanchor);
+          assert_eq!(s.audit_key_ledger_active_id().unwrap().as_deref(), Some(kid(&c).as_str()));
+          assert!(s.signing_key.is_some()); }
+        // Subsequent boot with C (now active) resumes without adopt.
+        { let mut s = VerifierStore::new(db.path()).unwrap();
+          assert_eq!(
+              s.admit_signing_key(c.clone(), false, None, 4_000).unwrap(),
+              KeyAdmission::Resumed); }
+    }
+
+    // --- Test 3: GENESIS ANCHOR (gap-2) — mutated env can't re-root ---------
+    #[test]
+    fn genesis_comes_from_durable_anchor_not_env() {
+        let db = TmpDb::new("g3");
+        let (a, mutated) = (key(1), key(9));
+        let mut s = VerifierStore::new(db.path()).unwrap();
+        s.admit_signing_key(a.clone(), false, None, 1_000).unwrap(); // anchor genesis = A
+        // Append a normal signed row under A.
+        {
+            let sk = s.signing_key.clone();
+            let tx = s.conn.transaction().unwrap();
+            AuditChainLinker::append_audit_event_tx(&tx, "TEST", "{}", 1_500, sk.as_ref()).unwrap();
+            tx.commit().unwrap();
+        }
+        // Verify while passing a MUTATED key: genesis must resolve from the
+        // durable anchor (A), so the prior rows still verify and the mutated
+        // key cannot re-root the keyring.
+        let r = s.verify_audit_chain_full(Some(&mutated.verifying_key())).unwrap();
+        assert!(r.chain_intact, "chain intact");
+        assert!(r.signature_valid, "prior rows verify under the durable genesis anchor, not the mutated env key");
+    }
+
+    // --- Test 4: FIRST-BOOT BACKFILL + idempotency --------------------------
+    #[test]
+    fn first_boot_backfill_writes_anchor_and_is_idempotent() {
+        let db = TmpDb::new("g4");
+        let a = key(1);
+        let mut s = VerifierStore::new(db.path()).unwrap();
+        assert_eq!(
+            s.admit_signing_key(a.clone(), false, None, 1_000).unwrap(),
+            KeyAdmission::BackfilledGenesis);
+        assert_eq!(s.audit_trust_anchor_genesis_id().unwrap().as_deref(), Some(kid(&a).as_str()));
+        let genesis_rows = s.audit_key_ledger_rows().unwrap()
+            .into_iter().filter(|r| r.role == "genesis").count();
+        assert_eq!(genesis_rows, 1, "exactly one genesis ledger row");
+        // Re-run admission with the same key → resume, no second backfill.
+        assert_eq!(
+            s.admit_signing_key(a.clone(), false, None, 2_000).unwrap(),
+            KeyAdmission::Resumed);
+        let genesis_rows2 = s.audit_key_ledger_rows().unwrap()
+            .into_iter().filter(|r| r.role == "genesis").count();
+        assert_eq!(genesis_rows2, 1, "backfill is idempotent — still exactly one genesis row");
+    }
+
+    // --- Test 5: MIGRATION RECONCILE ----------------------------------------
+    #[test]
+    fn migration_reconciles_preexisting_chain_rotations_into_ledger() {
+        let db = TmpDb::new("g5");
+        let (a, b) = (key(1), key(2));
+        let mut s = VerifierStore::new(db.path()).unwrap();
+        // Simulate a pre-#165 in-chain KEY_ROTATION (A→B) with NO ledger row.
+        s.set_signing_key(a.clone());
+        {
+            let payload = serde_json::json!({
+                "new_public_key_b64": b64e.encode(b.verifying_key().as_bytes()),
+                "new_key_id": kid(&b),
+                "reason": "preexisting",
+                "rotated_at_ms": 500,
+            }).to_string();
+            let tx = s.conn.transaction().unwrap();
+            AuditChainLinker::append_audit_event_tx(&tx, "KEY_ROTATION", &payload, 500, Some(&a)).unwrap();
+            tx.commit().unwrap();
+        }
+        // No anchor yet. First-boot admission backfills the ledger from history.
+        assert_eq!(
+            s.admit_signing_key(a.clone(), false, None, 1_000).unwrap(),
+            KeyAdmission::BackfilledGenesis);
+        let rows = s.audit_key_ledger_rows().unwrap();
+        assert!(rows.iter().any(|r| r.role == "genesis" && r.key_id == kid(&a)),
+            "genesis ledger row for A");
+        assert!(rows.iter().any(|r| r.role == "backfill" && r.key_id == kid(&b)),
+            "forensic backfill ledger row matching the pre-existing chain rotation to B");
+        // The running env key (A) stays active; the lost-key B is forensic only.
+        assert_eq!(s.audit_key_ledger_active_id().unwrap().as_deref(), Some(kid(&a).as_str()));
+    }
+
+    // --- Test 6: ATOMICITY — chain row + ledger row both-or-neither ---------
+    #[test]
+    fn rotation_chain_row_and_ledger_row_are_atomic_across_reopen() {
+        let db = TmpDb::new("g6");
+        let (a, b) = (key(1), key(2));
+        {
+            let mut s = VerifierStore::new(db.path()).unwrap();
+            s.admit_signing_key(a.clone(), false, None, 1).unwrap();
+            s.record_key_rotation(b.clone(), "r", 2).unwrap();
+        }
+        let s = VerifierStore::new(db.path()).unwrap();
+        let chain_rot: i64 = s.conn.query_row(
+            "SELECT COUNT(*) FROM audit_log_chain WHERE event_type='KEY_ROTATION'", [], |r| r.get(0)).unwrap();
+        let ledger_rot: i64 = s.durable_ref().query_row(
+            "SELECT COUNT(*) FROM audit_key_ledger WHERE role='rotation'", [], |r| r.get(0)).unwrap();
+        assert_eq!(chain_rot, 1, "the KEY_ROTATION chain row is durable across reopen");
+        assert_eq!(ledger_rot, 1, "the ledger rotation row is durable across reopen");
+        assert_eq!(chain_rot, ledger_rot, "both-present (single FULL transaction)");
+    }
+
+    // --- Regression: a rotated chain still verifies under the ledger seed ----
+    #[test]
+    fn rotated_chain_still_verifies_with_durable_seed() {
+        let db = TmpDb::new("g7");
+        let (a, b) = (key(1), key(2));
+        let mut s = VerifierStore::new(db.path()).unwrap();
+        s.admit_signing_key(a.clone(), false, None, 1).unwrap();
+        // a signed row under A, rotate to B, a signed row under B.
+        {
+            let sk = s.signing_key.clone();
+            let tx = s.conn.transaction().unwrap();
+            AuditChainLinker::append_audit_event_tx(&tx, "TEST", "{}", 10, sk.as_ref()).unwrap();
+            tx.commit().unwrap();
+        }
+        s.record_key_rotation(b.clone(), "r", 20).unwrap();
+        {
+            let sk = s.signing_key.clone();
+            let tx = s.conn.transaction().unwrap();
+            AuditChainLinker::append_audit_event_tx(&tx, "TEST", "{}", 30, sk.as_ref()).unwrap();
+            tx.commit().unwrap();
+        }
+        let r = s.verify_audit_chain_full(Some(&a.verifying_key())).unwrap();
+        assert!(r.chain_intact, "hash chain intact across rotation");
+        assert!(r.signature_valid, "all rows (A-signed AND B-signed) verify under the durable seed");
+    }
+
+    // --- Test 7: WCET — verdict path is independent of the key ledger --------
+    #[test]
+    fn wcet_verdict_path_does_not_touch_key_ledger() {
+        // The per-command verdict (validate_vehicle_command) is a pure function
+        // of (command, contract) — it takes no store, no connection, no key.
+        // #165 work is entirely boot-time (admit_signing_key) + rotation-time
+        // (record_key_rotation), off the hot path. This compiles & runs with no
+        // VerifierStore in scope, demonstrating the independence.
+        use crate::gateway::kinematics_contract::{
+            validate_vehicle_command, EnforceAction, ProposedVehicleCommand,
+            VehicleKinematicsContract,
+        };
+        let contract = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = ProposedVehicleCommand {
+            linear_velocity_mps: 10.0,
+            current_velocity_mps: 10.0,   // zero implied accel
+            delta_time_s: 0.05,
+            steering_angle_deg: 1.0,
+            current_steering_angle_deg: 1.0, // zero steering rate
+        };
+        assert_eq!(validate_vehicle_command(&cmd, &contract), EnforceAction::Allow);
     }
 }
