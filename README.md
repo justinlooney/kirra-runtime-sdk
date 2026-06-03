@@ -219,7 +219,7 @@ Modern robotic and autonomous deployments increasingly rely on AI models to gene
 - **Ed25519 federation** — cross-controller trust reports with replay prevention and nonce burning
 - **Federation reconciliation** — generation-ordered conflict resolution for multi-controller deployments
 - **HA standby/promotion** — heartbeat-based automatic promotion from passive standby to active
-- **WAL-mode SQLite** — durable persistence with fail-closed write ordering (disk before memory)
+- **WAL-mode SQLite** — fail-closed write **ordering** (disk before memory, INV-12); power-loss **durability** is precise: `synchronous=FULL` for the HA epoch fence and federation nonce burn (survive a hard cut), audit ledger durable to the last checkpoint (see `docs/safety/CODING_GUIDELINES.md` INV-12)
 - **SHA-256 hash-chained audit ledger** — tamper-evident record of all state transitions
 
 ### Test / Tooling
