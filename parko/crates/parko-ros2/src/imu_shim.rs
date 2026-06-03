@@ -21,28 +21,14 @@
 // transform's EXISTING non-finite check rejects — so a second gate here would be
 // redundant. Keeping the shim thin is deliberate.
 //
-// MIRROR / MERGE NOTE: `ImuSample` + `Quaternion` live on the (unmerged)
-// feat/parko-imu-mapping branch, so they are MIRRORED here (byte-identical) so
-// this shim compiles standalone off `main`. When the IMU mapping lands, delete
-// these mirrors and `use crate::sensor_mapping::{ImuSample, Quaternion};`.
-
-/// MIRROR of feat/parko-imu-mapping's `Quaternion` (ROS order x,y,z,w, f32).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Quaternion {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-    pub w: f32,
-}
-
-/// MIRROR of feat/parko-imu-mapping's `ImuSample` (the transform input).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ImuSample {
-    pub linear_acceleration: [f32; 3],
-    pub angular_velocity: [f32; 3],
-    /// `None` when the sensor reports orientation unavailable — never fabricated.
-    pub orientation: Option<Quaternion>,
-}
+// PIPELINE CONNECTION: `ImuSample` + `Quaternion` are the IMU mapping's transform
+// input, in main (IMU mapping landed in sensor_mapping.rs). This shim emits those
+// exact types — the prior byte-identical mirrors have been collapsed away — so the
+// shim's `imu_to_sample(...) -> ImuSample` feeds the mapping's `to_tensor(&ImuSample)`
+// with no conversion: the IMU path (Imu msg -> extract -> ImuSample -> mapping ->
+// tensor) type-checks end to end. (`ImuRawFields` below is NOT a mirror — it is the
+// f64 r2r extraction input — and is deliberately left in place.)
+use crate::sensor_mapping::{ImuSample, Quaternion};
 
 /// Plain mirror of the `sensor_msgs/Imu` fields the shim reads — r2r-free.
 #[derive(Debug, Clone, Copy, PartialEq)]
