@@ -341,3 +341,17 @@ jobs:
           path: |
             clippy-report.txt
             audit-report.txt
+
+  parko-install-framework:
+    name: Parko Multi-Backend Install Framework (shell, no hardware)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Framework self-test
+        # Pure shell — no hardware, root, or network. Asserts the target-
+        # parameterized installer's behavior: dispatch correctness, honest
+        # vendor-SDK stub slots, fail-closed refusals (no silent backend
+        # substitution), and non-skippable safety gates. On-silicon validation
+        # per target is hardware-gated and NOT run here.
+        run: bash scripts/test-install-parko-backend.sh

@@ -340,6 +340,97 @@ with the output of `uname -m`.
 
 ---
 
+## Multi-Backend / Multi-Chipset Install
+
+`install.sh` installs the **gateway** (`kirra_verifier_service`) — it is
+target-agnostic and unchanged. A separate **target-aware layer** installs and
+validates the Parko **inference backend** for a chosen silicon target:
+
+```bash
+sudo bash scripts/install-parko-backend.sh --target <TARGET>
+# explore without installing anything (no hardware/root needed):
+bash scripts/install-parko-backend.sh --list
+bash scripts/install-parko-backend.sh --target ort-cpu --dry-run
+```
+
+**One framework, per-target dispatch keyed on `BackendDescriptor`.** Every target
+runs the same flow: select → acquire runtime → build Parko (right feature/crate)
+→ apply posture config → **fail-closed validate the backend loads** → run the
+common safety gates.
+
+### The matrix (target names == scheduler descriptor strings)
+
+| Target | Kind | Descriptor | Crate | Runtime |
+|--------|------|------------|-------|---------|
+| `ort-cpu` | **REAL** | `Cpu` | `parko-onnx` | ONNX Runtime CPU build (freely pullable) |
+| `openvino` | **REAL** | `IntelOpenVino` | `parko-openvino` | OpenVINO runtime (pip/apt; freely pullable) |
+| `tensorrt` | **SCAFFOLD** | `TensorRT` | `parko-tensorrt` | NVIDIA TensorRT-enabled ORT (JetPack/L4T) — real inference **Jetson-gated** |
+| `qnn` | **STUB** | `QualcommQnn` | _(PARK-027)_ | **requires Qualcomm QNN SDK** (vendor-gated) |
+| `ti-tidl` | **STUB** | `TiTidl` | _(PARK-028)_ | **requires TI TIDL / Processor SDK** (vendor-gated) |
+| `amd-vitis` | **STUB** | `AmdVitis` | _(PARK-030)_ | **requires AMD Vitis AI** (vendor-gated) |
+
+The stub rows are **framework slots**, not fake installs: selecting one refuses
+with "requires _vendor_ SDK". Adding a real backend later = fill the slot
+(framework-wired, plug-in).
+
+### Design decisions (recommendations)
+
+- **Selection — explicit, not auto.** Pass `--target` explicitly (recommended).
+  `--auto-detect` only *suggests* and requires `--confirm` (or an interactive
+  yes) — it never auto-proceeds. Auto-detect alone can mask a misconfig or pick
+  the wrong silicon, which is unsafe for a safety runtime.
+- **Fail-closed per backend.** If the selected backend's runtime/EP does not
+  load, the install **refuses** — it never silently substitutes another backend
+  (e.g. no quiet CPU fallback on a GPU target). This generalizes
+  `parko-tensorrt`'s `.error_on_failure()` to every target: each backend must
+  prove its runtime loads or the install fails loud.
+- **Runtime acquisition.** CPU/ONNX and Intel/OpenVINO runtimes are freely
+  pullable and wired. The **stub targets' runtimes are vendor-gated**
+  (registration/licenses — Qualcomm QNN, TI TIDL, AMD Vitis); the slots say so
+  truthfully and never attempt a broken auto-fetch.
+- **Container vs host.** A target-parameterized installer that drives both, with
+  per-target **base images** (CPU / Intel / L4T-Jetson / vendor) for the
+  reproducible/pilot path. The gateway `Dockerfile`/`docker-compose.yml` are
+  **not forked** — the backend layer is the new target-aware addition.
+- **Gateway vs runtime.** The gateway stays `install.sh`/Docker; the Parko
+  backend is the **new target-aware layer** beside it. `install.sh --help` points
+  to `scripts/install-parko-backend.sh`.
+
+### Common safety gates (chipset-independent, NON-skippable)
+
+Run for **every** target as automated refuse-to-proceed steps (there is no
+`--skip-safety-gates`): fail-closed backend-load validation, the **chokepoint
+check** (exactly one publisher on the motor command topic), envelope/posture
+config presence, **e-stop** verification, and a **wheels-up-first smoke** (an
+over-limit command is clamped/denied with the vehicle on stands).
+
+### Posture config per target
+
+| Target | Posture |
+|--------|---------|
+| `ort-cpu` | single-thread + `GraphOptimizationLevel::Disable` (bitwise-reproducible) |
+| `openvino` | `ACCURACY` + `INFERENCE_PRECISION_HINT=f32` + `LATENCY` (mirrors ORT-CPU) |
+| `tensorrt` | `fp16=false`, `int8=false`, engine-cache on; **TF32 unenforced** (Jetson-gated); not bitwise-reproducible → decision-agreement posture |
+| `qnn` / `ti-tidl` / `amd-vitis` | defined when the real backend lands |
+
+### What is testable now vs hardware-gated
+
+- **Testable now (no special hardware):** the framework itself —
+  `scripts/test-install-parko-backend.sh` (pure shell, runs in CI) asserts
+  dispatch correctness, stub honesty, fail-closed refusals, and non-skippable
+  gates. Plus the **CPU** and **Intel** real targets (CPU anywhere; Intel on the
+  dev box).
+- **Hardware-gated:** on-silicon validation per target — **Jetson/TensorRT** now
+  (install logic + fail-closed path present; on-device run gated, see the
+  `parko-tensorrt` PARK-021 list), and **Qualcomm/TI/AMD** when the backend is
+  real *and* the vendor SDK is in hand.
+
+> Note: the `tensorrt` target references the `parko-tensorrt` crate, which lands
+> via its own branch (PARK-021 scaffold). The installer dispatch is by target
+> name and is independent of that crate being merged.
+
+---
+
 ## Getting Help
 
 - **Documentation**: https://github.com/justinlooney/kirra-runtime-sdk
