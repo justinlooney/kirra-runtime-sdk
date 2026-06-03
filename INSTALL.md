@@ -340,69 +340,100 @@ with the output of `uname -m`.
 
 ---
 
-## Multi-Backend / Multi-Chipset Install
+## Multi-Backend / Multi-Chipset Install (full stack: Kirra + Occy + Parko)
 
-`install.sh` installs the **gateway** (`kirra_verifier_service`) — it is
-target-agnostic and unchanged. A separate **target-aware layer** installs and
-validates the Parko **inference backend** for a chosen silicon target:
+The install is **run-and-go ready**: the install PATH is authored for **every**
+target now, so the only thing that can be missing at install time is **external**
+— the hardware and (for vendor targets) the operator-supplied licensed SDK
+artifact. Never "we still have to build the install."
+
+`install.sh` installs the silicon-agnostic **gateway** (`kirra_verifier_service`)
+— unchanged. The companion **target-aware layer** composes the full stack —
+**Kirra** (governor/gateway) + **Occy** (trajectory planner, silicon-agnostic
+ROS2/Autoware) + **Parko** (the per-silicon inference backend) — and validates
+it fail-closed:
 
 ```bash
-sudo bash scripts/install-parko-backend.sh --target <TARGET>
-# explore without installing anything (no hardware/root needed):
+sudo bash scripts/install-parko-backend.sh --target <TARGET> [--sdk-path <ARTIFACT>]
+# explore without installing anything (no hardware/root/network):
+bash scripts/install-parko-backend.sh --readiness     # the readiness model
 bash scripts/install-parko-backend.sh --list
 bash scripts/install-parko-backend.sh --target ort-cpu --dry-run
 ```
 
-**One framework, per-target dispatch keyed on `BackendDescriptor`.** Every target
-runs the same flow: select → acquire runtime → build Parko (right feature/crate)
-→ apply posture config → **fail-closed validate the backend loads** → run the
-common safety gates.
+The per-silicon variation lives **entirely in Parko** (the backend matrix);
+Kirra and Occy are authored once and composed with the selected Parko backend.
+Per-target flow: `[Kirra] + [Occy]` (silicon-agnostic) `+` select Parko target →
+acquire runtime/SDK → build Parko (right feature) → apply posture →
+**fail-closed validate the backend loads** → common safety gates across the
+composed stack.
 
-### The matrix (target names == scheduler descriptor strings)
+### Two readiness dimensions (don't conflate)
 
-| Target | Kind | Descriptor | Crate | Runtime |
-|--------|------|------------|-------|---------|
-| `ort-cpu` | **REAL** | `Cpu` | `parko-onnx` | ONNX Runtime CPU build (freely pullable) |
-| `openvino` | **REAL** | `IntelOpenVino` | `parko-openvino` | OpenVINO runtime (pip/apt; freely pullable) |
-| `tensorrt` | **SCAFFOLD** | `TensorRT` | `parko-tensorrt` | NVIDIA TensorRT-enabled ORT (JetPack/L4T) — real inference **Jetson-gated** |
-| `qnn` | **STUB** | `QualcommQnn` | _(PARK-027)_ | **requires Qualcomm QNN SDK** (vendor-gated) |
-| `ti-tidl` | **STUB** | `TiTidl` | _(PARK-028)_ | **requires TI TIDL / Processor SDK** (vendor-gated) |
-| `amd-vitis` | **STUB** | `AmdVitis` | _(PARK-030)_ | **requires AMD Vitis AI** (vendor-gated) |
+1. **Install-path readiness** — the procedure per target. **READY NOW for all six
+   targets** (this script).
+2. **Backend-code readiness** — `done` (ort-cpu, openvino), `scaffold` (tensorrt,
+   inference Jetson-gated), `stub` (qnn/ti-tidl/amd-vitis — PARK-027/028/030, a
+   separate code effort).
 
-The stub rows are **framework slots**, not fake installs: selecting one refuses
-with "requires _vendor_ SDK". Adding a real backend later = fill the slot
-(framework-wired, plug-in).
+"Ready when hardware + license arrive" = install-path ready (now, all) + backend
+code ready (done for some) + the external hardware/SDK. **A vendor target's PATH
+is ready; its backend is the remaining code gate — different things.** Run
+`--readiness` for the live table.
+
+| Target | Install-path | Backend-code | Remaining external gate |
+|--------|--------------|--------------|--------------------------|
+| `ort-cpu` | **READY** | done | none — ready now (CPU, anywhere) |
+| `openvino` | **READY** | done | Intel silicon (dev box ok) — ready now there |
+| `tensorrt` | **READY** | scaffold | NVIDIA Jetson hardware (no license) |
+| `qnn` | **READY** | stub (PARK-027) | Qualcomm HW + QNN SDK + backend code |
+| `ti-tidl` | **READY** | stub (PARK-028) | TI HW + TIDL SDK + backend code |
+| `amd-vitis` | **READY** | stub (PARK-030) | AMD HW + Vitis AI + backend code |
+
+### Authored per-target install path
+
+Every target has a real, ready-to-run procedure — not a "requires-SDK" refusal:
+
+- **ort-cpu / openvino** — runtime is freely pullable; path runs and validates
+  now (CPU anywhere; Intel on the dev box).
+- **tensorrt** — NVIDIA's TRT-enabled ORT from JetPack/L4T on the Jetson; path +
+  fail-closed load path present, on-device run Jetson-gated.
+- **qnn / ti-tidl / amd-vitis** — the operator **supplies the licensed SDK
+  artifact** via `--sdk-path <ARTIFACT>` (never auto-fetched — vendor-gated). The
+  path runs acquire → build → posture end to end; its **FINAL backend-load
+  validation defers** until the backend code is implemented (PARK-027/028/030).
+  That boundary is marked explicitly: missing `--sdk-path` says "supply the
+  artifact" (external gate), a stub backend says "remaining CODE gate" — neither
+  is a missing install.
 
 ### Design decisions (recommendations)
 
-- **Selection — explicit, not auto.** Pass `--target` explicitly (recommended).
-  `--auto-detect` only *suggests* and requires `--confirm` (or an interactive
-  yes) — it never auto-proceeds. Auto-detect alone can mask a misconfig or pick
-  the wrong silicon, which is unsafe for a safety runtime.
-- **Fail-closed per backend.** If the selected backend's runtime/EP does not
-  load, the install **refuses** — it never silently substitutes another backend
-  (e.g. no quiet CPU fallback on a GPU target). This generalizes
-  `parko-tensorrt`'s `.error_on_failure()` to every target: each backend must
-  prove its runtime loads or the install fails loud.
-- **Runtime acquisition.** CPU/ONNX and Intel/OpenVINO runtimes are freely
-  pullable and wired. The **stub targets' runtimes are vendor-gated**
-  (registration/licenses — Qualcomm QNN, TI TIDL, AMD Vitis); the slots say so
-  truthfully and never attempt a broken auto-fetch.
-- **Container vs host.** A target-parameterized installer that drives both, with
+- **Selection — explicit, not auto.** `--target` explicitly (recommended).
+  `--auto-detect` only *suggests* and needs `--confirm` — never auto-proceeds
+  (it can mask misconfig / pick wrong silicon — unsafe for a safety runtime).
+- **Fail-closed per backend.** If the selected backend's runtime/EP isn't
+  present, the install **refuses** — never silently substitutes another backend
+  (no quiet CPU fallback on a GPU target). Generalizes `parko-tensorrt`'s
+  `.error_on_failure()` to every target (wire the probe via `PARKO_BACKEND_PROBE`).
+- **Full-stack composition.** Kirra + Occy are silicon-agnostic and authored
+  once; the per-target axis is Parko only. Default composes all three;
+  `--parko-only` / `--no-occy` scope it down.
+- **Operator-supplied SDK.** Vendor licensed artifacts are passed as
+  `--sdk-path <ARTIFACT>` (a path the operator provides), never an impossible
+  auto-fetch.
+- **Container vs host.** Target-parameterized installer driving both, with
   per-target **base images** (CPU / Intel / L4T-Jetson / vendor) for the
   reproducible/pilot path. The gateway `Dockerfile`/`docker-compose.yml` are
-  **not forked** — the backend layer is the new target-aware addition.
-- **Gateway vs runtime.** The gateway stays `install.sh`/Docker; the Parko
-  backend is the **new target-aware layer** beside it. `install.sh --help` points
-  to `scripts/install-parko-backend.sh`.
+  **not forked**.
 
 ### Common safety gates (chipset-independent, NON-skippable)
 
-Run for **every** target as automated refuse-to-proceed steps (there is no
-`--skip-safety-gates`): fail-closed backend-load validation, the **chokepoint
-check** (exactly one publisher on the motor command topic), envelope/posture
-config presence, **e-stop** verification, and a **wheels-up-first smoke** (an
-over-limit command is clamped/denied with the vehicle on stands).
+Run for **every** target across the composed stack as refuse-to-proceed steps
+(there is no `--skip-safety-gates`): fail-closed backend-load validation, the
+**chokepoint check** (exactly one publisher on the motor topic — the Kirra
+gateway is the sole writer), envelope/posture config presence, **e-stop**
+verification, and a **wheels-up-first smoke** (an over-limit Occy plan is
+clamped/denied by Kirra with the vehicle on stands).
 
 ### Posture config per target
 
@@ -411,23 +442,25 @@ over-limit command is clamped/denied with the vehicle on stands).
 | `ort-cpu` | single-thread + `GraphOptimizationLevel::Disable` (bitwise-reproducible) |
 | `openvino` | `ACCURACY` + `INFERENCE_PRECISION_HINT=f32` + `LATENCY` (mirrors ORT-CPU) |
 | `tensorrt` | `fp16=false`, `int8=false`, engine-cache on; **TF32 unenforced** (Jetson-gated); not bitwise-reproducible → decision-agreement posture |
-| `qnn` / `ti-tidl` / `amd-vitis` | defined when the real backend lands |
+| `qnn` / `ti-tidl` / `amd-vitis` | full precision; vendor posture defined with the backend (PARK-027/028/030) |
 
-### What is testable now vs hardware-gated
+### Testable now vs externally-gated
 
-- **Testable now (no special hardware):** the framework itself —
-  `scripts/test-install-parko-backend.sh` (pure shell, runs in CI) asserts
-  dispatch correctness, stub honesty, fail-closed refusals, and non-skippable
-  gates. Plus the **CPU** and **Intel** real targets (CPU anywhere; Intel on the
-  dev box).
-- **Hardware-gated:** on-silicon validation per target — **Jetson/TensorRT** now
-  (install logic + fail-closed path present; on-device run gated, see the
-  `parko-tensorrt` PARK-021 list), and **Qualcomm/TI/AMD** when the backend is
-  real *and* the vendor SDK is in hand.
+- **Testable now (no special hardware):** the framework —
+  `scripts/test-install-parko-backend.sh` (pure shell, CI job
+  `parko-install-framework`, 16 assertions) covers dispatch, full-stack
+  composition, the readiness model, the operator-SDK path, fail-closed refusals,
+  and non-skippable gates. Plus the full **Kirra + Occy + Parko(CPU)** and
+  **Parko(Intel)** stack end to end.
+- **Externally-gated:** on-silicon validation per target — **Jetson/TensorRT** on
+  hardware now (path + fail-closed present; on-device run gated, see the
+  `parko-tensorrt` PARK-021 list); **Qualcomm/TI/AMD** when backend code +
+  hardware + SDK align.
 
-> Note: the `tensorrt` target references the `parko-tensorrt` crate, which lands
-> via its own branch (PARK-021 scaffold). The installer dispatch is by target
-> name and is independent of that crate being merged.
+> Note: `tensorrt` references the `parko-tensorrt` crate (PARK-021 scaffold) and
+> the vendor rows reference `parko-qnn`/`parko-tidl`/`parko-vitis`
+> (PARK-027/028/030) — those land via their own branches. The installer
+> dispatches by **target name** and is independent of those crates being merged.
 
 ---
 

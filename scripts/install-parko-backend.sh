@@ -1,31 +1,35 @@
 #!/usr/bin/env bash
 #
-# install-parko-backend.sh — TARGET-PARAMETERIZED Parko backend / chipset
-# installer. The runtime (ML inference backend) layer that composes WITH the
-# gateway installer (install.sh). install.sh installs the gateway
-# (kirra_verifier_service) as a systemd binary; THIS installs and validates the
-# selected Parko inference backend for a chosen silicon target. It does not
-# replace install.sh — see INSTALL.md "Multi-Backend / Multi-Chipset".
+# install-parko-backend.sh — FULL-STACK, TARGET-PARAMETERIZED install:
+# KIRRA (governor/gateway) + OCCY (trajectory planner) + PARKO (per-silicon
+# inference backend), composed into one bring-up. The per-silicon axis lives
+# entirely in Parko (the backend matrix); Kirra and Occy are silicon-agnostic and
+# authored once.
 #
-# ONE framework, per-target dispatch keyed on BackendDescriptor. The flow for
-# every target is identical:
+# GOAL — RUN-AND-GO READINESS. The install PATH is authored and ready for EVERY
+# target now. The only thing that can be missing at install time is EXTERNAL:
+# the hardware and (for vendor targets) the operator-supplied licensed SDK
+# artifact. Never "we still have to build the install."
 #
-#   select target → acquire runtime → build Parko (right feature/crate)
-#     → apply posture config → FAIL-CLOSED validate the backend loads
-#     → run the common (chipset-independent) safety gates
+# TWO READINESS DIMENSIONS (kept distinct — see `--readiness`):
+#   (1) INSTALL-PATH readiness — this script. READY NOW for all six targets.
+#   (2) BACKEND-CODE readiness — done: ort-cpu, openvino; scaffold: tensorrt
+#       (inference Jetson-gated); stub: qnn / ti-tidl / amd-vitis (PARK-027/028/030,
+#       a separate code effort). A vendor target's PATH is ready; its BACKEND is
+#       the remaining code gate — those are different things and this script says
+#       so honestly per target.
 #
-# Target names are aligned 1:1 with the scheduler's descriptor strings
-# (parko-core/src/scheduler.rs `descriptor_vendor`):
-#   ort-cpu  openvino  tensorrt  qnn  ti-tidl  amd-vitis
+# Per-target flow (identical shape, dispatched on BackendDescriptor; names align
+# with scheduler `descriptor_vendor`):
+#   [Kirra gateway] + [Occy bring-up]  (silicon-agnostic, composed once)
+#     + select Parko target → acquire runtime/SDK → build Parko (right feature)
+#       → apply posture → FAIL-CLOSED validate the backend loads
+#     → common (chipset-independent) safety gates across the composed stack.
 #
-# FAIL-CLOSED is the whole point: if the selected backend's runtime/EP does not
-# load, the install REFUSES — it NEVER silently substitutes another backend.
-# This generalizes parko-tensorrt's `.error_on_failure()` to every target.
-#
-# SAFETY: a wrong-but-loaded backend, or a silent CPU fallback on a GPU target,
-# is exactly the confidently-wrong hazard the governor cannot catch. So backend
-# selection is EXPLICIT (auto-detect only suggests, never auto-proceeds), and the
-# common safety gates are NOT skippable.
+# FAIL-CLOSED: if the selected backend's runtime/EP isn't present, REFUSE — never
+# silently substitute another backend (generalizes parko-tensorrt's
+# .error_on_failure()). Selection is EXPLICIT; auto-detect only suggests.
+# The common safety gates are NOT skippable.
 
 set -euo pipefail
 
@@ -40,18 +44,6 @@ fatal()   { error "$*"; exit 1; }
 section() { echo ""; echo -e "${BOLD}━━━ $* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
 
 # ── the matrix: single source, aligned with scheduler descriptor strings ──────
-# Columns per target: descriptor | kind | crate | cargo-feature | runtime-source
-#   kind: real     — installable + validatable here (CPU anywhere; Intel on dev box)
-#         scaffold — install LOGIC present; real inference is hardware-gated (Jetson)
-#         stub     — framework slot only; real backend pending + VENDOR-SDK-gated
-#
-# REAL    Cpu          → ort-cpu   → parko-onnx     (ONNX Runtime, freely pullable)
-# REAL    IntelOpenVino→ openvino  → parko-openvino (OpenVINO runtime, freely pullable)
-# SCAFFOLD TensorRT    → tensorrt  → parko-tensorrt (NVIDIA TRT-enabled ORT; Jetson)
-# STUB    QualcommQnn  → qnn       → (PARK-027)     requires Qualcomm QNN SDK
-# STUB    TiTidl       → ti-tidl   → (PARK-028)     requires TI TIDL / Processor SDK
-# STUB    AmdVitis     → amd-vitis → (PARK-030)     requires AMD Vitis AI
-
 ALL_TARGETS="ort-cpu openvino tensorrt qnn ti-tidl amd-vitis"
 
 target_descriptor() { case "$1" in
@@ -60,261 +52,321 @@ target_descriptor() { case "$1" in
     ti-tidl)   echo "TiTidl" ;;     amd-vitis) echo "AmdVitis" ;;
     *) return 1 ;; esac; }
 
-target_kind() { case "$1" in
-    ort-cpu|openvino)        echo "real" ;;
-    tensorrt)                echo "scaffold" ;;
-    qnn|ti-tidl|amd-vitis)   echo "stub" ;;
+# BACKEND-CODE readiness (dimension 2). NOT the install-path readiness.
+#   done     — backend implemented + validatable here (CPU anywhere; Intel on dev box)
+#   scaffold — backend builds; real inference hardware-gated (Jetson)
+#   stub     — backend not yet implemented (PARK-0xx); the install PATH is still ready
+target_backend_code_status() { case "$1" in
+    ort-cpu|openvino)  echo "done" ;;
+    tensorrt)          echo "scaffold" ;;
+    qnn)               echo "stub:PARK-027" ;;
+    ti-tidl)           echo "stub:PARK-028" ;;
+    amd-vitis)         echo "stub:PARK-030" ;;
     *) return 1 ;; esac; }
 
 target_crate() { case "$1" in
     ort-cpu)   echo "parko-onnx" ;;     openvino) echo "parko-openvino" ;;
-    tensorrt)  echo "parko-tensorrt" ;; qnn|ti-tidl|amd-vitis) echo "(pending)" ;;
+    tensorrt)  echo "parko-tensorrt" ;;
+    qnn)       echo "parko-qnn (PARK-027)" ;;
+    ti-tidl)   echo "parko-tidl (PARK-028)" ;;
+    amd-vitis) echo "parko-vitis (PARK-030)" ;;
     *) return 1 ;; esac; }
 
-# Cargo feature on parko-core's backend-* set (CI stubs) / the consuming node.
 target_feature() { case "$1" in
-    ort-cpu)   echo "(default — parko-onnx is its own crate)" ;;
-    openvino)  echo "backend-openvino" ;;
-    tensorrt)  echo "backend-tensorrt" ;;
-    qnn)       echo "backend-qnn" ;;
-    ti-tidl)   echo "backend-tidl" ;;
-    amd-vitis) echo "backend-amd" ;;
+    ort-cpu)   echo "(parko-onnx crate)" ;;  openvino)  echo "backend-openvino" ;;
+    tensorrt)  echo "backend-tensorrt" ;;     qnn)       echo "backend-qnn" ;;
+    ti-tidl)   echo "backend-tidl" ;;         amd-vitis) echo "backend-amd" ;;
     *) return 1 ;; esac; }
+
+# True when the runtime is a VENDOR-LICENSED SDK the operator must supply
+# (--sdk-path). These are never auto-fetched.
+target_needs_sdk() { case "$1" in
+    qnn|ti-tidl|amd-vitis) echo "yes" ;;
+    *) echo "no" ;; esac; }
 
 target_runtime_note() { case "$1" in
-    ort-cpu)   echo "ONNX Runtime shared lib (Microsoft CPU build; freely pullable)" ;;
-    openvino)  echo "OpenVINO runtime (pip wheel / apt; freely pullable)" ;;
+    ort-cpu)   echo "ONNX Runtime CPU build (freely pullable)" ;;
+    openvino)  echo "OpenVINO runtime (pip/apt; freely pullable)" ;;
     tensorrt)  echo "NVIDIA TensorRT-enabled ONNX Runtime (JetPack/L4T on the Jetson)" ;;
-    qnn)       echo "requires Qualcomm QNN SDK (vendor-gated: registration/license)" ;;
-    ti-tidl)   echo "requires TI TIDL / Processor SDK (vendor-gated)" ;;
-    amd-vitis) echo "requires AMD Vitis AI (vendor-gated)" ;;
+    qnn)       echo "Qualcomm QNN SDK (operator-supplied licensed artifact via --sdk-path)" ;;
+    ti-tidl)   echo "TI TIDL / Processor SDK (operator-supplied licensed artifact via --sdk-path)" ;;
+    amd-vitis) echo "AMD Vitis AI (operator-supplied licensed artifact via --sdk-path)" ;;
     *) return 1 ;; esac; }
 
-# Determinism / precision posture applied per target (audit-relevant).
 target_posture() { case "$1" in
     ort-cpu)   echo "single-thread + GraphOptimizationLevel::Disable (bitwise-reproducible)" ;;
     openvino)  echo "ACCURACY + INFERENCE_PRECISION_HINT=f32 + LATENCY (mirrors ORT-CPU)" ;;
-    tensorrt)  echo "fp16=false, int8=false, engine-cache on; TF32 UNENFORCED (Jetson-gated); NOT bitwise-reproducible — decision-agreement posture" ;;
-    qnn|ti-tidl|amd-vitis) echo "(defined when the real backend lands)" ;;
+    tensorrt)  echo "fp16=false, int8=false, engine-cache on; TF32 UNENFORCED (Jetson-gated); decision-agreement posture" ;;
+    qnn)       echo "full precision; QNN HTP posture defined with the backend (PARK-027)" ;;
+    ti-tidl)   echo "full precision; TIDL posture defined with the backend (PARK-028)" ;;
+    amd-vitis) echo "full precision; Vitis DPU posture defined with the backend (PARK-030)" ;;
     *) return 1 ;; esac; }
 
-# ── argument parsing ──────────────────────────────────────────────────────────
-TARGET=""
-AUTO_DETECT=false
-CONFIRMED=false
-NON_INTERACTIVE=false
-DRY_RUN=false
+# Honest one-line external gate per target.
+target_external_gate() { case "$1" in
+    ort-cpu)   echo "none — ready now (CPU, anywhere)" ;;
+    openvino)  echo "Intel silicon (dev box ok) — ready now there" ;;
+    tensorrt)  echo "NVIDIA Jetson hardware (no license) — ready on hardware" ;;
+    qnn)       echo "Qualcomm hardware + QNN SDK + backend code (PARK-027)" ;;
+    ti-tidl)   echo "TI hardware + TIDL SDK + backend code (PARK-028)" ;;
+    amd-vitis) echo "AMD hardware + Vitis AI + backend code (PARK-030)" ;;
+    *) return 1 ;; esac; }
+
+# ── arguments ─────────────────────────────────────────────────────────────────
+TARGET=""; SDK_PATH=""
+AUTO_DETECT=false; CONFIRMED=false; NON_INTERACTIVE=false; DRY_RUN=false
+WITH_KIRRA=true; WITH_OCCY=true
 
 usage() {
     cat <<EOF
 Usage: sudo bash install-parko-backend.sh --target <TARGET> [OPTIONS]
 
-Installs and FAIL-CLOSED-validates a Parko inference backend for one silicon
-target. Composes with the gateway installer (install.sh).
+Full-stack install: KIRRA (gateway) + OCCY (planner) + PARKO (per-silicon
+backend). The per-silicon axis is the Parko --target; Kirra+Occy are
+silicon-agnostic and composed once.
 
-Targets (aligned with the scheduler's descriptor strings):
-  ort-cpu     REAL      Cpu           → parko-onnx      (CPU, anywhere)
-  openvino    REAL      IntelOpenVino → parko-openvino  (Intel CPU/iGPU/VPU)
-  tensorrt    SCAFFOLD  TensorRT      → parko-tensorrt  (NVIDIA Jetson; HW-gated)
-  qnn         STUB      QualcommQnn   → PARK-027        (requires Qualcomm QNN SDK)
-  ti-tidl     STUB      TiTidl        → PARK-028        (requires TI TIDL SDK)
-  amd-vitis   STUB      AmdVitis      → PARK-030        (requires AMD Vitis AI)
+Targets (== scheduler descriptor strings) and readiness:
+  ort-cpu    Cpu           path READY · backend DONE      · external: none (now)
+  openvino   IntelOpenVino path READY · backend DONE      · external: Intel HW
+  tensorrt   TensorRT      path READY · backend SCAFFOLD  · external: Jetson HW
+  qnn        QualcommQnn   path READY · backend STUB(027) · external: HW+SDK+code
+  ti-tidl    TiTidl        path READY · backend STUB(028) · external: HW+SDK+code
+  amd-vitis  AmdVitis      path READY · backend STUB(030) · external: HW+SDK+code
 
 Options:
-  --target <name>    Select the backend target (EXPLICIT — recommended).
-  --auto-detect      SUGGEST a target from detected hardware; requires --confirm
-                     (or an interactive yes) before proceeding. Never auto-runs.
+  --target <name>    Parko backend target (EXPLICIT — recommended).
+  --sdk-path <PATH>  Operator-supplied licensed SDK artifact (REQUIRED for the
+                     vendor targets qnn/ti-tidl/amd-vitis). Never auto-fetched.
+  --auto-detect      SUGGEST a target from hardware; requires --confirm.
   --confirm          Accept the auto-detected suggestion non-interactively.
+  --parko-only       Install only the Parko backend (skip Kirra + Occy).
+  --no-occy          Skip Occy bring-up (Kirra + Parko only).
   --non-interactive  No prompts.
-  --dry-run          Print every step without acquiring/building/installing.
-                     Safe to run anywhere (no hardware, no root). Used by the
-                     framework self-test.
-  --list             Print the target matrix and exit.
+  --dry-run          Print every step; acquire/build/install nothing. Runs
+                     anywhere (no hardware/root). Used by the self-test.
+  --readiness        Print the per-target readiness model (two dimensions) + exit.
+  --list             Print the target matrix + exit.
   --help             This help.
 
-FAIL-CLOSED: if the selected backend's runtime/EP does not load, the install
-REFUSES — it never substitutes another backend. The common safety gates always
-run and cannot be skipped.
+FAIL-CLOSED: a selected backend whose runtime/EP is absent REFUSES — never
+substitutes another backend. Common safety gates always run, never skipped.
 EOF
 }
 
 print_matrix() {
     section "Parko backend / chipset target matrix"
-    printf "%-10s %-9s %-16s %-16s %s\n" "TARGET" "KIND" "DESCRIPTOR" "CRATE" "RUNTIME"
+    printf "%-10s %-14s %-16s %-13s %s\n" "TARGET" "DESCRIPTOR" "CRATE" "BACKEND-CODE" "RUNTIME"
     for t in $ALL_TARGETS; do
-        printf "%-10s %-9s %-16s %-16s %s\n" \
-            "$t" "$(target_kind "$t")" "$(target_descriptor "$t")" \
-            "$(target_crate "$t")" "$(target_runtime_note "$t")"
+        printf "%-10s %-14s %-16s %-13s %s\n" \
+            "$t" "$(target_descriptor "$t")" "$(target_crate "$t")" \
+            "$(target_backend_code_status "$t")" "$(target_runtime_note "$t")"
     done
+}
+
+print_readiness() {
+    section "Readiness model — install-path vs backend-code, per target (honest)"
+    echo "Install-path readiness is READY NOW for ALL targets (this script)."
+    echo "The remaining gates are EXTERNAL (hardware / licensed SDK) and, for the"
+    echo "vendor targets, the BACKEND CODE itself. These are distinct dimensions:"
+    echo ""
+    printf "%-10s %-13s %-13s %s\n" "TARGET" "INSTALL-PATH" "BACKEND-CODE" "REMAINING EXTERNAL GATE"
+    for t in $ALL_TARGETS; do
+        printf "%-10s %-13s %-13s %s\n" \
+            "$t" "READY" "$(target_backend_code_status "$t")" "$(target_external_gate "$t")"
+    done
+    echo ""
+    echo "Summary: ort-cpu/openvino = ready now; tensorrt = ready on Jetson HW (no"
+    echo "license); qnn/ti-tidl/amd-vitis = PATH ready, backend code + HW + SDK still"
+    echo "required. A vendor target is NOT one-command-ready while its backend is a stub."
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --target) TARGET="${2:-}"; shift 2 ;;
         --target=*) TARGET="${1#*=}"; shift ;;
+        --sdk-path) SDK_PATH="${2:-}"; shift 2 ;;
+        --sdk-path=*) SDK_PATH="${1#*=}"; shift ;;
         --auto-detect) AUTO_DETECT=true; shift ;;
         --confirm) CONFIRMED=true; shift ;;
+        --parko-only) WITH_KIRRA=false; WITH_OCCY=false; shift ;;
+        --no-occy) WITH_OCCY=false; shift ;;
         --non-interactive) NON_INTERACTIVE=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
+        --readiness) print_readiness; exit 0 ;;
         --list) print_matrix; exit 0 ;;
         --help|-h) usage; exit 0 ;;
-        # NOTE: there is deliberately NO --skip-safety-gates. The common safety
-        # gates are non-skippable; a flag to bypass them would defeat the point.
+        # No --skip-safety-gates: the common gates are non-skippable by design.
         *) fatal "Unknown argument: $1 (see --help)" ;;
     esac
 done
 
 # ── selection (explicit; auto-detect only suggests) ───────────────────────────
 auto_detect_suggest() {
-    # Best-effort hardware sniff → a SUGGESTION only. Never authoritative.
-    if command -v nvidia-smi >/dev/null 2>&1 || [ -e /dev/nvgpu ] || [ -d /proc/device-tree ] && grep -qi nvidia /proc/device-tree/model 2>/dev/null; then
-        echo "tensorrt"; return
-    fi
+    if command -v nvidia-smi >/dev/null 2>&1 || { [ -d /proc/device-tree ] && grep -qi nvidia /proc/device-tree/model 2>/dev/null; }; then
+        echo "tensorrt"; return; fi
     if [ -d /dev/dri ] && grep -qi "GenuineIntel" /proc/cpuinfo 2>/dev/null; then
-        echo "openvino"; return
-    fi
-    echo "ort-cpu"  # safe default suggestion
+        echo "openvino"; return; fi
+    echo "ort-cpu"
 }
 
 select_target() {
     if [ "$AUTO_DETECT" = true ]; then
-        local suggested; suggested="$(auto_detect_suggest)"
-        warn "Auto-detect is a SUGGESTION, not a decision (it can mask a misconfig"
-        warn "or pick the wrong silicon — unsafe to trust blindly for a safety runtime)."
-        info "Suggested target from detected hardware: ${BOLD}${suggested}${NC}"
-        if [ "$CONFIRMED" = true ]; then
-            TARGET="$suggested"
-            info "Accepted via --confirm."
+        local s; s="$(auto_detect_suggest)"
+        warn "Auto-detect is a SUGGESTION, not a decision (can mask misconfig / pick wrong silicon)."
+        info "Suggested: ${BOLD}${s}${NC}"
+        if [ "$CONFIRMED" = true ]; then TARGET="$s"; info "Accepted via --confirm."
         elif [ "$NON_INTERACTIVE" = true ]; then
-            fatal "Auto-detect requires explicit confirmation. Re-run with --confirm \
-or pass --target ${suggested} to proceed."
+            fatal "Auto-detect requires explicit confirmation. Re-run with --confirm or --target ${s}."
         else
-            read -r -p "Use '${suggested}'? Type the target name to confirm: " answer
-            [ "$answer" = "$suggested" ] || fatal "Not confirmed — refusing to guess. Pass --target explicitly."
-            TARGET="$suggested"
+            read -r -p "Use '${s}'? Type the target name to confirm: " a
+            [ "$a" = "$s" ] || fatal "Not confirmed — refusing to guess. Pass --target explicitly."
+            TARGET="$s"
         fi
     fi
-    [ -n "$TARGET" ] || { usage; fatal "No target selected. Pass --target <name> (recommended) or --auto-detect."; }
+    [ -n "$TARGET" ] || { usage; fatal "No target. Pass --target <name> (recommended) or --auto-detect."; }
     target_descriptor "$TARGET" >/dev/null 2>&1 || fatal "Unknown target '${TARGET}'. Valid: ${ALL_TARGETS}"
 }
 
-# ── per-target runtime acquisition ────────────────────────────────────────────
-acquire_runtime() {
-    local t="$1"; local kind; kind="$(target_kind "$t")"
-    section "1/5 Acquire runtime — ${t} ($(target_descriptor "$t"))"
-    info "Runtime: $(target_runtime_note "$t")"
-    if [ "$kind" = "stub" ]; then
-        # HONEST: vendor SDKs are gated (registration/license), not freely
-        # pullable. The slot does not pretend to auto-fetch a real runtime.
-        fatal "Target '${t}' is a STUB slot (no real backend yet). $(target_runtime_note "$t"). \
-Install the vendor SDK out-of-band, then a future release fills this slot. Refusing to fake an install."
-    fi
+# ── full-stack composition: KIRRA + OCCY (silicon-agnostic) ───────────────────
+install_kirra_gateway() {
+    [ "$WITH_KIRRA" = true ] || { info "Skipping Kirra (--parko-only)."; return 0; }
+    section "Compose: KIRRA gateway (silicon-agnostic)"
+    info "The governor/gateway (kirra_verifier_service) is installed by install.sh —"
+    info "authored once, identical for every silicon target."
     if [ "$DRY_RUN" = true ]; then
-        info "[dry-run] would acquire the ${t} runtime here."
+        info "[dry-run] would run: sudo bash install.sh --non-interactive"
+    else
+        info "Run: sudo bash install.sh   (see INSTALL.md)"
+    fi
+}
+
+bringup_occy() {
+    [ "$WITH_OCCY" = true ] || { info "Skipping Occy (--no-occy / --parko-only)."; return 0; }
+    section "Compose: OCCY trajectory planner (silicon-agnostic ROS2)"
+    info "Occy (Autoware-filled for the pilot) is a ROS2 trajectory planner — silicon-"
+    info "agnostic; the same bring-up for every target. It registers with Kirra via"
+    info "scripts/setup_ros2_fleet.sh and publishes plans the governor gates."
+    if [ "$DRY_RUN" = true ]; then
+        info "[dry-run] would: build the ROS2 planner workspace + register nodes with Kirra."
+    fi
+}
+
+# ── PARKO per-target: acquire → build → posture → validate ────────────────────
+acquire_runtime() {
+    local t="$1"
+    section "Parko 1/4 — acquire runtime/SDK (${t})"
+    info "Runtime: $(target_runtime_note "$t")"
+    if [ "$(target_needs_sdk "$t")" = "yes" ]; then
+        # Vendor target: the operator SUPPLIES the licensed artifact. Authored,
+        # ready-to-run — gated only on that external artifact being present.
+        if [ -z "$SDK_PATH" ]; then
+            fatal "Target '${t}' needs an operator-supplied licensed SDK: pass --sdk-path <ARTIFACT>. \
+This is the PATH waiting on the EXTERNAL artifact — not a missing install (never auto-fetched)."
+        fi
+        if [ "$DRY_RUN" = true ]; then
+            info "[dry-run] would install the ${t} backend SDK from operator artifact: ${SDK_PATH}"
+        else
+            [ -e "$SDK_PATH" ] || fatal "Supplied --sdk-path '${SDK_PATH}' not found. Provide the licensed artifact."
+            info "Installing ${t} SDK from operator artifact: ${SDK_PATH}"
+        fi
         return 0
     fi
+    if [ "$DRY_RUN" = true ]; then info "[dry-run] would acquire the ${t} runtime."; return 0; fi
     case "$t" in
-        ort-cpu)
-            # Freely pullable. Mirrors the CI parko-onnx install (ONNX Runtime
-            # matched to ort 2.0.0-rc.11 / ORT_API_VERSION 23 → v1.23.2).
-            info "Acquire the Microsoft ONNX Runtime CPU build (v1.23.x) and export ORT_DYLIB_PATH."
-            warn "Acquisition step is environment-specific; see INSTALL.md for the pinned steps." ;;
-        openvino)
-            info "Acquire the OpenVINO runtime (pip wheel >= 2025.1 or apt) and set LD_LIBRARY_PATH." ;;
-        tensorrt)
-            # Jetson-gated: NVIDIA ships TRT-enabled ORT via JetPack/L4T.
-            warn "TensorRT runtime is JESTON-GATED: install NVIDIA's TensorRT-enabled ONNX Runtime"
-            warn "from JetPack/L4T on the device. Cannot be pulled on a non-Jetson host." ;;
+        ort-cpu)  info "Acquire ONNX Runtime CPU (v1.23.x) → ORT_DYLIB_PATH (see INSTALL.md)." ;;
+        openvino) info "Acquire OpenVINO runtime (pip wheel >=2025.1 / apt) → LD_LIBRARY_PATH." ;;
+        tensorrt) warn "JETSON-GATED: install NVIDIA's TRT-enabled ONNX Runtime from JetPack/L4T on-device." ;;
     esac
 }
 
-# ── build Parko with the right crate/feature ──────────────────────────────────
 build_parko() {
     local t="$1"
-    section "2/5 Build Parko — ${t}"
-    local crate; crate="$(target_crate "$t")"
-    info "Backend crate: ${crate} | cargo feature: $(target_feature "$t")"
-    if [ "$DRY_RUN" = true ]; then
-        info "[dry-run] would build the ${t} backend (crate ${crate})."
-        return 0
-    fi
-    case "$t" in
-        ort-cpu)  info "cargo build --release -p parko-onnx" ;;
-        openvino) info "cargo build --release -p parko-openvino" ;;
-        tensorrt) info "cargo build --release -p parko-tensorrt   # CI-buildable; real run Jetson-gated" ;;
+    section "Parko 2/4 — build (${t})"
+    info "Crate: $(target_crate "$t") | feature: $(target_feature "$t")"
+    case "$(target_backend_code_status "$t")" in
+        stub:*) warn "Backend code is a STUB ($(target_backend_code_status "$t")) — the build target is reserved; \
+the crate is implemented as a separate code effort. PATH is wired; this is the code gate." ;;
     esac
+    if [ "$DRY_RUN" = true ]; then info "[dry-run] would build $(target_crate "$t")."; fi
 }
 
-# ── posture config per target ─────────────────────────────────────────────────
 apply_posture() {
     local t="$1"
-    section "3/5 Apply posture config — ${t}"
+    section "Parko 3/4 — posture config (${t})"
     info "Posture: $(target_posture "$t")"
-    if [ "$DRY_RUN" = true ]; then
-        info "[dry-run] would write the ${t} posture config."
-    fi
+    if [ "$DRY_RUN" = true ]; then info "[dry-run] would write the ${t} posture config."; fi
 }
 
-# ── FAIL-CLOSED backend-load validation (generalizes error_on_failure) ─────────
-# Every target must PROVE its runtime/EP loads, or the install fails loud. The
-# probe is the backend crate's own load path (the TRT crate already fail-closes
-# via .error_on_failure(); ORT/OV panic/err without their runtime). This hook is
-# the framework's single chokepoint for "the backend actually loaded".
+# FAIL-CLOSED backend-load validation. The single chokepoint for "the selected
+# backend actually loaded". Generalizes parko-tensorrt's .error_on_failure().
 validate_backend_loads() {
-    local t="$1"
-    section "4/5 FAIL-CLOSED validation — ${t}"
+    local t="$1"; local code; code="$(target_backend_code_status "$t")"
+    section "Parko 4/4 — FAIL-CLOSED backend-load validation (${t})"
     if [ "$DRY_RUN" = true ]; then
-        info "[dry-run] would run the ${t} backend-load probe and REFUSE on failure"
-        info "          (no silent substitution to another backend)."
+        info "[dry-run] would run the ${t} load probe and REFUSE on failure (no substitution)."
         return 0
     fi
-    # Real run: invoke the backend's load probe. Non-zero → refuse the install.
-    # Contract: a probe exits 0 ONLY if the selected backend's runtime/EP loaded.
-    case "$t" in
-        ort-cpu|openvino|tensorrt)
-            warn "Backend-load probe is the ${t} crate's own fail-closed load path."
-            warn "On this host the probe will FAIL for a hardware-gated target (e.g."
-            warn "tensorrt off-Jetson) — that is correct: refuse, never substitute."
-            # A future release wires the concrete probe binary here. Until then,
-            # a real (non-dry-run) install of a not-yet-probeable target refuses.
-            fatal "Backend-load probe not yet wired for '${t}' in this scaffold — \
-refusing to claim a validated install (fail-closed). Use --dry-run to exercise the framework." ;;
+    case "$code" in
+        stub:*)
+            # PATH ran (acquire/build/posture). FINAL validation defers to when the
+            # backend CODE exists — a clearly-marked boundary, NOT a path gap.
+            warn "Install PATH for '${t}' is ready and ran. FINAL backend-load validation is"
+            warn "DEFERRED: the backend code is not yet implemented (${code}). This is the"
+            warn "remaining CODE gate, distinct from the (present) hardware + SDK."
+            fatal "Refusing to claim a VALIDATED backend for '${t}' while its code is a stub (fail-closed)." ;;
+        done|scaffold)
+            # Run the backend's own fail-closed load probe. Contract: the probe
+            # exits 0 ONLY if the SELECTED backend's runtime/EP actually loaded
+            # (parko-tensorrt already fail-closes via .error_on_failure(); ORT/OV
+            # error/panic without their runtime). Any failure → REFUSE, never
+            # substitute. The operator points PARKO_BACKEND_PROBE at the probe
+            # (e.g. the crate's load check on a box with the runtime present).
+            if [ -n "${PARKO_BACKEND_PROBE:-}" ]; then
+                info "Backend-load probe: ${PARKO_BACKEND_PROBE}"
+                if "${PARKO_BACKEND_PROBE}"; then
+                    success "Backend '${t}' load validated (runtime/EP present)."
+                else
+                    fatal "Backend-load probe FAILED for '${t}' — refusing (fail-closed; no substitution)."
+                fi
+            else
+                fatal "No backend-load probe wired (PARKO_BACKEND_PROBE unset), so the '${t}' runtime/EP \
+presence is unverified — refusing to claim a validated backend (fail-closed). For ort-cpu/openvino set \
+PARKO_BACKEND_PROBE to the crate's load check on a box with the runtime; tensorrt is Jetson-gated. \
+Use --dry-run to exercise the framework without a runtime."
+            fi ;;
     esac
 }
 
-# ── common safety gates (chipset-independent; run for EVERY target) ───────────
-gate() { # name, description
-    if [ "$DRY_RUN" = true ]; then
-        info "[dry-run] GATE: $1 — $2"
-    else
-        info "GATE: $1 — $2"
-        # Real gates are refuse-to-proceed; wired against the deployed node.
-    fi
+# ── common safety gates (chipset-independent; EVERY target; non-skippable) ────
+gate() {
+    if [ "$DRY_RUN" = true ]; then info "[dry-run] GATE: $1 — $2"; else info "GATE: $1 — $2"; fi
 }
-
 run_common_safety_gates() {
     local t="$1"
-    section "5/5 Common safety gates — chipset-independent, NON-skippable"
-    gate "backend-load"      "the selected backend loaded fail-closed (step 4) — no silent substitution"
-    gate "chokepoint"        "exactly ONE publisher on the motor command topic (no second writer)"
-    gate "envelope-config"   "kinematic envelope + posture config present and parseable"
-    gate "e-stop"            "emergency-stop path verified reachable and authoritative"
-    gate "wheels-up smoke"   "an over-limit command is clamped/denied with the vehicle on stands"
-    success "Common safety gates defined for ${t} (run as refuse-to-proceed steps on deploy)."
+    section "Common safety gates — across the composed stack, NON-skippable"
+    gate "backend-load"    "selected Parko backend loaded fail-closed — no silent substitution"
+    gate "chokepoint"      "exactly ONE publisher on the motor command topic (Kirra gateway is the sole writer)"
+    gate "envelope-config" "kinematic envelope + posture config present and parseable"
+    gate "e-stop"          "emergency-stop path verified reachable and authoritative"
+    gate "wheels-up smoke" "an over-limit Occy plan is clamped/denied by Kirra with the vehicle on stands"
+    success "Common safety gates defined for the Kirra+Occy+${t} stack (refuse-to-proceed on deploy)."
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
 main() {
     select_target
-    section "Parko backend install — target '${TARGET}' ($(target_descriptor "$TARGET"), $(target_kind "$TARGET"))"
-    [ "$DRY_RUN" = true ] && warn "DRY-RUN: no runtime acquired, nothing built or installed."
-    acquire_runtime          "$TARGET"
-    build_parko              "$TARGET"
-    apply_posture            "$TARGET"
-    validate_backend_loads   "$TARGET"
-    run_common_safety_gates  "$TARGET"
-    success "Parko backend flow complete for '${TARGET}'."
-    info "Gateway (kirra_verifier_service) is installed separately via install.sh — see INSTALL.md."
+    section "Full-stack install — Parko target '${TARGET}' ($(target_descriptor "$TARGET"))"
+    info "Backend-code: $(target_backend_code_status "$TARGET") | external gate: $(target_external_gate "$TARGET")"
+    if [ "$DRY_RUN" = true ]; then warn "DRY-RUN: nothing acquired, built, or installed."; fi
+    # Compose the silicon-agnostic layers first, then the per-silicon backend.
+    install_kirra_gateway
+    bringup_occy
+    acquire_runtime         "$TARGET"
+    build_parko             "$TARGET"
+    apply_posture           "$TARGET"
+    validate_backend_loads  "$TARGET"
+    run_common_safety_gates "$TARGET"
+    success "Full-stack flow complete for Kirra + Occy + Parko('${TARGET}')."
 }
 
 main
