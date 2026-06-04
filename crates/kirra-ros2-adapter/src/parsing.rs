@@ -117,6 +117,10 @@ pub fn parse_predicted_objects(
             pos: Point { x_m: pose.position.x as f64, y_m: pose.position.y as f64 },
             velocity_mps,
             heading_rad,
+            // KIRRA-OCCY-PMON-003 §5 (PRESERVE): carry the twist VECTOR through
+            // (previously discarded after the magnitude collapse) so the
+            // Track-C kinematic ceiling sees the reported map-frame velocity.
+            vel: Point { x_m: vx, y_m: vy },
         }
     }).collect()
 }

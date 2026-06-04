@@ -43,7 +43,14 @@ use crate::state::{
     AdaptorState, EgoOdom, TrajectoryPoint, SUBSCRIPTION_STALENESS_TIMEOUT_MS,
 };
 use crate::validation::{
-    check_command_conforms, validate_trajectory_slow, ConformanceVerdict, IncomingControl,
+    check_command_conforms, validate_trajectory_slow_capped, ConformanceVerdict, IncomingControl,
+};
+// KIRRA-OCCY-PMON-003 slice-1: pure ingest orchestration (safety logic lives
+// in `perception_ingest` + the kernel; this node only forwards to them).
+use crate::perception_ingest::{perception_derate_enabled, publish_perception_tick};
+use kirra_runtime_sdk::gateway::perception_monitor::{
+    empty_perception_cap, resolve_perception_cap, KinematicPlausibilityContract,
+    PerceptionCapPublisher,
 };
 
 /// Read the subscription staleness timeout (ms) from
@@ -330,6 +337,17 @@ pub async fn run_adapter(
     // the M1-era behaviour for verifier-less deployments.
     let slow_state = Arc::clone(&state);
     let slow_corridor = Arc::clone(&corridor);
+    // KIRRA-OCCY-PMON-003 slice-1 (D3a): adapter-local perception-derate cap.
+    // The publisher runs the Track-C kinematic guard at perception-tick rate
+    // and publishes a speed cap; the slow loop reads it O(1) and composes it
+    // into the per-pose verdict. DEFAULT OFF via `KIRRA_PERCEPTION_DERATE_ENABLED`
+    // — `resolve_perception_cap(false, ..)` returns `None` → pure no-op.
+    let perception_cache = empty_perception_cap();
+    let perception_publisher = PerceptionCapPublisher::new(
+        perception_cache.clone(),
+        KinematicPlausibilityContract::urban_reference(),
+        subscription_staleness_timeout_ms(), // ttl reuses the subscription staleness budget
+    );
     tokio::spawn(async move {
         let mut rx = trajectory_rx;
         while let Some(traj) = rx.recv().await {
@@ -337,13 +355,36 @@ pub async fn run_adapter(
             let objects = slow_state.snapshot_objects();
             let odom = slow_state.snapshot_odom();
             let posture = slow_state.current_posture();
-            let verdict = validate_trajectory_slow(
+
+            // Track-C ingest tick (pure orchestration in `perception_ingest`):
+            // publish the cap stamped with the OBJECTS' freshness timestamp, so
+            // the cap ages with the object stream and `resolve_perception_cap`
+            // fails closed (state-3 MRC) when objects go silent. If objects are
+            // stale/never-seen, sweep an MRC-floor cap proactively.
+            let now_wall = now_ms_wall();
+            let objects_ms =
+                slow_state.last_objects_ms.load(std::sync::atomic::Ordering::Relaxed);
+            let objects_fresh = objects_ms != 0
+                && now_wall.saturating_sub(objects_ms) <= subscription_staleness_timeout_ms();
+            if objects_fresh {
+                publish_perception_tick(&perception_publisher, &objects, objects_ms);
+            } else {
+                perception_publisher.sweep_staleness(now_wall);
+            }
+            let effective_perception_cap = resolve_perception_cap(
+                perception_derate_enabled(),
+                &perception_cache,
+                now_wall,
+            );
+
+            let verdict = validate_trajectory_slow_capped(
                 &traj.points,
                 slow_corridor.as_ref(),
                 &objects,
                 &slow_state.config,
                 odom.as_ref(),
                 posture,
+                effective_perception_cap,
             );
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

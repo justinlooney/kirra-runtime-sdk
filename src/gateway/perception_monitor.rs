@@ -41,11 +41,16 @@ pub const MAX_TRACKED_OBJECTS: usize = 256;
 
 /// Maximum credible object ground speed (m/s), GROUND/MAP-FRAME.
 ///
-/// **Derived value — KIRRA-OCCY-PMON-KIN-MARGIN-001.** The contract reports
-/// each object's own **map-frame** velocity (confirmed against the Autoware
-/// adapter — this is the object's absolute ground speed, NOT an ego-relative
-/// / closing speed), so the ceiling is a single absolute bound, not a sum of
-/// ego + object speeds.
+/// **Derived value — KIRRA-OCCY-PMON-KIN-MARGIN-001.** The ceiling is checked
+/// against each object's own **map-frame absolute ground speed** (not an
+/// ego-relative / closing speed), so it is a single absolute bound, not a sum
+/// of ego + object speeds. **This map/world-frame assumption rests on the
+/// upstream Autoware message contract** (`PredictedObjects` twist), NOT on any
+/// transform inside the KIRRA adapter — the adapter performs no frame
+/// conversion on object twist (see KIRRA-OCCY-PMON-003 §4 / D4). **Confirm per
+/// deployment** that the target Autoware version emits object twist as
+/// map/world-frame absolute velocity before enabling the derate on a vehicle;
+/// if it does not, the ingest shim must transform to map frame first.
 ///
 /// `60.0 m/s` (216 km/h) is the rounded value of:
 ///   - max credible object-class ground speed near the deployment ODD road
@@ -697,6 +702,64 @@ impl PerceptionCapPublisher {
     }
 }
 
+// ===========================================================================
+// Ingest helpers (KIRRA-OCCY-PMON-003 slice-1) — PURE, default-features-tested.
+//
+// These are the *safety-relevant* transforms of the perception ingest. They
+// operate on KERNEL types + plain scalars only (NOT on any ROS / r2r /
+// adapter type), so they compile and are unit-tested under default features
+// (CI `Test`). The ROS2 adapter's `ros2`-gated wiring is a thin extractor that
+// pulls `(id, pos, vel)` out of its message type and calls these — it holds no
+// safety decision logic.
+// ===========================================================================
+
+/// Sentinel inter-frame Δt (seconds) used by [`tracked_object_from_parts`] so
+/// the teleport (implied-speed) check is a **no-op** in slice-1 (D2a): with
+/// `prev_pos_m == pos_m`, the implied speed `|pos − prev_pos| / dt = 0` for any
+/// positive `dt`, so only the reported-velocity ceiling can fire. The real
+/// inter-frame Δt arrives with the teleport check itself (D2b, deferred).
+pub const TELEPORT_NOOP_DT_S: f64 = 1.0;
+
+/// Build a kernel [`TrackedObject`] from ingest parts (KIRRA-OCCY-PMON-003 §3).
+///
+/// `vel_mps` is the object's **reported map-frame ground velocity vector**
+/// (D2a: reported-velocity ceiling). `prev_pos_m` is set to `pos_m` and `dt_s`
+/// to [`TELEPORT_NOOP_DT_S`], making the teleport check inert for slice-1.
+///
+/// Pure; no allocation; the caller (the ROS2 adapter shim) supplies already-
+/// extracted scalars — no tracking/association happens here (ADR-0004).
+#[must_use]
+pub fn tracked_object_from_parts(id: u64, pos_m: Vec2, vel_mps: Vec2) -> TrackedObject {
+    TrackedObject {
+        id,
+        pos_m,
+        vel_mps,
+        prev_pos_m: pos_m,
+        dt_s: TELEPORT_NOOP_DT_S,
+    }
+}
+
+/// Assemble a [`PerceptionOutput`] for the ingest path from a bounded slice of
+/// shimmed objects (KIRRA-OCCY-PMON-003 §3).
+///
+/// Upstream-tracked objects are treated as trusted-present (`confidence = 1.0`,
+/// `min_confidence = 0.0`), so the snapshot-confidence gate does not itself
+/// derate; **object-stream staleness is enforced one layer up** by the cap's
+/// `generated_at_ms`/`ttl_ms` + `resolve_perception_cap` (the freshness
+/// authority for the ingest). The structural fail-closed gates that DO remain
+/// active here are the per-object finite/`dt>0` checks inside the guard and the
+/// `objects.len() <= MAX_TRACKED_OBJECTS` bound (over-cap → MRC floor).
+#[must_use]
+pub fn ingest_perception_output(objects: &[TrackedObject]) -> PerceptionOutput<'_> {
+    PerceptionOutput {
+        objects,
+        confidence: 1.0,
+        age_ms: 0,
+        min_confidence: 0.0,
+        max_age_ms: u64::MAX,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1231,5 +1294,53 @@ mod tests {
         );
         pubr.sweep_staleness(2100); // within TTL → no-op
         assert_eq!(resolve_perception_cap(true, &cache, 2100), Some(9.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Ingest helpers (KIRRA-OCCY-PMON-003 slice-1): tracked_object_from_parts
+    // + ingest_perception_output. Pure, default-features (CI `Test`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shim_from_parts_carries_vector_and_neutralizes_teleport() {
+        let obj = tracked_object_from_parts(7, Vec2 { x: 10.0, y: 2.0 }, Vec2 { x: 3.0, y: 4.0 });
+        assert_eq!(obj.id, 7);
+        assert_eq!(obj.pos_m, Vec2 { x: 10.0, y: 2.0 });
+        assert_eq!(obj.vel_mps, Vec2 { x: 3.0, y: 4.0 }); // vector preserved
+        // D2a: prev == pos and dt > 0 → implied speed is exactly 0 (teleport no-op).
+        assert_eq!(obj.prev_pos_m, obj.pos_m);
+        assert_eq!(obj.dt_s, TELEPORT_NOOP_DT_S);
+        assert!(obj.dt_s > 0.0);
+        let implied = obj.pos_m.dist_to(&obj.prev_pos_m) / obj.dt_s;
+        assert_eq!(implied, 0.0, "teleport implied-speed must be 0 in slice-1");
+    }
+
+    #[test]
+    fn shim_object_only_velocity_ceiling_can_fire() {
+        // |vel| = 5 (3,4) < 60 → plausible; the teleport check is inert.
+        let ok = tracked_object_from_parts(1, Vec2 { x: 0.0, y: 0.0 }, Vec2 { x: 3.0, y: 4.0 });
+        // |vel| = 65 > 60 → velocity ceiling trips (teleport still inert).
+        let bad = tracked_object_from_parts(2, Vec2 { x: 0.0, y: 0.0 }, Vec2 { x: 65.0, y: 0.0 });
+        let objs = [ok, bad];
+        let p = ingest_perception_output(&objs);
+        let d = kinematic_plausibility_derate(&p, &KinematicPlausibilityContract::urban_reference());
+        assert_eq!(d.reason, DerateCode::ObjectVelocityImplausible);
+    }
+
+    #[test]
+    fn ingest_output_passes_health_gate_and_keeps_count_bound() {
+        let objs: Vec<TrackedObject> = (0..3)
+            .map(|i| tracked_object_from_parts(i, Vec2 { x: 0.0, y: 0.0 }, Vec2 { x: 1.0, y: 0.0 }))
+            .collect();
+        assert!(ingest_perception_output(&objs).is_healthy());
+        // Over MAX_TRACKED_OBJECTS → unhealthy → guard returns MRC floor.
+        let too_many: Vec<TrackedObject> = (0..(MAX_TRACKED_OBJECTS as u64 + 1))
+            .map(|i| tracked_object_from_parts(i, Vec2 { x: 0.0, y: 0.0 }, Vec2 { x: 1.0, y: 0.0 }))
+            .collect();
+        let p = ingest_perception_output(&too_many);
+        assert!(!p.is_healthy());
+        let d = kinematic_plausibility_derate(&p, &KinematicPlausibilityContract::urban_reference());
+        assert_eq!(d.reason, DerateCode::PerceptionSnapshotUnhealthy);
+        assert_eq!(d.cap_mps, 0.0);
     }
 }
