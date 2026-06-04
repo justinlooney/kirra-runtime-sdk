@@ -3,22 +3,26 @@
 // Sub-modules:
 //   - this file: the `CorridorSource` trait + `MockCorridorSource`
 //     (always built; no ROS deps).
-//   - `lanelet2_bridge` (feature `ros2`): the cxx::bridge calling into
+//   - `lanelet2_bridge` (feature `lanelet2`): the cxx::bridge calling into
 //     the lanelet2_core C++ boost::serialization deserializer.
-//   - `lanelet2` (feature `ros2`): the `Lanelet2CorridorSource` impl
+//   - `lanelet2` (feature `lanelet2`): the `Lanelet2CorridorSource` impl
 //     of `CorridorSource`.
+//
+// The lanelet2 corridor bridge is gated on the `lanelet2` feature (which
+// implies `ros2`), NOT on `ros2` alone — the perception-governance path
+// builds with `--features ros2` and pulls no C++ / no cxx / no lanelet2.
 //
 // CorridorSource — the seam between the map/perception side (Lanelet2 +
 // localization in production) and the slow-loop containment check.
 //
 
-#[cfg(feature = "ros2")]
+#[cfg(feature = "lanelet2")]
 pub mod lanelet2_bridge;
 
-#[cfg(feature = "ros2")]
+#[cfg(feature = "lanelet2")]
 pub mod lanelet2;
 
-#[cfg(feature = "ros2")]
+#[cfg(feature = "lanelet2")]
 pub use self::lanelet2::{Lanelet2CorridorSource, Lanelet2Error};
 
 // ---------------------------------------------------------------------------

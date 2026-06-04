@@ -31,15 +31,27 @@ license = "Apache-2.0 OR MIT"
 # only, which is what the rest of the workspace consumes today.
 default = []
 
-# Enable r2r + the ROS 2 node skeleton in src/node.rs + the
-# Lanelet2CorridorSource (cxx wrap of `lanelet2_core`'s
-# boost::serialization deserializer). ROS distros: Humble / Jazzy /
-# Kilted (per r2r 0.9.5 support matrix). Production integrators turn
-# this on; the safety kernel CI keeps it OFF. Requires
+# Enable r2r + the ROS 2 node skeleton in src/node.rs (the perception-
+# governance path: subscribes autoware_perception_msgs/PredictedObjects,
+# parses + validates + composes the Track-C derate). ROS distros:
+# Humble / Jazzy / Kilted (per r2r 0.9.5 support matrix). Production
+# integrators turn this on; the safety kernel CI keeps it OFF. Requires only
+# a sourced ROS 2 + autoware_perception_msgs on AMENT_PREFIX_PATH:
 #   source /opt/ros/jazzy/setup.bash
-#   apt install ros-jazzy-lanelet2 libboost-serialization-dev
-# (or the integrator's equivalents) — see README.
-ros2 = ["dep:r2r", "dep:cxx", "dep:cxx-build", "dep:tracing-subscriber", "dep:futures", "dep:reqwest", "dep:serde_json", "dep:bytes"]
+# This feature pulls NO C++ / no cxx / no lanelet2 — that is the separate
+# `lanelet2` feature below (the perception governance path is independent of
+# the map/corridor layer). See README.
+ros2 = ["dep:r2r", "dep:tracing-subscriber", "dep:futures", "dep:reqwest", "dep:serde_json", "dep:bytes"]
+
+# Enable the real Lanelet2CorridorSource — a cxx/C++ wrap of `lanelet2_core`'s
+# boost::serialization deserializer (`fromBinMsg`). Implies `ros2` (the only
+# consumer of Lanelet2CorridorSource is the node binary, which needs r2r).
+# Production / map-aware build. Requires the C++ toolchain prerequisites:
+#   apt install ros-${ROS_DISTRO}-lanelet2 libboost-serialization-dev libeigen3-dev
+# (or the integrator's equivalents) — see README. The lanelet2 C++ API/version
+# compatibility is the concern of THIS feature only; a plain `ros2` build never
+# compiles the C++ bridge.
+lanelet2 = ["ros2", "dep:cxx", "dep:cxx-build"]
 
 [dependencies]
 # Concurrency primitives shared with the safety kernel.
@@ -62,6 +74,8 @@ r2r = { version = "=0.9.5", optional = true }
 # cxx — Rust ↔ C++ FFI bridge. Used by `Lanelet2CorridorSource` to call
 # into `lanelet2_core`'s boost::serialization deserializer (`fromBinMsg`
 # canonical path). Pinned to 1.0 to match cxx-build (build-deps below).
+# Gated on the `lanelet2` feature (NOT `ros2`): only the corridor bridge
+# needs C++ FFI; the perception path pulls no cxx.
 cxx = { version = "1.0", optional = true }
 
 # Phase 4: structured logging in the adapter binary. Optional + gated on
@@ -87,8 +101,8 @@ bytes      = { version = "1",    optional = true }
 
 [build-dependencies]
 # cxx-build — compiles the C++ shim and the cxx-generated glue. Must
-# match the `cxx` major version pinned above. Skipped when the `ros2`
-# feature is OFF: `build.rs` is a no-op without it.
+# match the `cxx` major version pinned above. Skipped unless the `lanelet2`
+# feature is ON: `build.rs` is a no-op for default and `ros2`-only builds.
 cxx-build = { version = "1.0", optional = true }
 
 [dev-dependencies]

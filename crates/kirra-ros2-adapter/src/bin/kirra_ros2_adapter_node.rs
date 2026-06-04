@@ -35,7 +35,7 @@ use kirra_ros2_adapter::{
     state::AdaptorState,
 };
 
-#[cfg(feature = "ros2")]
+#[cfg(feature = "lanelet2")]
 use kirra_ros2_adapter::corridor::Lanelet2CorridorSource;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +138,7 @@ fn build_corridor(args: &CliArgs) -> Result<Arc<dyn CorridorSource>, Box<dyn std
             tracing::info!("corridor source: mock (5 m half-width straight corridor, 500 m)");
             Ok(Arc::new(MockCorridorSource::straight_5m_half_width(500.0)))
         }
+        #[cfg(feature = "lanelet2")]
         CorridorSourceKind::Lanelet2 => {
             let path = args.map_bin_path.as_deref()
                 .expect("CLI parser guards: --map-bin required for lanelet2");
@@ -149,6 +150,23 @@ fn build_corridor(args: &CliArgs) -> Result<Arc<dyn CorridorSource>, Box<dyn std
                 &bin, &args.lanelet_ids, 0.95, 0,
             ).map_err(|e| format!("Lanelet2CorridorSource: {e}"))?;
             Ok(Arc::new(src))
+        }
+        // FAIL-CLOSED: a real corridor was requested but this binary was built
+        // without the `lanelet2` feature. Do NOT silently downgrade to the mock
+        // corridor — a deployment that asked for a map-derived drivable-space
+        // corridor must not run on a 5 m straight-line stand-in. Hard error.
+        #[cfg(not(feature = "lanelet2"))]
+        CorridorSourceKind::Lanelet2 => {
+            Err(format!(
+                "corridor source `lanelet2` (map-bin {:?}) was requested, but this \
+                 binary was built WITHOUT the `lanelet2` feature. The real \
+                 Lanelet2CorridorSource is unavailable. Rebuild with \
+                 `--features ros2,lanelet2` (requires ros-${{ROS_DISTRO}}-lanelet2 + \
+                 libboost-serialization-dev + libeigen3-dev), or use \
+                 `--corridor-source mock`. Refusing to downgrade a requested real \
+                 corridor to the mock.",
+                args.map_bin_path,
+            ).into())
         }
     }
 }
