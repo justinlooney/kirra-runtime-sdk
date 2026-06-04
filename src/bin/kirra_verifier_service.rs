@@ -1548,8 +1548,46 @@ async fn main() {
             });
     let audit_verifying_key = audit_signing_key.as_ref().map(|sk| sk.verifying_key());
 
+    // #165: admit the env-loaded signing key against the DURABLE trust map
+    // (audit_trust_anchor + audit_key_ledger) before any signing happens.
+    // First boot backfills the anchor; a matching active key resumes; a retired
+    // key (restart-reverted) or a brand-new env key WITHOUT an explicit adopt
+    // signal is FAIL-CLOSED — the process refuses to start rather than sign
+    // under the wrong key. Adopt is opt-in via KIRRA_LOG_SIGNING_KEY_ADOPT=1;
+    // an optional KIRRA_LOG_SIGNING_GENESIS_PIN pins the durable genesis.
     if let Some(ref key) = audit_signing_key {
-        store.set_signing_key(key.clone());
+        let adopt = std::env::var("KIRRA_LOG_SIGNING_KEY_ADOPT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let pinned = std::env::var("KIRRA_LOG_SIGNING_GENESIS_PIN")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let admission = store
+            .admit_signing_key(key.clone(), adopt, pinned.as_deref(), now_ms())
+            .expect("failed to admit audit signing key against the durable trust map");
+        use kirra_runtime_sdk::verifier_store::KeyAdmission;
+        match admission {
+            KeyAdmission::Resumed
+            | KeyAdmission::BackfilledGenesis
+            | KeyAdmission::AdoptedReanchor => {
+                println!("Audit signing key admitted ({admission:?}).");
+            }
+            KeyAdmission::RetiredKeyRejected => panic!(
+                "FAIL-CLOSED (#165): KIRRA_LOG_SIGNING_KEY is a RETIRED audit key \
+                 (a later rotation is the durable active key). Refusing to sign under \
+                 a retired key. Provide the current active private key, or perform an \
+                 explicit rotation."
+            ),
+            KeyAdmission::UnadoptedNewKeyRejected => panic!(
+                "FAIL-CLOSED (#165): KIRRA_LOG_SIGNING_KEY is a NEW key not in the durable \
+                 ledger and no adopt signal was given. Refusing to silently re-root audit \
+                 trust. Set KIRRA_LOG_SIGNING_KEY_ADOPT=1 to consent to adopting it."
+            ),
+            KeyAdmission::GenesisPinMismatch => panic!(
+                "FAIL-CLOSED (#165): KIRRA_LOG_SIGNING_GENESIS_PIN does not match the durable \
+                 trust anchor's genesis. Refusing to start."
+            ),
+        }
     }
 
     let app_state = Arc::new(AppState::new(store, mode));
