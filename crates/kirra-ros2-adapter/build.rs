@@ -1,12 +1,17 @@
 // crates/kirra-ros2-adapter/build.rs
 //
 // Two-mode build script:
-//   - `ros2` feature OFF (default): no-op. Default builds and the
-//     safety-kernel CI don't need any of this.
-//   - `ros2` feature ON: compile the C++ shim
+//   - `lanelet2` feature OFF (default + plain `ros2`): no-op. Default
+//     builds, the safety-kernel CI, and the `ros2`-only perception path
+//     don't need any C++ — no cxx, no lanelet2 headers.
+//   - `lanelet2` feature ON: compile the C++ shim
 //     (src/corridor/lanelet2_bridge.{cpp,h}) via cxx-build, with
 //     lanelet2_core + boost-serialization headers discovered from the
 //     integrator's sourced ROS environment.
+//
+// NOTE: the C++ work is gated on `lanelet2`, NOT `ros2` — the perception-
+// governance path (`ros2`) is independent of the map/corridor layer. The
+// lanelet2 C++ API/version compatibility only matters when this feature is on.
 //
 // Discovery order (first hit wins):
 //   1. $CMAKE_PREFIX_PATH — set by `source /opt/ros/<distro>/setup.bash`.
@@ -22,21 +27,22 @@
 // `cc` complaining about missing headers.
 
 fn main() {
-    // The `ros2` feature gates ALL of the C++ work. Without it we
-    // produce nothing — the default cargo build stays pure-Rust.
-    #[cfg(not(feature = "ros2"))]
+    // The `lanelet2` feature gates ALL of the C++ work. Without it we
+    // produce nothing — default builds AND `ros2`-only builds stay
+    // pure-Rust (no cxx, no lanelet2 headers).
+    #[cfg(not(feature = "lanelet2"))]
     {
         // Tell Cargo we don't depend on anything we haven't yet seen.
-        // No file changes will re-trigger this script on a default build.
+        // No file changes will re-trigger this script on a non-lanelet2 build.
         println!("cargo:rerun-if-changed=build.rs");
     }
 
-    #[cfg(feature = "ros2")]
-    ros2_build();
+    #[cfg(feature = "lanelet2")]
+    lanelet2_build();
 }
 
-#[cfg(feature = "ros2")]
-fn ros2_build() {
+#[cfg(feature = "lanelet2")]
+fn lanelet2_build() {
     use std::env;
     use std::path::{Path, PathBuf};
 
@@ -85,7 +91,7 @@ fn ros2_build() {
 
     if lanelet_include_dirs.is_empty() {
         panic!(
-            "kirra-ros2-adapter (feature `ros2`): could not locate lanelet2_core \
+            "kirra-ros2-adapter (feature `lanelet2`): could not locate lanelet2_core \
              headers (lanelet2_core/LaneletMap.h) under any of these include roots:\n\
                 {candidate_includes:#?}\n\
              \n\
@@ -141,7 +147,7 @@ fn ros2_build() {
     }
     if !link_search_added {
         panic!(
-            "kirra-ros2-adapter (feature `ros2`): no lib search path produced from \
+            "kirra-ros2-adapter (feature `lanelet2`): no lib search path produced from \
              CMAKE_PREFIX_PATH / ROS_DISTRO — did `source /opt/ros/<distro>/setup.bash` succeed?"
         );
     }
