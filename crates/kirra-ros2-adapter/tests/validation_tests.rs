@@ -102,6 +102,7 @@ fn test_rss_violation_rejects() {
         pos: Point { x_m: 9.0, y_m: 0.0 },
         velocity_mps: 0.0,
         heading_rad: 0.0,
+        vel: Point { x_m: 0.0, y_m: 0.0 },
     }];
     let cfg = VehicleConfig::default_urban();
 

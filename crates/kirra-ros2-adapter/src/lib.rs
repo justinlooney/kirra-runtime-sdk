@@ -21,6 +21,9 @@ pub mod corridor;
 pub mod geometry;
 pub mod state;
 pub mod validation;
+// KIRRA-OCCY-PMON-003 slice-1 — pure perception-ingest shim/orchestration
+// (non-ros2-gated; safety logic tested under default features).
+pub mod perception_ingest;
 
 // `posture_tracker` was relocated to the kernel
 // (`kirra_runtime_sdk::posture_tracker`) by M2b so the parko-ros2 node

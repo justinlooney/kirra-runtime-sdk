@@ -91,6 +91,35 @@ pub fn validate_trajectory_slow(
     latest_odom: Option<&EgoOdom>,
     posture: FleetPosture,
 ) -> TrajectoryVerdict {
+    // Back-compat delegate: no perception-derate cap (the M1 behaviour). The
+    // ROS2 slow loop calls `validate_trajectory_slow_capped` with the
+    // resolved Track-C cap (KIRRA-OCCY-PMON-003 slice-1).
+    validate_trajectory_slow_capped(
+        trajectory, corridor, objects, config, latest_odom, posture, None,
+    )
+}
+
+/// As [`validate_trajectory_slow`], plus the Track-C perception-derate cap
+/// (KIRRA-OCCY-PMON-003 D3a). `effective_perception_cap` is the value resolved
+/// by [`resolve_perception_cap`] at the call site (the adapter slow loop):
+/// `None` when the monitor is disabled/absent (state 1 → no-op), `Some(0.0)`
+/// MRC floor when an enabled monitor is stale/silent (state 3).
+///
+/// The cap is composed into the per-pose kinematics contract via the kernel's
+/// `apply_perception_cap` (a `min` into `odd_speed_cap_mps`) — so
+/// `validate_vehicle_command` stays byte-identical; this only tightens the
+/// contract handed to it. Derate-only: `DenyCode` / the deny path are
+/// untouched, and an MRC-floor (0.0) cap surfaces as the existing
+/// `ClampLinear(0.0)` controlled stop.
+pub fn validate_trajectory_slow_capped(
+    trajectory: &[TrajectoryPoint],
+    corridor: &dyn CorridorSource,
+    objects: &[PerceivedObject],
+    config: &VehicleConfig,
+    latest_odom: Option<&EgoOdom>,
+    posture: FleetPosture,
+    effective_perception_cap: Option<f64>,
+) -> TrajectoryVerdict {
     // ----- Posture short-circuit (M1) ----------------------------------
     //
     // A LockedOut fleet must not be commanded — the safe response is to
@@ -158,11 +187,21 @@ pub fn validate_trajectory_slow(
     // LockedOut was short-circuited above; this match is exhaustive on
     // the remaining variants.
     let degraded = posture == FleetPosture::Degraded;
-    let kinematics = match posture {
+    let base_kinematics = match posture {
         FleetPosture::Nominal  => config.to_kinematics_contract(),
         FleetPosture::Degraded => config.to_mrc_kinematics_contract(),
         FleetPosture::LockedOut => unreachable!("handled by the posture short-circuit above"),
     };
+    // KIRRA-OCCY-PMON-003: compose the Track-C perception-derate cap (most-
+    // conservative-wins `min` into `odd_speed_cap_mps`). Applied uniformly —
+    // a no-op when `None` (state 1) or when the cap is above the posture
+    // ceiling; an MRC-floor (0.0) cap tightens the ceiling to 0 → controlled
+    // stop via the existing per-pose `ClampLinear`. `validate_vehicle_command`
+    // is unchanged.
+    let kinematics = kirra_runtime_sdk::gateway::perception_monitor::apply_perception_cap(
+        &base_kinematics,
+        effective_perception_cap,
+    );
     let initial_steering_deg = current_steering_deg_from_odom(latest_odom, config);
     let mut clamp_seen = false;
     let mut prev_steering_deg = initial_steering_deg;

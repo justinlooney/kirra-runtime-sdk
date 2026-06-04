@@ -188,6 +188,13 @@ pub struct PerceivedObject {
     pub pos: Point,
     pub velocity_mps: f64,
     pub heading_rad: f64,
+    /// Reported map-frame ground-velocity **vector** `{x_m, y_m}` (m/s),
+    /// preserved from the upstream Autoware twist (KIRRA-OCCY-PMON-003 §5
+    /// sub-decision = PRESERVE). `velocity_mps` stays the magnitude RSS uses;
+    /// `vel` feeds the Track-C kinematic-plausibility ceiling (a vector-
+    /// magnitude check). Frame note: rests on the upstream message contract
+    /// being map/world-frame absolute — see PMON-003 §4 / D4.
+    pub vel: Point,
 }
 
 /// Phase 4c — typed-payload envelope for a freshly-received trajectory
