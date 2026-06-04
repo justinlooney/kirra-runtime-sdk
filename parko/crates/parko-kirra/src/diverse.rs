@@ -179,6 +179,24 @@ impl DiverseKirraGovernor {
         self
     }
 
+    /// Sets the per-ODD operational speed cap on the nominal contract,
+    /// mirroring [`crate::KirraGovernor::with_odd_speed_cap`]. This makes the
+    /// `effective_ceiling` ODD-cap arm (`Some(cap)`) reachable, so a primary
+    /// configured with an ODD cap is MATCHED by the diverse shadow rather than
+    /// diverging. The two re-derive the same `min(max_speed_mps, cap)` ceiling
+    /// through structurally different code (the diversity argument).
+    ///
+    /// Panics if `cap_mps` is non-finite or non-positive.
+    pub fn with_odd_speed_cap(mut self, cap_mps: f64) -> Self {
+        assert!(
+            cap_mps.is_finite() && cap_mps > 0.0,
+            "ODD speed cap must be a finite positive value, got {}",
+            cap_mps
+        );
+        self.nominal_contract.odd_speed_cap_mps = Some(cap_mps);
+        self
+    }
+
     /// Update the RSS safe-distance state. Same semantics as the primary's
     /// `update_rss_state`; the comparator keeps both governors in lockstep
     /// by calling this through its own `update_rss_state`.
@@ -636,6 +654,67 @@ mod tests {
             "set_rss_state(unsafe) must route to MRC ceiling {MRC_VELOCITY_CEILING_MPS}, got {v}");
     }
 
+    /// `with_odd_speed_cap` makes the `effective_ceiling` ODD-cap arm reachable
+    /// and lowers the Nominal envelope: a steady command above the cap is held
+    /// at the cap, strictly below the uncapped (physical-max) ceiling. A large
+    /// dt removes the rate limit as the binding constraint so the test isolates
+    /// the ceiling itself. Hardening finding (the arm was dead before).
+    #[test]
+    fn diverse_odd_speed_cap_lowers_nominal_ceiling() {
+        let cmd = twist(30.0, 0.0);
+        let prev = twist(30.0, 0.0); // already at speed → no accel limiting
+
+        let mut uncapped = DiverseKirraGovernor::new();
+        uncapped.update_rss_state(safe_rss());
+        let v_uncapped = effective_lin(
+            &uncapped.evaluate(&cmd, Some(&prev), 100.0, SafetyPosture::Nominal), 30.0);
+
+        let mut capped = DiverseKirraGovernor::new().with_odd_speed_cap(8.0);
+        capped.update_rss_state(safe_rss());
+        let v_capped = effective_lin(
+            &capped.evaluate(&cmd, Some(&prev), 100.0, SafetyPosture::Nominal), 30.0);
+
+        assert!(v_capped <= 8.0 + 1e-9,
+            "ODD cap 8.0 must bind the Nominal ceiling, got {v_capped}");
+        assert!(v_capped < v_uncapped,
+            "ODD cap must lower the ceiling below the uncapped max: capped={v_capped} uncapped={v_uncapped}");
+    }
+
+    /// The builder rejects a non-finite / non-positive cap (fail-closed config).
+    #[test]
+    #[should_panic(expected = "ODD speed cap must be a finite positive value")]
+    fn diverse_odd_speed_cap_rejects_non_positive() {
+        let _ = DiverseKirraGovernor::new().with_odd_speed_cap(0.0);
+    }
+
+    /// A cap >= the physical max (`nominal_reference_profile().max_speed_mps`
+    /// = 35.0) is a NO-OP: the effective ceiling stays at the physical max,
+    /// never *raised* to the cap. `effective_ceiling` is `min(max, cap)`, so a
+    /// too-high cap must not widen the envelope. (This is the case that kills
+    /// the `guard -> true` mutant on the ODD-cap arm; without it the arm is
+    /// only exercised with cap < max.)
+    #[test]
+    fn diverse_odd_speed_cap_above_physical_max_is_noop() {
+        let cmd = twist(60.0, 0.0);
+        let prev = twist(60.0, 0.0);
+
+        let mut uncapped = DiverseKirraGovernor::new();
+        uncapped.update_rss_state(safe_rss());
+        let v_uncapped = effective_lin(
+            &uncapped.evaluate(&cmd, Some(&prev), 100.0, SafetyPosture::Nominal), 60.0);
+
+        // Cap of 50.0 > physical max 35.0 → must not raise the ceiling.
+        let mut over_capped = DiverseKirraGovernor::new().with_odd_speed_cap(50.0);
+        over_capped.update_rss_state(safe_rss());
+        let v_over = effective_lin(
+            &over_capped.evaluate(&cmd, Some(&prev), 100.0, SafetyPosture::Nominal), 60.0);
+
+        assert!((v_over - v_uncapped).abs() < 1e-9,
+            "an ODD cap above the physical max must be a no-op: over_capped={v_over} uncapped={v_uncapped}");
+        assert!(v_over <= 35.0 + 1e-9,
+            "ceiling must remain at the physical max 35.0, got {v_over}");
+    }
+
     // -- Property-based broad agreement ----------------------------------
 
     proptest! {
@@ -677,6 +756,54 @@ mod tests {
                 !actions_diverge(&p, &d, &cmd, TOL),
                 "divergence: posture={:?} v={} w={} c={} dt={} prev={}\n  primary={:?}\n  diverse={:?}",
                 posture, v, w, c, dt, has_prev, p, d,
+            );
+        }
+
+        /// CERT-006 ODD-cap agreement: with the SAME ODD speed cap configured
+        /// on both governors, primary and diverse must STILL never diverge.
+        /// `odd_cap ∈ [1, 30)` is below the nominal physical max (~35 m/s) so
+        /// the `effective_ceiling`/`effective_max_speed_mps` ODD-cap arm
+        /// (`Some(cap)`) actually fires — the arm that was unreachable before
+        /// `with_odd_speed_cap` existed (hardening finding). Both governors
+        /// re-derive the capped ceiling through structurally different code.
+        #[test]
+        fn proptest_diverse_agrees_with_primary_under_odd_cap(
+            v in -60.0_f64..60.0,
+            w in -12.0_f64..12.0,
+            c in -60.0_f64..60.0,
+            dt in 0.005_f64..0.5,
+            posture_idx in 0usize..3,
+            rss_safe in proptest::bool::ANY,
+            has_prev in proptest::bool::ANY,
+            // Spans BELOW, AT, and ABOVE the 35.0 m/s physical max so the
+            // ODD-cap arm is exercised in both regimes: cap < max (cap binds)
+            // and cap >= max (cap is a no-op, ceiling stays at max). The
+            // above-max regime is what makes a `guard -> true` mutation on the
+            // arm observable (it would wrongly raise the ceiling to cap).
+            odd_cap in 1.0_f64..60.0,
+        ) {
+            let posture = [
+                SafetyPosture::Nominal,
+                SafetyPosture::Degraded,
+                SafetyPosture::LockedOut,
+            ][posture_idx];
+            let rss = if rss_safe { safe_rss() } else { unsafe_rss() };
+
+            let mut primary = KirraGovernor::new().with_odd_speed_cap(odd_cap);
+            let mut diverse = DiverseKirraGovernor::new().with_odd_speed_cap(odd_cap);
+            primary.update_rss_state(rss.clone());
+            diverse.update_rss_state(rss);
+
+            let cmd = twist(v, w);
+            let prev = twist(c, 0.0);
+            let previous = if has_prev { Some(&prev) } else { None };
+
+            let p = primary.evaluate(&cmd, previous, dt, posture);
+            let d = diverse.evaluate(&cmd, previous, dt, posture);
+            prop_assert!(
+                !actions_diverge(&p, &d, &cmd, TOL),
+                "ODD-cap divergence: cap={} posture={:?} v={} w={} c={} dt={} prev={}\n  primary={:?}\n  diverse={:?}",
+                odd_cap, posture, v, w, c, dt, has_prev, p, d,
             );
         }
     }
