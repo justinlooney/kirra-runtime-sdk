@@ -61,6 +61,8 @@ fn build_state(initial: Option<CachedFleetPosture>) -> Arc<ServiceState> {
         fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
         fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
         posture_engine_tx: std::sync::OnceLock::new(),
+        perception_cap: kirra_runtime_sdk::gateway::perception_monitor::empty_perception_cap(),
+        perception_monitor_enabled: false,
     })
 }
 

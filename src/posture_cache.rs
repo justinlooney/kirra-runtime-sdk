@@ -165,6 +165,20 @@ pub struct ServiceState {
     /// channel is full; the gate fail-closes on the resulting stale cache.
     pub posture_engine_tx:
         std::sync::OnceLock<crate::posture_engine_v2::PostureEngineSender>,
+
+    /// Track-C perception-derate cap cache (KIRRA-OCCY-PMON-002). The
+    /// perception-monitor worker publishes a speed cap here at perception-tick
+    /// rate; the actuator verdict surfaces read it O(1) and compose it into the
+    /// Nominal-arm contract via `apply_perception_cap`. Present even when the
+    /// monitor is disabled (the enabled flag gates use, not allocation).
+    pub perception_cap: crate::gateway::perception_monitor::SharedPerceptionCap,
+
+    /// Whether the perception monitor is deployed/enabled. **Defaults false** —
+    /// when false, `resolve_perception_cap` returns `None` (state 1: no-op), so
+    /// the composition is a pure no-op until a real perception ingest (#126)
+    /// wires and enables the monitor. A disabled monitor's absence is NOT a
+    /// fault; only a *configured* monitor going silent fails closed (state 3).
+    pub perception_monitor_enabled: bool,
 }
 
 /// Returns current time as milliseconds since UNIX epoch.

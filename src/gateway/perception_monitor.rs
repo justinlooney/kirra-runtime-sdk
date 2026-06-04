@@ -517,6 +517,186 @@ pub fn range_supported_speed_mps(range_m: f64, t_react_s: f64, a_brake_mps2: f64
     }
 }
 
+// ===========================================================================
+// Verdict-path composition (KIRRA-OCCY-PMON-002).
+//
+// Makes the guards ENFORCE without touching the byte-stable verdict path.
+// Option B: a perception-monitor worker evaluates the guards at perception-tick
+// rate and PUBLISHES a cap to `SharedPerceptionCap`; the verdict surfaces read
+// that cap O(1), resolve the 3-state lifecycle, and TIGHTEN the contract they
+// pass to `validate_vehicle_command` via `apply_perception_cap` — so
+// `validate_vehicle_command` and `effective_max_speed_mps` stay byte-identical.
+// Derate-only: never touches `DenyCode` or the deny path.
+// ===========================================================================
+
+use std::sync::{Arc, RwLock};
+use crate::gateway::kinematics_contract::VehicleKinematicsContract;
+
+/// The MRC-floor cap (m/s). A published cap of `0.0` composes into
+/// `effective_max_speed = min(…, 0.0) = 0.0` and surfaces as the EXISTING
+/// `ClampLinear(0.0)` → controlled stop. No new code path.
+pub const MRC_FLOOR_CAP_MPS: f64 = 0.0;
+
+/// Atomic published snapshot of the perception-derived speed cap. Mirrors
+/// `CachedFleetPosture`: the worker owns `generated_at_ms`/`ttl_ms`; the
+/// verdict-path resolver reads them to evaluate staleness.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CachedPerceptionCap {
+    /// Published permitted-speed cap (m/s). `0.0` = controlled stop.
+    pub cap_mps: f64,
+    /// Absolute timestamp (ms since UNIX epoch) when the worker published this.
+    pub generated_at_ms: u64,
+    /// Staleness TTL (ms). After `generated_at_ms + ttl_ms < now`, the resolver
+    /// treats this entry as stale and fails closed to the MRC floor.
+    pub ttl_ms: u64,
+    /// The `DerateCode` that produced this cap (audit/diagnostics).
+    pub reason: DerateCode,
+}
+
+impl CachedPerceptionCap {
+    /// Returns true if this entry has exceeded its TTL relative to `now_ms`.
+    /// Saturating subtraction tolerates clock skew without panic — identical
+    /// to `CachedFleetPosture::is_stale`.
+    #[must_use]
+    pub fn is_stale(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.generated_at_ms) >= self.ttl_ms
+    }
+}
+
+/// Shared perception-cap cache. `Arc<RwLock<Option<CachedPerceptionCap>>>` —
+/// the same shape as `SharedPostureCache`. `None` = the enabled worker has not
+/// published yet (cold start) → the resolver fails closed.
+pub type SharedPerceptionCap = Arc<RwLock<Option<CachedPerceptionCap>>>;
+
+/// Constructs an empty (cold-start) shared perception cap.
+#[must_use]
+pub fn empty_perception_cap() -> SharedPerceptionCap {
+    Arc::new(RwLock::new(None))
+}
+
+/// The 3-state cap resolver (KIRRA-OCCY-PMON-002 §4) — the enabled-gate.
+///
+/// Pure function of `(enabled, cache, now_ms)` → the effective perception cap to
+/// compose, or `None` for "no cap, no derate":
+///
+/// - **State 1 — NOT enabled** → `None`. The monitor is an *optional* layer;
+///   its absence is NOT a fault and must not derate. This is what lets the
+///   mechanism land as a pure no-op on main before any ingest exists.
+/// - **State 2 — enabled + FRESH** (`now − generated_at ≤ ttl`) → `Some(cap_mps)`.
+/// - **State 3 — enabled + STALE / `None` / poisoned RwLock** → `Some(MRC_FLOOR_CAP_MPS)`.
+///   A configured monitor going silent IS a fault → controlled stop. Mirrors
+///   `resolve_posture → LockedOut` exactly.
+#[must_use]
+pub fn resolve_perception_cap(
+    enabled: bool,
+    cache: &SharedPerceptionCap,
+    now_ms: u64,
+) -> Option<f64> {
+    // State 1 — layer not deployed/enabled. No-op (NOT a fault).
+    if !enabled {
+        return None;
+    }
+    // Enabled: read O(1). Poison → fail closed (state 3).
+    match cache.read() {
+        Ok(guard) => match guard.as_ref() {
+            // State 2 — fresh.
+            Some(entry) if !entry.is_stale(now_ms) => Some(entry.cap_mps),
+            // State 3 — stale or never-published.
+            _ => Some(MRC_FLOOR_CAP_MPS),
+        },
+        // State 3 — poisoned lock.
+        Err(_) => Some(MRC_FLOOR_CAP_MPS),
+    }
+}
+
+/// Composition via call-site contract tightening (KIRRA-OCCY-PMON-002 §1, §6).
+///
+/// Returns a copy of `contract` whose `odd_speed_cap_mps` is tightened to
+/// `min(existing_effective_cap, cap)` when `effective_cap` is `Some`; returns
+/// the contract unchanged when `None`. Because
+/// `effective_max_speed_mps() = min(max_speed_mps, odd_speed_cap_mps)`, the
+/// result yields `min(max_speed, odd_cap, perception_cap)` — the ADR-0002
+/// most-conservative-wins multi-input `min` — **without** touching
+/// `validate_vehicle_command` or `effective_max_speed_mps`. The verdict fn
+/// stays byte-identical; the only per-command cost is the O(1) resolver read at
+/// the call site.
+///
+/// WHY call-site tightening (not threading an `Option<f64>` through
+/// `validate_vehicle_command`): keeping the verdict fn + `effective_max_speed_mps`
+/// byte-identical preserves their verified-unchanged status (WCET, MC/DC, the
+/// whole P0..P6 pipeline) and confines this change to the composition layer.
+#[must_use]
+pub fn apply_perception_cap(
+    contract: &VehicleKinematicsContract,
+    effective_cap: Option<f64>,
+) -> VehicleKinematicsContract {
+    let mut out = contract.clone();
+    if let Some(cap) = effective_cap {
+        let existing = out.effective_max_speed_mps();
+        out.odd_speed_cap_mps = Some(existing.min(cap));
+    }
+    out
+}
+
+/// Publishes perception-derate caps into a `SharedPerceptionCap` at tick rate.
+/// Stateless w.r.t. its own history; mirrors the posture-engine worker's
+/// "compute then atomically replace the cache" shape.
+///
+/// First cut is KINEMATIC-ONLY (`range_supported_derate` is STAGED — no `R_obs`
+/// producer exists, #120 Item B). When the range guard lands, `on_tick` composes
+/// `min(kinematic_cap, range_cap)` here before publishing.
+pub struct PerceptionCapPublisher {
+    cache: SharedPerceptionCap,
+    contract: KinematicPlausibilityContract,
+    ttl_ms: u64,
+}
+
+impl PerceptionCapPublisher {
+    #[must_use]
+    pub fn new(
+        cache: SharedPerceptionCap,
+        contract: KinematicPlausibilityContract,
+        ttl_ms: u64,
+    ) -> Self {
+        Self { cache, contract, ttl_ms }
+    }
+
+    /// Run the kinematic guard over a fresh perception snapshot and publish the
+    /// resulting cap. Called once per perception tick.
+    pub fn on_tick(&self, perception: &PerceptionOutput, now_ms: u64) {
+        let decision = kinematic_plausibility_derate(perception, &self.contract);
+        self.publish(decision.cap_mps, decision.reason, now_ms);
+    }
+
+    /// Staleness sweep: if no fresh cap exists within the TTL, publish the
+    /// MRC-floor cap (a configured monitor going silent IS a fault). Mirrors
+    /// the telemetry watchdog's timeout sweep.
+    pub fn sweep_staleness(&self, now_ms: u64) {
+        let stale = match self.cache.read() {
+            Ok(guard) => guard.as_ref().map(|e| e.is_stale(now_ms)).unwrap_or(true),
+            Err(_) => true,
+        };
+        if stale {
+            self.publish(MRC_FLOOR_CAP_MPS, DerateCode::PerceptionSnapshotUnhealthy, now_ms);
+        }
+    }
+
+    fn publish(&self, cap_mps: f64, reason: DerateCode, now_ms: u64) {
+        let entry = CachedPerceptionCap {
+            cap_mps,
+            generated_at_ms: now_ms,
+            ttl_ms: self.ttl_ms,
+            reason,
+        };
+        // Poison-tolerant write: if the lock is poisoned we still replace the
+        // entry (the resolver fails closed on poison regardless).
+        match self.cache.write() {
+            Ok(mut guard) => *guard = Some(entry),
+            Err(poisoned) => *poisoned.into_inner() = Some(entry),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -811,5 +991,245 @@ mod tests {
             let json = serde_json::to_string(&code).expect("serialize");
             assert_eq!(json, format!("\"{token}\""));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Composition (KIRRA-OCCY-PMON-002): resolver, apply_perception_cap,
+    // end-to-end resolve→apply→validate, and the publisher worker.
+    // -----------------------------------------------------------------------
+
+    use crate::gateway::kinematics_contract::{
+        validate_vehicle_command, EnforceAction, ProposedVehicleCommand, VehicleKinematicsContract,
+        URBAN_ODD_SPEED_CAP_MPS,
+    };
+
+    fn fresh_cap(cache: &SharedPerceptionCap, cap_mps: f64, now_ms: u64, ttl_ms: u64) {
+        *cache.write().unwrap() = Some(CachedPerceptionCap {
+            cap_mps,
+            generated_at_ms: now_ms,
+            ttl_ms,
+            reason: DerateCode::ObjectVelocityImplausible,
+        });
+    }
+
+    /// A steady-state command at `v` m/s (no accel/steering corrections), so the
+    /// only thing that can act is the P2 velocity ceiling.
+    fn cmd_at(v: f64) -> ProposedVehicleCommand {
+        ProposedVehicleCommand {
+            linear_velocity_mps: v,
+            current_velocity_mps: v,
+            delta_time_s: 0.1,
+            steering_angle_deg: 0.0,
+            current_steering_angle_deg: 0.0,
+        }
+    }
+
+    // ---- 3-state resolver ----
+
+    #[test]
+    fn resolver_state1_not_enabled_is_none() {
+        let cache = empty_perception_cap();
+        fresh_cap(&cache, 5.0, 1000, 500); // even with a fresh cap present…
+        assert_eq!(resolve_perception_cap(false, &cache, 1100), None, "disabled → no cap");
+    }
+
+    #[test]
+    fn resolver_state2_enabled_fresh_returns_cap() {
+        let cache = empty_perception_cap();
+        fresh_cap(&cache, 7.5, 1000, 500);
+        assert_eq!(resolve_perception_cap(true, &cache, 1200), Some(7.5));
+    }
+
+    #[test]
+    fn resolver_state3_enabled_stale_is_mrc_floor() {
+        let cache = empty_perception_cap();
+        fresh_cap(&cache, 7.5, 1000, 500);
+        // now - generated = 600 > ttl 500 → stale → MRC floor.
+        assert_eq!(resolve_perception_cap(true, &cache, 1600), Some(MRC_FLOOR_CAP_MPS));
+    }
+
+    #[test]
+    fn resolver_state3_enabled_none_is_mrc_floor() {
+        let cache = empty_perception_cap(); // never published
+        assert_eq!(resolve_perception_cap(true, &cache, 1000), Some(MRC_FLOOR_CAP_MPS));
+    }
+
+    // ---- apply_perception_cap ----
+
+    #[test]
+    fn apply_none_returns_unchanged_contract() {
+        let base = VehicleKinematicsContract::nominal_reference_profile();
+        let out = apply_perception_cap(&base, None);
+        assert_eq!(out.effective_max_speed_mps(), base.effective_max_speed_mps());
+        assert_eq!(out.odd_speed_cap_mps, base.odd_speed_cap_mps);
+    }
+
+    #[test]
+    fn apply_some_tightens_to_min() {
+        let base = VehicleKinematicsContract::nominal_reference_profile(); // max 35, no odd cap
+        // Perception cap 12 < 35 → effective becomes 12.
+        let out = apply_perception_cap(&base, Some(12.0));
+        assert_eq!(out.effective_max_speed_mps(), 12.0);
+        // A looser perception cap never raises the ceiling.
+        let out2 = apply_perception_cap(&base, Some(100.0));
+        assert_eq!(out2.effective_max_speed_mps(), base.max_speed_mps);
+    }
+
+    #[test]
+    fn apply_composes_with_existing_odd_cap_most_conservative_wins() {
+        let mut base = VehicleKinematicsContract::nominal_reference_profile();
+        base.odd_speed_cap_mps = Some(URBAN_ODD_SPEED_CAP_MPS); // 22.35
+        // Perception cap 10 < 22.35 → 10 wins.
+        assert_eq!(apply_perception_cap(&base, Some(10.0)).effective_max_speed_mps(), 10.0);
+        // Perception cap 30 > 22.35 → existing odd cap still wins.
+        assert!(
+            (apply_perception_cap(&base, Some(30.0)).effective_max_speed_mps() - URBAN_ODD_SPEED_CAP_MPS).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn apply_zero_floor_stops() {
+        let base = VehicleKinematicsContract::nominal_reference_profile();
+        let out = apply_perception_cap(&base, Some(MRC_FLOOR_CAP_MPS));
+        assert_eq!(out.effective_max_speed_mps(), 0.0);
+    }
+
+    // ---- end-to-end: resolve → apply → validate (the composition outcome) ----
+
+    #[test]
+    fn compose_state1_identical_to_baseline() {
+        let cache = empty_perception_cap();
+        let base = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = cmd_at(20.0); // under the 35 m/s vehicle max → baseline Allow
+        let baseline = validate_vehicle_command(&cmd, &base);
+
+        let eff = resolve_perception_cap(false, &cache, 1000); // disabled
+        let composed = validate_vehicle_command(&cmd, &apply_perception_cap(&base, eff));
+        assert_eq!(composed, baseline);
+        assert_eq!(composed, EnforceAction::Allow);
+    }
+
+    #[test]
+    fn compose_state2_cap_below_command_clamps() {
+        let cache = empty_perception_cap();
+        fresh_cap(&cache, 8.0, 1000, 500);
+        let base = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = cmd_at(20.0); // 20 > published cap 8 → clamp to 8
+
+        let eff = resolve_perception_cap(true, &cache, 1200);
+        let composed = validate_vehicle_command(&cmd, &apply_perception_cap(&base, eff));
+        assert_eq!(composed, EnforceAction::ClampLinear(8.0));
+    }
+
+    #[test]
+    fn compose_state2_cap_above_command_allows() {
+        let cache = empty_perception_cap();
+        fresh_cap(&cache, 25.0, 1000, 500);
+        let base = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = cmd_at(20.0); // 20 < published cap 25 → Allow
+
+        let eff = resolve_perception_cap(true, &cache, 1200);
+        let composed = validate_vehicle_command(&cmd, &apply_perception_cap(&base, eff));
+        assert_eq!(composed, EnforceAction::Allow);
+    }
+
+    #[test]
+    fn compose_state3_stale_is_controlled_stop() {
+        let cache = empty_perception_cap();
+        fresh_cap(&cache, 25.0, 1000, 500);
+        let base = VehicleKinematicsContract::nominal_reference_profile();
+        let cmd = cmd_at(20.0);
+
+        // Stale (now - gen = 600 > ttl 500) → MRC floor → ClampLinear(0.0).
+        let eff = resolve_perception_cap(true, &cache, 1600);
+        let composed = validate_vehicle_command(&cmd, &apply_perception_cap(&base, eff));
+        assert_eq!(composed, EnforceAction::ClampLinear(0.0));
+    }
+
+    // ---- publisher worker (synthetic TrackedObjects → published cap) ----
+
+    fn ok_obj(id: u64) -> TrackedObject {
+        TrackedObject {
+            id,
+            pos_m: Vec2 { x: 10.0, y: 0.0 },
+            vel_mps: Vec2 { x: 5.0, y: 0.0 },
+            prev_pos_m: Vec2 { x: 9.5, y: 0.0 },
+            dt_s: 0.1,
+        }
+    }
+
+    #[test]
+    fn worker_on_tick_publishes_nominal_cap_for_clean_snapshot() {
+        let cache = empty_perception_cap();
+        let pubr = PerceptionCapPublisher::new(
+            cache.clone(),
+            KinematicPlausibilityContract::urban_reference(),
+            500,
+        );
+        let objs = [ok_obj(1), ok_obj(2)];
+        let p = PerceptionOutput {
+            objects: &objs,
+            confidence: 0.95,
+            age_ms: 10,
+            min_confidence: 0.5,
+            max_age_ms: 500,
+        };
+        pubr.on_tick(&p, 1000);
+        // Enabled+fresh read returns the nominal cap (no implausible objects).
+        assert_eq!(
+            resolve_perception_cap(true, &cache, 1100),
+            Some(URBAN_ODD_SPEED_CAP_MPS)
+        );
+    }
+
+    #[test]
+    fn worker_on_tick_publishes_mrc_floor_for_implausible_snapshot() {
+        let cache = empty_perception_cap();
+        let pubr = PerceptionCapPublisher::new(
+            cache.clone(),
+            KinematicPlausibilityContract::urban_reference(),
+            500,
+        );
+        // A non-finite object → structural failure → MRC floor (0.0).
+        let mut bad = ok_obj(1);
+        bad.vel_mps = Vec2 { x: f64::NAN, y: 0.0 };
+        let objs = [bad];
+        let p = PerceptionOutput {
+            objects: &objs,
+            confidence: 0.95,
+            age_ms: 10,
+            min_confidence: 0.5,
+            max_age_ms: 500,
+        };
+        pubr.on_tick(&p, 1000);
+        assert_eq!(resolve_perception_cap(true, &cache, 1100), Some(0.0));
+    }
+
+    #[test]
+    fn worker_sweep_publishes_mrc_floor_when_no_tick() {
+        let cache = empty_perception_cap(); // never ticked
+        let pubr = PerceptionCapPublisher::new(
+            cache.clone(),
+            KinematicPlausibilityContract::urban_reference(),
+            500,
+        );
+        pubr.sweep_staleness(2000);
+        // Sweep published an MRC-floor cap; a fresh read now sees 0.0.
+        let entry = cache.read().unwrap().unwrap();
+        assert_eq!(entry.cap_mps, 0.0);
+        assert_eq!(resolve_perception_cap(true, &cache, 2050), Some(0.0));
+    }
+
+    #[test]
+    fn worker_sweep_leaves_fresh_cap_untouched() {
+        let cache = empty_perception_cap();
+        fresh_cap(&cache, 9.0, 2000, 500);
+        let pubr = PerceptionCapPublisher::new(
+            cache.clone(),
+            KinematicPlausibilityContract::urban_reference(),
+            500,
+        );
+        pubr.sweep_staleness(2100); // within TTL → no-op
+        assert_eq!(resolve_perception_cap(true, &cache, 2100), Some(9.0));
     }
 }

@@ -19,6 +19,7 @@ use crate::gateway::kinematics_contract::{
     enforce_degraded_decel_to_stop, validate_vehicle_command, EnforceAction,
     ProposedVehicleCommand, VehicleKinematicsContract,
 };
+use crate::gateway::perception_monitor::{apply_perception_cap, resolve_perception_cap};
 use crate::gateway::policy::{classify_http_command, OperationalCommand};
 use crate::posture_cache::{
     now_ms as posture_now_ms, should_route_command, CachedFleetPosture, ServiceState,
@@ -219,10 +220,24 @@ pub async fn enforce_actuator_safety_envelope(
     // decel-to-stop-and-HOLD gate (non-increasing speed + no re-initiation)
     // over the MRC envelope. LockedOut was already short-circuited above.
     let verdict = match posture {
-        FleetPosture::Nominal => validate_vehicle_command(
-            &proposed_cmd,
-            &VehicleKinematicsContract::nominal_reference_profile(),
-        ),
+        FleetPosture::Nominal => {
+            // KIRRA-OCCY-PMON-002 composition: read the perception-derate cap
+            // O(1) (3-state resolver — None when the monitor is disabled, MRC
+            // floor when an enabled monitor is stale/silent) and tighten the
+            // Nominal contract via `apply_perception_cap` BEFORE the verdict
+            // call. `validate_vehicle_command`/`effective_max_speed_mps` are
+            // unchanged; the only added per-command cost is this O(1) read.
+            let eff_cap = resolve_perception_cap(
+                svc.perception_monitor_enabled,
+                &svc.perception_cap,
+                now_ms(),
+            );
+            let contract = apply_perception_cap(
+                &VehicleKinematicsContract::nominal_reference_profile(),
+                eff_cap,
+            );
+            validate_vehicle_command(&proposed_cmd, &contract)
+        }
         FleetPosture::Degraded => enforce_degraded_decel_to_stop(
             &proposed_cmd,
             &VehicleKinematicsContract::mrc_fallback_profile(),

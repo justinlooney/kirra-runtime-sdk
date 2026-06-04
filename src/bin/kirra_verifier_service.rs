@@ -1451,7 +1451,15 @@ async fn handle_fabric_command(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.body_text()}))).into_response(),
     };
 
-    match svc.fabric_router.route_command(&asset_id, &cmd) {
+    // KIRRA-OCCY-PMON-002: resolve the perception-derate cap O(1) here (the
+    // handler holds `svc`/`ServiceState`) and thread it through to the fabric
+    // governor's Nominal arm. `None` while the monitor is disabled (default).
+    let perception_cap = kirra_runtime_sdk::gateway::perception_monitor::resolve_perception_cap(
+        svc.perception_monitor_enabled,
+        &svc.perception_cap,
+        now_ms(),
+    );
+    match svc.fabric_router.route_command(&asset_id, &cmd, perception_cap) {
         Ok(action) => {
             let action_str = format!("{:?}", action);
             let allowed = !matches!(action, kirra_runtime_sdk::gateway::kinematics_contract::EnforceAction::DenyBreach(_));
@@ -1632,6 +1640,11 @@ async fn main() {
         fabric_telemetry: Arc::new(FabricTelemetry::new()),
         fabric_causal_log: Arc::new(FabricCausalLog::new(signing_key)),
         posture_engine_tx: std::sync::OnceLock::new(),
+        // KIRRA-OCCY-PMON-002: perception-derate composition. DEFAULT OFF —
+        // pure no-op (state 1) until #126 wires a real perception ingest and a
+        // deployment enables the monitor + starts the publisher worker.
+        perception_cap: kirra_runtime_sdk::gateway::perception_monitor::empty_perception_cap(),
+        perception_monitor_enabled: false,
     });
 
     {
