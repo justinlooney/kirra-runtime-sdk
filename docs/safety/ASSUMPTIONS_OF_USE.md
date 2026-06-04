@@ -201,3 +201,39 @@ trimmed-package bench does not transfer to a full-interface deployment.
 - KIRRA-OCCY-DEPLOY-001 — the Pacifica deployment architecture (bench/vehicle tiers this
   precondition gates).
 - The adapter `README.md` — the `ros2` vs `lanelet2` build matrix and the dev-only trim note.
+- KIRRA-OCCY-MSGSYNC-001 (`MSG_INTERFACE_VERSION_SYNC.md`) — the curated-interface SRAC (see
+  the relationship below).
+
+### Relationship to the curated interface (PROPOSED — leave this AoU OPEN; human decision)
+A **sanctioned, version-controlled, hash-verified curated interface package** has been
+scaffolded (`ros2_ws/src/autoware_{perception,planning}_msgs/`, the extract/verify scripts,
+and the SRAC KIRRA-OCCY-MSGSYNC-001) as a **candidate resolution** of this AoU. It does **not
+satisfy the condition as written** ("the toolchain codegens the **full** Autoware message
+set"). Instead it **reframes** the condition into:
+
+> *the governor runs **isolated** (no full Autoware message set on its build/runtime host)
+> with a **hash-verified curated subset** carrying the real package names + verbatim message
+> closures, **version-synced** to the deployed Autoware.*
+
+Arguments that this is the **better** condition for an *independent* governor (ADR-0004): a
+small, audited interface surface is easier to verify and to keep wire-compatible (byte-diff
++ RIHS hash) than depending on a third-party toolchain codegen-ing a large message set; and
+it removes the un-versioned trim entirely. Arguments it is **not a full discharge**: it adds
+a standing topology precondition (interface isolation) and a per-target re-verification
+obligation (KIRRA-OCCY-MSGSYNC-001 TOPO-1/2), and it bakes in the deployment-topology
+commitment (container-isolation on the single-Orin bench; dedicated/container on the
+Pacifica — KIRRA-OCCY-DEPLOY-001), rather than removing the precondition.
+
+**Flagged safety-case decision (do not auto-resolve):** does the curated-interface +
+isolation path
+- **(a) DISCHARGE** AOU-MSG-TOOLCHAIN-001 (treat the reframed condition as the accepted
+  resolution, once Phase 2 + per-target verification pass), or
+- **(b) PARTIALLY DISCHARGE** it (the codegen crutch is retired, but the topology +
+  per-target obligations remain tracked under this AoU), or
+- **(c) SUPERSEDE** it with a **revised AoU** (retire AOU-MSG-TOOLCHAIN-001 and replace it
+  with an `AOU-MSG-CURATED-ISOLATION` whose condition is the reframed statement above)?
+
+Each option also bakes in the deployment-topology commitment, so this is a safety-case
+judgement for the owner, not an engineering default. **Until that decision is recorded,
+AOU-MSG-TOOLCHAIN-001 stays OPEN** and the curated-interface SRAC (KIRRA-OCCY-MSGSYNC-001)
+stands beside it.
