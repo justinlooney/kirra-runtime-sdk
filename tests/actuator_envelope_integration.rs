@@ -47,6 +47,8 @@ fn build_state_with_posture(posture: FleetPosture) -> Arc<ServiceState> {
         fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
         fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
         posture_engine_tx: std::sync::OnceLock::new(),
+        perception_cap: kirra_runtime_sdk::gateway::perception_monitor::empty_perception_cap(),
+        perception_monitor_enabled: false,
     })
 }
 
@@ -427,6 +429,106 @@ async fn test_capstone_degraded_in_envelope_passes_through_unclamped() {
     assert_eq!(v["linear_velocity_mps"], 3.0);
     assert_eq!(v["enforced_steering_angle_deg"], 1.0);
     assert_eq!(v["steering_angle_deg"], 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// KIRRA-OCCY-PMON-002: perception-derate composition wired into the HTTP
+// actuator middleware (the call-site tightening at the Nominal arm).
+// ---------------------------------------------------------------------------
+
+/// PMON-002 state 2 (enabled + fresh, cap below command): the middleware reads
+/// the published cap and clamps the forwarded command to it. A steady-state
+/// command (current == linear, no accel/steer correction) isolates the cap as
+/// the only acting constraint.
+#[tokio::test]
+async fn test_perception_cap_enabled_fresh_clamps_to_published_cap() {
+    // enabled=true is set on the ServiceState below; cap 3.0 m/s, command 10 m/s.
+    let store = VerifierStore::new(":memory:").expect("in-memory store");
+    let app_state = Arc::new(AppState::new(store, VerifierOperationMode::Active));
+    let posture_cache: SharedPostureCache =
+        Arc::new(std::sync::RwLock::new(Some(CachedFleetPosture::new(FleetPosture::Nominal))));
+    let perception_cap = kirra_runtime_sdk::gateway::perception_monitor::empty_perception_cap();
+    {
+        use kirra_runtime_sdk::gateway::perception_monitor::{CachedPerceptionCap, DerateCode};
+        let now = kirra_runtime_sdk::posture_cache::now_ms();
+        *perception_cap.write().unwrap() = Some(CachedPerceptionCap {
+            cap_mps: 3.0,
+            generated_at_ms: now,
+            ttl_ms: 5_000,
+            reason: DerateCode::ObjectVelocityImplausible,
+        });
+    }
+    let svc = Arc::new(ServiceState {
+        app: app_state,
+        posture_cache,
+        audit_verifying_key: None,
+        fabric_router: Arc::new(kirra_runtime_sdk::fabric::router::FabricRouter::new()),
+        fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
+        fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
+        posture_engine_tx: std::sync::OnceLock::new(),
+        perception_cap,
+        perception_monitor_enabled: true,
+    });
+
+    // 10 m/s steady (current==linear so no accel/steer clamp) → clamp to cap 3.0.
+    let (status, v) =
+        send_json(build_schema_app(svc), Body::from(cmd_json(10.0, 10.0, 0.1, 0.0, 0.0))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["action"], "ClampLinear");
+    assert_eq!(v["enforced_linear_velocity_mps"], 3.0,
+        "enabled+fresh perception cap must clamp the forwarded command to 3.0");
+}
+
+/// PMON-002 state 1 (disabled): identical to the no-perception baseline — a
+/// command under the vehicle max is Allowed unchanged. (Default ServiceState
+/// has `perception_monitor_enabled = false`.)
+#[tokio::test]
+async fn test_perception_cap_disabled_is_noop() {
+    let svc = build_state_with_posture(FleetPosture::Nominal); // enabled = false
+    let (status, v) =
+        send_json(build_schema_app(svc), Body::from(cmd_json(10.0, 10.0, 0.1, 0.0, 0.0))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["action"], "Allow", "disabled monitor must be a pure no-op");
+    assert_eq!(v["enforced_linear_velocity_mps"], 10.0);
+}
+
+/// PMON-002 state 3 (enabled + STALE): a configured monitor whose cap has aged
+/// past its TTL fails closed to the MRC floor → ClampLinear(0.0) controlled stop.
+#[tokio::test]
+async fn test_perception_cap_enabled_stale_controlled_stop() {
+    let store = VerifierStore::new(":memory:").expect("in-memory store");
+    let app_state = Arc::new(AppState::new(store, VerifierOperationMode::Active));
+    let posture_cache: SharedPostureCache =
+        Arc::new(std::sync::RwLock::new(Some(CachedFleetPosture::new(FleetPosture::Nominal))));
+    let perception_cap = kirra_runtime_sdk::gateway::perception_monitor::empty_perception_cap();
+    {
+        use kirra_runtime_sdk::gateway::perception_monitor::{CachedPerceptionCap, DerateCode};
+        // generated far in the past relative to a tiny TTL → stale on read.
+        *perception_cap.write().unwrap() = Some(CachedPerceptionCap {
+            cap_mps: 9.0,
+            generated_at_ms: 1, // epoch-ancient
+            ttl_ms: 1,
+            reason: DerateCode::ObjectVelocityImplausible,
+        });
+    }
+    let svc = Arc::new(ServiceState {
+        app: app_state,
+        posture_cache,
+        audit_verifying_key: None,
+        fabric_router: Arc::new(kirra_runtime_sdk::fabric::router::FabricRouter::new()),
+        fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
+        fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
+        posture_engine_tx: std::sync::OnceLock::new(),
+        perception_cap,
+        perception_monitor_enabled: true,
+    });
+
+    let (status, v) =
+        send_json(build_schema_app(svc), Body::from(cmd_json(10.0, 10.0, 0.1, 0.0, 0.0))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["action"], "ClampLinear");
+    assert_eq!(v["enforced_linear_velocity_mps"], 0.0,
+        "enabled+stale monitor must fail closed to a controlled stop (cap 0.0)");
 }
 
 /// FAIL-CLOSED: the handler's signature declares `Extension<EnforcementOutcome>`

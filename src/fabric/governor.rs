@@ -99,10 +99,17 @@ impl AssetGovernor {
     // (≅ AEGIS SG-007. LockedOut → DenyCode::AssetLockedOut; Degraded →
     //  controlled decel-to-stop-and-HOLD under the MRC envelope (Issue #70);
     //  Nominal → full envelope.)
+    // `effective_perception_cap` (KIRRA-OCCY-PMON-002): the perception-derate
+    // cap resolved by the caller (`Option<f64>` — `None` when the monitor is
+    // disabled; `Some(0.0)` MRC floor when an enabled monitor is stale). It is
+    // composed into the Nominal-arm contract via `apply_perception_cap` (a pure
+    // `min` into `odd_speed_cap_mps`), so `validate_vehicle_command` stays
+    // byte-identical. No-op on Degraded/LockedOut (already at/below MRC).
     pub fn evaluate_command(
         &self,
         cmd: &ProposedVehicleCommand,
         current_posture: &FleetPosture,
+        effective_perception_cap: Option<f64>,
     ) -> EnforceAction {
         match current_posture {
             FleetPosture::LockedOut => {
@@ -116,7 +123,10 @@ impl AssetGovernor {
                 enforce_degraded_decel_to_stop(cmd, &contract)
             }
             FleetPosture::Nominal => {
-                let contract = self.profile.nominal_contract();
+                let contract = crate::gateway::perception_monitor::apply_perception_cap(
+                    &self.profile.nominal_contract(),
+                    effective_perception_cap,
+                );
                 validate_vehicle_command(cmd, &contract)
             }
         }
@@ -166,8 +176,8 @@ mod tests {
             steering_angle_deg: 0.0,
             current_steering_angle_deg: 0.0,
         };
-        let nominal_result = g.evaluate_command(&reinit_cmd, &FleetPosture::Nominal);
-        let degraded_result = g.evaluate_command(&reinit_cmd, &FleetPosture::Degraded);
+        let nominal_result = g.evaluate_command(&reinit_cmd, &FleetPosture::Nominal, None);
+        let degraded_result = g.evaluate_command(&reinit_cmd, &FleetPosture::Degraded, None);
         // Nominal admits the motion (clamped by accel limits, never denied).
         assert!(
             matches!(nominal_result, EnforceAction::ClampLinear(_) | EnforceAction::Allow),
@@ -195,7 +205,7 @@ mod tests {
             steering_angle_deg: 0.0,
             current_steering_angle_deg: 0.0,
         };
-        let degraded_result = g.evaluate_command(&decel_cmd, &FleetPosture::Degraded);
+        let degraded_result = g.evaluate_command(&decel_cmd, &FleetPosture::Degraded, None);
         assert!(
             !matches!(degraded_result, EnforceAction::DenyBreach(_)),
             "decelerating command must be admitted under Degraded: {degraded_result:?}"
@@ -205,7 +215,7 @@ mod tests {
     #[test]
     fn test_locked_out_denies_all_commands() {
         let g = AssetGovernor::new("av01".to_string(), KinematicProfileType::AutomotiveNominal);
-        let result = g.evaluate_command(&nominal_cmd(), &FleetPosture::LockedOut);
+        let result = g.evaluate_command(&nominal_cmd(), &FleetPosture::LockedOut, None);
         assert_eq!(result, EnforceAction::DenyBreach(DenyCode::AssetLockedOut));
     }
 
@@ -215,7 +225,7 @@ mod tests {
         // 0.5 m/s with zero current velocity over 0.1s dt: accel = 5 m/s²
         // Robot MRC max_accel is 1.5*0.4 = 0.6 m/s², nominal is 1.5 m/s²
         // This will be clamped but not denied
-        let result = g.evaluate_command(&nominal_cmd(), &FleetPosture::Nominal);
+        let result = g.evaluate_command(&nominal_cmd(), &FleetPosture::Nominal, None);
         // Either Allow or ClampLinear is acceptable (depends on accel)
         assert!(!matches!(result, EnforceAction::DenyBreach(_)));
     }
@@ -230,7 +240,7 @@ mod tests {
             steering_angle_deg: 0.0,
             current_steering_angle_deg: 0.0,
         };
-        let result = g.evaluate_command(&fast, &FleetPosture::Nominal);
+        let result = g.evaluate_command(&fast, &FleetPosture::Nominal, None);
         assert_eq!(result, EnforceAction::ClampLinear(0.5));
     }
 }

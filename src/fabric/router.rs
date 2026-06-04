@@ -80,10 +80,15 @@ impl FabricRouter {
         self.asset_postures.entry(asset.asset_id.clone()).or_insert(initial_posture);
     }
 
+    // `effective_perception_cap` (KIRRA-OCCY-PMON-002): the perception-derate
+    // cap the caller resolved from the `SharedPerceptionCap` (the caller holds
+    // `ServiceState`; the router just threads the scalar through to the
+    // governor's Nominal arm). `None` when the monitor is disabled.
     pub fn route_command(
         &self,
         asset_id: &str,
         cmd: &ProposedVehicleCommand,
+        effective_perception_cap: Option<f64>,
     ) -> Result<EnforceAction, FabricError> {
         let governor = self.governors.get(asset_id)
             .ok_or_else(|| FabricError::AssetNotFound(asset_id.to_string()))?;
@@ -92,7 +97,7 @@ impl FabricRouter {
             .map(|p| p.posture.clone())
             .unwrap_or(FleetPosture::LockedOut);  // fail-closed if posture unknown
 
-        Ok(governor.evaluate_command(cmd, &posture))
+        Ok(governor.evaluate_command(cmd, &posture, effective_perception_cap))
     }
 
     /// Low-level posture write. Used by:
@@ -302,14 +307,14 @@ mod tests {
     fn test_route_command_to_correct_asset_governor() {
         let router = FabricRouter::new();
         router.register_asset(&make_asset("r01", AssetType::Robot, KinematicProfileType::RobotNominal));
-        let result = router.route_command("r01", &safe_cmd());
+        let result = router.route_command("r01", &safe_cmd(), None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_unknown_asset_returns_error() {
         let router = FabricRouter::new();
-        let result = router.route_command("nonexistent", &safe_cmd());
+        let result = router.route_command("nonexistent", &safe_cmd(), None);
         assert!(matches!(result, Err(FabricError::AssetNotFound(_))));
     }
 
@@ -436,7 +441,7 @@ mod tests {
             steering_angle_deg: 0.0,
             current_steering_angle_deg: 0.0,
         };
-        let result = router.route_command("r01", &hold)
+        let result = router.route_command("r01", &hold, None)
             .expect("route_command should not error");
         assert!(matches!(result, EnforceAction::Allow),
             "holding at a standstill must be allowed on a freshly registered (Degraded) asset, got {result:?}");
@@ -444,7 +449,7 @@ mod tests {
         // A re-initiation command from rest (the `safe_cmd` 0.1 m/s crawl that
         // the old MRC-crawl behavior admitted) must now be DENIED — no
         // autonomous re-initiation of motion under Degraded.
-        let result = router.route_command("r01", &safe_cmd())
+        let result = router.route_command("r01", &safe_cmd(), None)
             .expect("route_command should not error");
         assert!(matches!(result, EnforceAction::DenyBreach(_)),
             "re-initiation from a stop must be denied on a Degraded asset, got {result:?}");
@@ -458,7 +463,7 @@ mod tests {
             steering_angle_deg: 0.0,
             current_steering_angle_deg: 0.0,
         };
-        let result = router.route_command("r01", &decel).expect("route_command should not error");
+        let result = router.route_command("r01", &decel, None).expect("route_command should not error");
         assert!(!matches!(result, EnforceAction::DenyBreach(_)),
             "a decelerating within-MRC command must be admitted on a Degraded asset, got {result:?}");
     }
@@ -544,7 +549,7 @@ mod tests {
                         delta_time_s: 0.1,
                         steering_angle_deg: 0.0,
                         current_steering_angle_deg: 0.0,
-                    });
+                    }, None);
                 }
             })
         }).collect();

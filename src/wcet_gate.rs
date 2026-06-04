@@ -122,6 +122,24 @@ pub const GOVERNOR_VERDICT_WCET_CI_THRESHOLD_MICROS: u64 = 1000;
 /// fail-closed timeout setting.
 pub const GOVERNOR_CONTAINMENT_WCET_CI_THRESHOLD_MICROS: u64 = 10_000;
 
+/// CI regression-gate threshold for the Track-C perception kinematic-plausibility
+/// guard (microseconds), evaluated at PERCEPTION-TICK rate — NOT per command
+/// (KIRRA-OCCY-PMON-002, Option B).
+///
+/// Like the SG2 containment check, this guard is structurally heavier than the
+/// O(1) per-command kernel: it is `O(MAX_TRACKED_OBJECTS)` (a finite/structural
+/// check + a velocity-magnitude + a teleport implied-speed test per object,
+/// `MAX_TRACKED_OBJECTS = 256`). It does NOT fold into the per-command budget —
+/// under Option B it runs once per perception frame and publishes a cap; the
+/// verdict path only does an O(1) cap read (gated separately by the per-command
+/// threshold, see `wcet_perception_cap_read_is_o1`).
+///
+/// 10 000 µs is generous for debug-mode CI (same caveat / separate-budget
+/// rationale as `GOVERNOR_CONTAINMENT_WCET_CI_THRESHOLD_MICROS`); S8 (#120)
+/// re-measures on the target SoC. The exact value is provisional — confirmed
+/// alongside the tick-rate worker's real cadence at deployment time.
+pub const GOVERNOR_PERCEPTION_GUARD_WCET_CI_THRESHOLD_MICROS: u64 = 10_000;
+
 // ---------------------------------------------------------------------------
 // Measurement helpers
 // ---------------------------------------------------------------------------
@@ -408,6 +426,99 @@ mod ci_gate_tests {
              on top of its expected O(poses × vertices × 4) edge work.",
             GOVERNOR_CONTAINMENT_WCET_CI_THRESHOLD_MICROS,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // KIRRA-OCCY-PMON-002 — perception-derate composition WCET coverage.
+    //
+    // Two separate budgets, mirroring the containment precedent:
+    //   (1) the tick-rate kinematic guard (O(MAX_TRACKED_OBJECTS)) — its OWN
+    //       budget, NOT the per-command one;
+    //   (2) the per-command cap read+compose (resolve_perception_cap +
+    //       apply_perception_cap) — must stay O(1), under the per-command budget
+    //       (no per-command budget revision).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wcet_perception_kinematic_guard_worst_case() {
+        use crate::gateway::perception_monitor::{
+            kinematic_plausibility_derate, KinematicPlausibilityContract, PerceptionOutput,
+            TrackedObject, Vec2, MAX_TRACKED_OBJECTS,
+        };
+        // Worst case: a full MAX_TRACKED_OBJECTS slice of valid, plausible
+        // objects (every object runs the finite + velocity + teleport checks to
+        // completion — no early structural-failure return).
+        let objs: Vec<TrackedObject> = (0..MAX_TRACKED_OBJECTS as u64)
+            .map(|id| TrackedObject {
+                id,
+                pos_m: Vec2 { x: 10.0, y: 0.0 },
+                vel_mps: Vec2 { x: 5.0, y: 0.0 },
+                prev_pos_m: Vec2 { x: 9.5, y: 0.0 },
+                dt_s: 0.1,
+            })
+            .collect();
+        let perception = PerceptionOutput {
+            objects: &objs,
+            confidence: 0.95,
+            age_ms: 10,
+            min_confidence: 0.5,
+            max_age_ms: 500,
+        };
+        let contract = KinematicPlausibilityContract::urban_reference();
+
+        const GUARD_ITERS: u32 = 2_000;
+        let (max_ns, p999_ns) = measure_stats(GUARD_ITERS, || {
+            let _ = std::hint::black_box(kinematic_plausibility_derate(
+                std::hint::black_box(&perception),
+                std::hint::black_box(&contract),
+            ));
+        });
+        let (max_us, p999_us) = (max_ns / 1000, p999_ns / 1000);
+        println!(
+            "WCET-GATE perception_kinematic_guard::worst_case ({MAX_TRACKED_OBJECTS} objects): \
+             max={max_ns}ns ({max_us}us)  p99.9={p999_ns}ns ({p999_us}us)  \
+             vs PMON-guard CI-threshold {}us (TICK-rate, not per-command — see \
+             GOVERNOR_PERCEPTION_GUARD_WCET_CI_THRESHOLD_MICROS)",
+            GOVERNOR_PERCEPTION_GUARD_WCET_CI_THRESHOLD_MICROS,
+        );
+        assert!(
+            p999_us < GOVERNOR_PERCEPTION_GUARD_WCET_CI_THRESHOLD_MICROS as u128,
+            "WCET REGRESSION on perception_kinematic_guard::worst_case: p99.9 {p999_us}us \
+             exceeds the PMON-guard CI threshold {}us — the O(MAX_TRACKED_OBJECTS) guard \
+             has acquired a heap alloc / lock / I/O on top of its per-object scalar work.",
+            GOVERNOR_PERCEPTION_GUARD_WCET_CI_THRESHOLD_MICROS,
+        );
+    }
+
+    #[test]
+    fn wcet_perception_cap_read_is_o1() {
+        use crate::gateway::kinematics_contract::VehicleKinematicsContract;
+        use crate::gateway::perception_monitor::{
+            apply_perception_cap, empty_perception_cap, resolve_perception_cap, CachedPerceptionCap,
+            DerateCode,
+        };
+        // The per-command hot-path addition: resolve (one RwLock read + staleness
+        // compare) + apply (clone + one min). Must stay under the PER-COMMAND
+        // budget — this is the cost the verdict path actually pays per command.
+        let cache = empty_perception_cap();
+        let now = crate::posture_cache::now_ms();
+        *cache.write().unwrap() = Some(CachedPerceptionCap {
+            cap_mps: 12.0,
+            generated_at_ms: now,
+            ttl_ms: 5_000,
+            reason: DerateCode::ObjectVelocityImplausible,
+        });
+        let base = VehicleKinematicsContract::nominal_reference_profile();
+
+        let (max_ns, p999_ns) = measure_stats(ITERS, || {
+            let eff = std::hint::black_box(resolve_perception_cap(
+                std::hint::black_box(true),
+                std::hint::black_box(&cache),
+                std::hint::black_box(now),
+            ));
+            let _ = std::hint::black_box(apply_perception_cap(std::hint::black_box(&base), eff));
+        });
+        assert_under_budget("perception_cap_read+compose::per_command", max_ns, p999_ns);
     }
 
     #[test]
