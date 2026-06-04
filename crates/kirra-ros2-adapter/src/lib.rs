@@ -45,7 +45,7 @@ pub mod posture_source;
 // binary; for now these are the public surface).
 pub use crate::config::VehicleConfig;
 pub use crate::corridor::{CorridorSource, MockCorridorSource, Point};
-#[cfg(feature = "ros2")]
+#[cfg(feature = "lanelet2")]
 pub use crate::corridor::{Lanelet2CorridorSource, Lanelet2Error};
 pub use crate::geometry::quat_to_yaw;
 pub use kirra_runtime_sdk::posture_tracker::{PostureTracker, POSTURE_STALENESS_TIMEOUT_MS};
