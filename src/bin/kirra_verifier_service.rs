@@ -1587,6 +1587,14 @@ async fn main() {
                 "FAIL-CLOSED (#165): KIRRA_LOG_SIGNING_GENESIS_PIN does not match the durable \
                  trust anchor's genesis. Refusing to start."
             ),
+            KeyAdmission::MigrationReversionRejected { chain_latest_key_id, env_key_id } => panic!(
+                "FAIL-CLOSED (#165 migration): the audit chain's latest rotation is to key \
+                 {chain_latest_key_id} but KIRRA_LOG_SIGNING_KEY supplied {env_key_id}. The env \
+                 key has reverted to a pre-rotation (or foreign) key; anchoring on it would \
+                 re-root audit trust. RESOLUTION — supply the correct active key in \
+                 KIRRA_LOG_SIGNING_KEY, OR set KIRRA_LOG_SIGNING_KEY_ADOPT=1 to consent to \
+                 anchoring on the env key (recorded as a consented reanchor)."
+            ),
         }
     }
 
