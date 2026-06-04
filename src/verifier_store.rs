@@ -138,6 +138,19 @@ pub enum KeyAdmission {
     /// FAIL-CLOSED: a config-pinned genesis key-id did not match the durable
     /// anchor's genesis.
     GenesisPinMismatch,
+    /// FAIL-CLOSED at the UPGRADE moment (#165 migration hardening): a pre-#165
+    /// chain records a KEY_ROTATION whose latest resulting key (`chain_latest_key_id`)
+    /// does NOT match the env key (`env_key_id`). The env key has reverted to a
+    /// pre-rotation key (or is foreign to the chain), so anchoring genesis on it
+    /// would silently re-root trust away from what the chain asserts is active.
+    /// Refused unless the operator explicitly consents via
+    /// `KIRRA_LOG_SIGNING_KEY_ADOPT` (which records a consented reanchor). Fires
+    /// ONLY when the chain has ≥1 rotation and its latest key != env; clean and
+    /// correctly-rotated upgrades are unaffected.
+    MigrationReversionRejected {
+        chain_latest_key_id: String,
+        env_key_id: String,
+    },
 }
 
 /// Canonical, versioned signing payload for an `audit_key_ledger` row. The NEW
@@ -544,7 +557,8 @@ impl VerifierStore {
     ///
     /// - No anchor → FIRST-BOOT BACKFILL: write anchor{genesis = env} + a
     ///   self-signed genesis ledger row, and reconcile any pre-existing in-chain
-    ///   KEY_ROTATION rows into forensic `backfill` ledger rows. Adopt env.
+    ///   KEY_ROTATION rows into forensic `backfill` ledger rows. Adopt env —
+    ///   UNLESS a migration reversion is detected (see runbook below).
     /// - Anchor + env == active → resume.
     /// - Anchor + env is a RETIRED ledger id → fail-closed (gap-1).
     /// - Anchor + env is a NEW id → fail-closed unless `adopt`, in which case a
@@ -553,6 +567,24 @@ impl VerifierStore {
     ///   fail-closed.
     ///
     /// All durable writes ride a single `synchronous=FULL` transaction.
+    ///
+    /// # Migration-reversion runbook (`KeyAdmission::MigrationReversionRejected`)
+    ///
+    /// At the upgrade moment, a pre-#165 chain may record an in-process
+    /// KEY_ROTATION (e.g. A→B) whose latest result key the env key does NOT
+    /// match — i.e. env has reverted to a pre-rotation key (A), or is foreign to
+    /// the chain. Those pre-#165 in-process rotations were never durable (the
+    /// very bug #165 closes), so anchoring genesis on the reverted env key would
+    /// silently re-root audit trust away from what the chain records as active.
+    /// This is the PRIMARY safeguard: fail closed. It fires ONLY when the chain
+    /// has ≥1 rotation AND its latest key != env; clean upgrades (no pre-#165
+    /// rotations) and correct upgrades (env updated to the latest rotation key)
+    /// are unaffected. RESOLUTION, operator's choice:
+    ///   1. Supply the correct active private key in `KIRRA_LOG_SIGNING_KEY`
+    ///      (the key the chain's latest rotation names), then restart; OR
+    ///   2. Set `KIRRA_LOG_SIGNING_KEY_ADOPT=1` to consent to anchoring on the
+    ///      env key — recorded as an explicit, self-signed `reanchor` ledger row
+    ///      (a logged operator decision, never a silent anchor).
     pub fn admit_signing_key(
         &mut self,
         env_key: ed25519_dalek::SigningKey,
@@ -576,12 +608,30 @@ impl VerifierStore {
         match self.audit_trust_anchor_genesis_id()? {
             // ---- FIRST-BOOT BACKFILL (no durable anchor yet) -----------------
             None => {
+                let rotations = self.collect_chain_key_rotations()?;
+                // The key the chain asserts SHOULD be active = the result of its
+                // latest KEY_ROTATION (rotations are in id order).
+                let chain_latest = rotations.last().map(|(kid, _)| kid.clone());
+                // #165 migration hardening: a pre-#165 chain whose latest rotation
+                // is NOT the env key means env has reverted to a pre-rotation key
+                // (or is foreign to the chain). Anchoring genesis on it would
+                // silently re-root trust away from what the chain records as
+                // active — fail closed unless the operator explicitly consents.
+                // Covers both "env is an earlier key in the lineage" and "env is
+                // foreign to the chain": both are the same re-rooting risk.
+                let reversion = matches!(&chain_latest, Some(latest) if *latest != k_env);
+                if reversion && !adopt {
+                    return Ok(KeyAdmission::MigrationReversionRejected {
+                        chain_latest_key_id: chain_latest.unwrap(),
+                        env_key_id: k_env,
+                    });
+                }
+
                 let genesis_sig = b64e.encode(
                     env_key
                         .sign(ledger_signing_payload(&k_env, None, "genesis", &env_pub_b64, now_ms as i64).as_bytes())
                         .to_bytes(),
                 );
-                let rotations = self.collect_chain_key_rotations()?;
                 let tx = self.durable_mut().transaction()?;
                 tx.execute(
                     "INSERT INTO audit_trust_anchor (id, genesis_key_id, created_at_ms) \
@@ -611,9 +661,40 @@ impl VerifierStore {
                     )?;
                     prev = kid;
                 }
+                // CONSENTED reversion (reversion && adopt): record an explicit,
+                // self-signed `reanchor` ledger row (prev = the chain's latest
+                // key) so the operator's decision is a logged record, not a
+                // silent anchor. This also makes K_env unambiguously the active
+                // (max-seq non-backfill) key.
+                if reversion {
+                    let reanchor_sig = b64e.encode(
+                        env_key
+                            .sign(
+                                ledger_signing_payload(
+                                    &k_env,
+                                    chain_latest.as_deref(),
+                                    "reanchor",
+                                    &env_pub_b64,
+                                    now_ms as i64,
+                                )
+                                .as_bytes(),
+                            )
+                            .to_bytes(),
+                    );
+                    tx.execute(
+                        "INSERT INTO audit_key_ledger \
+                         (key_id, prev_key_id, role, pubkey_b64, signature_b64, created_at_ms) \
+                         VALUES (?1, ?2, 'reanchor', ?3, ?4, ?5)",
+                        params![k_env, chain_latest, env_pub_b64, reanchor_sig, now_ms as i64],
+                    )?;
+                }
                 tx.commit()?; // FULL → fsync
                 self.signing_key = Some(env_key);
-                Ok(KeyAdmission::BackfilledGenesis)
+                Ok(if reversion {
+                    KeyAdmission::AdoptedReanchor
+                } else {
+                    KeyAdmission::BackfilledGenesis
+                })
             }
             // ---- ANCHOR EXISTS: strict admission -----------------------------
             Some(_genesis_id) => {
@@ -2812,35 +2893,100 @@ mod key_durability_165_tests {
         assert_eq!(genesis_rows2, 1, "backfill is idempotent — still exactly one genesis row");
     }
 
-    // --- Test 5: MIGRATION RECONCILE ----------------------------------------
+    /// Inject a pre-#165 in-chain `KEY_ROTATION` (old→new) with NO ledger row,
+    /// simulating an in-process rotation done before #165.
+    fn inject_chain_rotation(s: &mut VerifierStore, old: &SigningKey, new: &SigningKey, ts: i64) {
+        let payload = serde_json::json!({
+            "new_public_key_b64": b64e.encode(new.verifying_key().as_bytes()),
+            "new_key_id": kid(new),
+            "reason": "preexisting",
+            "rotated_at_ms": ts,
+        }).to_string();
+        let tx = s.conn.transaction().unwrap();
+        AuditChainLinker::append_audit_event_tx(&tx, "KEY_ROTATION", &payload, ts, Some(old)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // --- Test 5: MIGRATION RECONCILE (consented reversion via adopt) --------
     #[test]
-    fn migration_reconciles_preexisting_chain_rotations_into_ledger() {
+    fn migration_reconcile_with_adopt_records_consented_reanchor() {
         let db = TmpDb::new("g5");
         let (a, b) = (key(1), key(2));
         let mut s = VerifierStore::new(db.path()).unwrap();
-        // Simulate a pre-#165 in-chain KEY_ROTATION (A→B) with NO ledger row.
         s.set_signing_key(a.clone());
-        {
-            let payload = serde_json::json!({
-                "new_public_key_b64": b64e.encode(b.verifying_key().as_bytes()),
-                "new_key_id": kid(&b),
-                "reason": "preexisting",
-                "rotated_at_ms": 500,
-            }).to_string();
-            let tx = s.conn.transaction().unwrap();
-            AuditChainLinker::append_audit_event_tx(&tx, "KEY_ROTATION", &payload, 500, Some(&a)).unwrap();
-            tx.commit().unwrap();
-        }
-        // No anchor yet. First-boot admission backfills the ledger from history.
+        inject_chain_rotation(&mut s, &a, &b, 500); // chain A→B, env will be A
+
+        // Env reverted to A while the chain's latest rotation is B → consented
+        // adopt is required; it backfills the ledger AND logs a reanchor.
         assert_eq!(
-            s.admit_signing_key(a.clone(), false, None, 1_000).unwrap(),
-            KeyAdmission::BackfilledGenesis);
+            s.admit_signing_key(a.clone(), true, None, 1_000).unwrap(),
+            KeyAdmission::AdoptedReanchor);
         let rows = s.audit_key_ledger_rows().unwrap();
         assert!(rows.iter().any(|r| r.role == "genesis" && r.key_id == kid(&a)),
             "genesis ledger row for A");
         assert!(rows.iter().any(|r| r.role == "backfill" && r.key_id == kid(&b)),
             "forensic backfill ledger row matching the pre-existing chain rotation to B");
-        // The running env key (A) stays active; the lost-key B is forensic only.
+        assert!(rows.iter().any(|r| r.role == "reanchor"
+                && r.key_id == kid(&a)
+                && r.prev_key_id.as_deref() == Some(kid(&b).as_str())),
+            "consented reanchor row: A adopted over the chain's latest (B)");
+        // The consented env key (A) is the active key.
+        assert_eq!(s.audit_key_ledger_active_id().unwrap().as_deref(), Some(kid(&a).as_str()));
+    }
+
+    // --- Migration hardening: reversion at first boot, no adopt → fail-closed
+    #[test]
+    fn migration_reversion_no_adopt_is_fail_closed() {
+        let db = TmpDb::new("g5b");
+        let (a, b) = (key(1), key(2));
+        let mut s = VerifierStore::new(db.path()).unwrap();
+        s.set_signing_key(a.clone());
+        inject_chain_rotation(&mut s, &a, &b, 500); // chain A→B
+        // Env = A (reverted to a pre-rotation key), no adopt → FAIL CLOSED.
+        assert_eq!(
+            s.admit_signing_key(a.clone(), false, None, 1_000).unwrap(),
+            KeyAdmission::MigrationReversionRejected {
+                chain_latest_key_id: kid(&b),
+                env_key_id: kid(&a),
+            });
+        // Fail-closed: nothing durable was written — no anchor, no ledger rows.
+        assert!(s.audit_trust_anchor_genesis_id().unwrap().is_none(), "no anchor written on reject");
+        assert!(s.audit_key_ledger_active_id().unwrap().is_none(), "no ledger row written on reject");
+    }
+
+    // --- Migration hardening: env matches the chain's latest rotation → OK ---
+    #[test]
+    fn migration_env_matches_latest_rotation_does_not_fire() {
+        let db = TmpDb::new("g5c");
+        let (a, b) = (key(1), key(2));
+        let mut s = VerifierStore::new(db.path()).unwrap();
+        s.set_signing_key(a.clone());
+        inject_chain_rotation(&mut s, &a, &b, 500); // chain A→B
+        // Env = B (correctly updated to the latest rotation) → normal backfill.
+        assert_eq!(
+            s.admit_signing_key(b.clone(), false, None, 1_000).unwrap(),
+            KeyAdmission::BackfilledGenesis);
+        assert_eq!(s.audit_trust_anchor_genesis_id().unwrap().as_deref(), Some(kid(&b).as_str()));
+        assert_eq!(s.audit_key_ledger_active_id().unwrap().as_deref(), Some(kid(&b).as_str()));
+    }
+
+    // --- Migration hardening: no rotations in chain → unaffected ------------
+    #[test]
+    fn migration_no_rotations_is_unaffected() {
+        let db = TmpDb::new("g5d");
+        let a = key(1);
+        let mut s = VerifierStore::new(db.path()).unwrap();
+        s.set_signing_key(a.clone());
+        // A signed non-rotation row, but NO KEY_ROTATION.
+        {
+            let sk = s.signing_key.clone();
+            let tx = s.conn.transaction().unwrap();
+            AuditChainLinker::append_audit_event_tx(&tx, "TEST", "{}", 10, sk.as_ref()).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            s.admit_signing_key(a.clone(), false, None, 1_000).unwrap(),
+            KeyAdmission::BackfilledGenesis);
         assert_eq!(s.audit_key_ledger_active_id().unwrap().as_deref(), Some(kid(&a).as_str()));
     }
 
