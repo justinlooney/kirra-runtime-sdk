@@ -39,6 +39,7 @@ the verification passes for the target deployment.
 | AoU ID | Title | Owner | Status | Gates |
 |--------|-------|-------|--------|-------|
 | AOU-PERCEPTION-FRAME-001 | Upstream object velocity is absolute, map/world-frame | Integrator (perception) | **OPEN** | `KIRRA_PERCEPTION_DERATE_ENABLED` (PMON-003 D4 pre-enable gate) |
+| AOU-MSG-TOOLCHAIN-001 | ROS message toolchain codegens the full Autoware message set (no trimmed packages) | Integrator (build / toolchain) | **OPEN** | bench/vehicle ROS 2 build (KIRRA-OCCY-PMON-004 §8 constraint 1) |
 
 ---
 
@@ -139,3 +140,64 @@ assumption must never be allowed to drive (or fail to drive) a real actuator.
 - KIRRA-OCCY-PMON-003 §D4 — the pre-enable gate this AoU formalizes.
 - KIRRA-OCCY-PMON-002 — the cap-composition mechanism the derate feeds.
 - ADR-0004 — independent safety channel (Kirra checks perception output; builds none).
+
+---
+
+## AOU-MSG-TOOLCHAIN-001 — ROS message toolchain codegens the full Autoware message set
+
+### Assumption
+The deployment's ROS 2 message toolchain (the binding generator the adapter is built
+against) **generates bindings for the integrator's genuine, full Autoware message set** —
+in particular the complete `autoware_planning_msgs` (and the `autoware_common_msgs` it
+depends on) — **without** requiring any message package to be trimmed or stubbed.
+
+### Why it is load-bearing
+The adapter binds real Autoware messages (`autoware_planning_msgs::Trajectory`,
+`autoware_perception_msgs::PredictedObjects`, `autoware_control_msgs::Control`). If the
+toolchain cannot codegen a deployment's real message packages, the adapter cannot be built
+against the real interface — and any *workaround* that trims the message set changes the
+interface the safety function is integrated against. A safety function must run against the
+**genuine** deployment interface, not a reduced stand-in.
+
+### Evidence / origin (KIRRA-OCCY-PMON-004 §8 constraint 1, 2026-06-04)
+On the sub-gate-1 bench (Ubuntu 24.04 + ROS 2 Jazzy), `r2r = "=0.9.5"`'s binding generator
+(`r2r_msg_gen`) **panics** on Jazzy's full `autoware_planning_msgs` — specifically the route
+messages (`LaneletPrimitive`, the `ClearRoute` service) and `autoware_common_msgs/ResponseStatus`
+— and a **single** un-generatable type aborts the **entire** binding run (so even the
+`Trajectory` the adapter needs never generates). r2r's `IDL_PACKAGE_FILTER` is include-only
+with no nested-dependency resolution, so it cannot exclude a bad message inside a needed
+package.
+
+**Workaround used to run sub-gate 1 (DEV/SIM ONLY):** the apt `autoware_planning_msgs` was
+replaced with a trimmed overlay containing only `Trajectory` + `TrajectoryPoint` (verbatim
+official `.msg`). This unblocks the *mechanism + decode* validation on the bench but **must
+not** be carried into a real integration.
+
+### Scope
+- **In scope:** any bench/vehicle deployment that builds the adapter against the
+  integrator's real Autoware messages via r2r 0.9.5 (or whatever generator is in use).
+- This is a **build/toolchain** precondition, not a runtime assumption — it is discharged at
+  integration/build time, not per-cycle.
+
+### Verification status — **OPEN** (vehicle-tier precondition)
+A real bench/vehicle integration must build against the **full, untrimmed** message set.
+Resolution options (any one suffices; choose at integration time):
+- bump `r2r` off `=0.9.5` to a version that codegens these messages;
+- an upstream `r2r` / `r2r_msg_gen` fix (nested-dependency-aware filtering);
+- a **sanctioned** minimal-interface package agreed with the integrator (a deliberate,
+  reviewed interface contract — distinct from the ad-hoc bench trim).
+
+**The trimmed package is explicitly NOT an acceptable deployment artifact.** This item stays
+OPEN until the deployment builds against the genuine message set.
+
+### Consequence if violated
+The adapter is integrated against a **reduced** interface — messages/fields the real
+deployment carries are absent, so behavior on the real interface is unproven (and, worse,
+could mask a field the safety logic should see). The mechanism/decode evidence from the
+trimmed-package bench does not transfer to a full-interface deployment.
+
+### Cross-references
+- KIRRA-OCCY-PMON-004 §8 — the execution record where this constraint was observed.
+- KIRRA-OCCY-DEPLOY-001 — the Pacifica deployment architecture (bench/vehicle tiers this
+  precondition gates).
+- The adapter `README.md` — the `ros2` vs `lanelet2` build matrix and the dev-only trim note.

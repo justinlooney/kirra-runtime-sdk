@@ -63,6 +63,14 @@ A **synthetic `PredictedObjects` publisher** → the `ros2` adapter harness → 
 **(b)–(e)**. This is what **first exercises the CI-unreachable `parse_predicted_objects` +
 node slow-loop tick**. **Buildable now, no AWSIM dependency.**
 
+> **STATUS (2026-06-04): Layer-2 automated tests PASS on ROS 2 Jazzy.** The decode
+> boundary (`parse_predicted_objects` over a real r2r-generated `PredictedObjects`) is
+> exercised and green; the full node-tick over live DDS (`run_full_node_integration`)
+> remains the manual launch step. See §8 for the dated execution record + scope. Sub-gate 1
+> is **substantially but not fully** discharged (the manual node-tick step is outstanding),
+> sub-gate 2 is **pending**, AOU-PERCEPTION-FRAME-001 stays **OPEN**, and the flag stays
+> **OFF**.
+
 ### Sub-gate 2 — FRAME (deferred, gated on AWSIM)
 Scenario **(a)** — **real Autoware perception on AWSIM** (NOT AWSIM ground-truth objects:
 that bypasses the tracker and the very frame question). Its own subsequent step.
@@ -206,3 +214,84 @@ deployment** and records partial discharge of AOU-PERCEPTION-FRAME-001 (general 
 **Governor boundary:** the gate drives perception input and observes the gated command
 output — no tracker/associator/detector. Building perception in the harness would defeat the
 independence it validates.
+
+---
+
+## 8. Sub-gate 1 — Execution Record (2026-06-04, ROS 2 Jazzy)
+
+Attested bench run (not re-runnable in CI — there is no ros2 CI job; recorded here as a
+dated validation-log entry).
+
+### Environment
+- **Date:** 2026-06-04.
+- **Host:** Ubuntu 24.04 (Noble) + ROS 2 Jazzy; rustup stable; `r2r = "=0.9.5"`.
+- **Build:** `cargo build/test -p kirra-ros2-adapter --features ros2` on branch
+  `feat/ros2-feature-decouple-lanelet2` (PR #186, merged) — i.e. **WITHOUT** the `lanelet2`
+  feature, so no lanelet2 C++ corridor bridge in the build (the perception-governance path
+  only). PR #186's feature decouple is what made this build possible on Jazzy.
+
+### Result — `cargo test -p kirra-ros2-adapter --features ros2`
+- `tests/perception_mechanism_gate_ros2.rs` (**Layer 2**): **2 passed, 1 ignored**
+  - `parse_predicted_objects_roundtrips_all_scenarios` … **ok**
+  - `decoded_objects_produce_expected_caps` … **ok**
+  - `run_full_node_integration` … **ignored** (manual launch recipe; NOT executed)
+- `tests/perception_mechanism_gate.rs` (Layer 1): **8 passed**.
+- `tests/validation_tests.rs`: **14 passed**; lib unit + conformance suites: green.
+
+### DISCHARGED (be precise — do not overclaim)
+The **sub-gate-1 mechanism + decode boundary, in real ROS 2.** The two passing Layer-2
+tests prove that `parse_predicted_objects` correctly decodes a **real r2r-generated**
+`autoware_perception_msgs::PredictedObjects` into the adapter's `PerceivedObject`, and that
+the **decoded** objects drive the expected caps. This is the boundary Layer 1 (which starts
+from hand-built fixtures) structurally cannot reach: it confirms the CI-unreachable r2r
+decode path against a genuine message.
+
+### NOT discharged (unchanged status — stays as below)
+- **FRAME convention** — the test twists are **synthetic / chosen**, not real Autoware
+  output, so this proves the *mechanism + decode*, **not** that real Autoware emits absolute
+  map/world-frame twist. **AOU-PERCEPTION-FRAME-001 stays OPEN.**
+- **`KIRRA_PERCEPTION_DERATE_ENABLED` stays OFF** — sub-gate 2 is still pending.
+- **`run_full_node_integration`** (full node slow-loop tick over live DDS topics) was **NOT
+  run** — it remains the manual launch-recipe step (§4 of the harness file).
+- **Sub-gate 2** (frame confirm on AWSIM + real Autoware perception, GPU host) is
+  **unchanged / pending**.
+
+### Environment constraints observed (new — recorded for the bench/vehicle tiers)
+1. **r2r 0.9.5 cannot codegen Jazzy's full `autoware_planning_msgs`.** Its binding
+   generator (`r2r_msg_gen`) panics on the route messages (`LaneletPrimitive`, the
+   `ClearRoute` service) and on `autoware_common_msgs/ResponseStatus`, and a single
+   un-generatable type aborts the **entire** binding run — including the `Trajectory` the
+   adapter needs. r2r's `IDL_PACKAGE_FILTER` is include-only with no nested-dependency
+   resolution, so it cannot exclude a bad message inside a needed package.
+   - **Workaround used on the bench laptop (DEV/SIM ONLY):** replace the apt
+     `autoware_planning_msgs` with a trimmed overlay containing only `Trajectory` +
+     `TrajectoryPoint` (verbatim official `.msg`).
+   - **Deployment implication — TRACKED as a vehicle-tier precondition:** a real
+     bench/vehicle integration must carry the **genuine, full** `autoware_planning_msgs`, so
+     the r2r codegen limitation must be **resolved properly** (bump r2r off `=0.9.5` once it
+     handles these messages, an upstream r2r fix, or a sanctioned minimal-interface package)
+     — **NOT** by shipping the trimmed package. Recorded as **AOU-MSG-TOOLCHAIN-001** in
+     `ASSUMPTIONS_OF_USE.md` (OPEN).
+2. **The `lanelet2` C++ corridor bridge does not compile on Jazzy** — lanelet2's
+   serialization API differs from what `corridor/lanelet2_bridge.cpp` was written against
+   (`lanelet::LaneletMap` has no member `serialize`). **Out of scope for the perception
+   gate** — the `ros2`/`lanelet2` feature split (PR #186) isolates it — but a known
+   constraint for whenever the corridor bridge is needed on Jazzy. (Build note; see the
+   adapter `README.md`.)
+3. **The `lanelet2` C++ build also needs Eigen3** on the include path (`libeigen3-dev` + an
+   Eigen include dir); `build.rs` does not auto-discover Eigen. (Build note; see the adapter
+   `README.md`.)
+
+Constraints 2 and 3 are **build notes for the `lanelet2` feature only** and do not affect
+the `ros2` perception build that this record attests. Constraint 1 is the one with a
+deployment consequence and is tracked as an AoU.
+
+### Net status after this run
+| Item | Status |
+|------|--------|
+| Sub-gate 1 — decode boundary (Layer 2 automated) | **PASS** (ROS 2 Jazzy, 2026-06-04) |
+| Sub-gate 1 — full node tick (`run_full_node_integration`) | **outstanding** (manual launch) |
+| Sub-gate 2 — frame confirm (AWSIM) | **pending** |
+| AOU-PERCEPTION-FRAME-001 | **OPEN** (unchanged) |
+| `KIRRA_PERCEPTION_DERATE_ENABLED` | **OFF** (unchanged) |
+| AOU-MSG-TOOLCHAIN-001 (full-message-set / r2r codegen) | **OPEN** (new; vehicle-tier precondition) |
