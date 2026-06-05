@@ -71,20 +71,26 @@ bench reference does not transfer to a target running a different Autoware versi
 the per-target instance of SRAC-MSGSYNC-2, stated as a topology condition because each target
 is a distinct integration.)
 
-## 5. Verification status — **OPEN** (until Phase 2 lands + per target)
+## 5. Verification status — bench PASS recorded; per-target re-verify OPEN
 
 - The **scaffold** (packages, scripts, this SRAC) is in the repo (Phase 1).
-- The **verbatim `.msg` + the byte-identical verification + the build-against-curated proof**
-  (governor builds green + Layer-2 passes with only the curated subset on the path, no apt
-  Autoware packages, no trim) are the **Phase 2** laptop step — **outstanding**.
-- This SRAC stays **OPEN** until: (a) Phase 2 passes on the bench, **and** (b) it is
-  re-verified per deployment target (TOPO-2). `KIRRA_PERCEPTION_DERATE_ENABLED` is unaffected
-  by this item and stays default-OFF on its own gates.
+- **Phase 2 — DONE on the bench (2026-06-05, ROS 2 Jazzy):**
+  - `scripts/curated_interface/verify_hashes.sh` = **PASS** — all **8** curated `.msg`
+    byte-identical to the apt reference `ros-jazzy-autoware-{perception,planning,common}-msgs`
+    **1.11.0-1noble.20260412**. Wire compatibility (RIHS type hash) holds by construction.
+  - `cargo build/test -p kirra-ros2-adapter --features ros2` = **GREEN** against the curated
+    overlay with **NO full Autoware present** (no apt Autoware, no trim). Verdict path unchanged.
+- **Still OPEN: per-target re-verification (TOPO-2).** SRAC-MSGSYNC-1/2 must be re-passed
+  against whatever Autoware version each deployment target runs; the bench PASS does not
+  transfer to a target on a different Autoware version. `KIRRA_PERCEPTION_DERATE_ENABLED` is
+  unaffected by this item and stays default-OFF on its own gates.
 
-## 6. Relationship to AOU-MSG-TOOLCHAIN-001 (proposed; human decision)
+## 6. Relationship to AOU-MSG-TOOLCHAIN-001 (SUPERSEDES — owner decision 2026-06-05)
 
-The curated interface is a **candidate resolution** of AOU-MSG-TOOLCHAIN-001 but **reframes**
-the condition rather than satisfying it as written. See the proposal + flagged options in
-`ASSUMPTIONS_OF_USE.md` (AOU-MSG-TOOLCHAIN-001 → "Relationship to the curated interface").
-Until that decision is made, **AOU-MSG-TOOLCHAIN-001 stays OPEN** and this SRAC stands beside
-it (it does not auto-close it).
+This SRAC **supersedes the relevant scope of AOU-MSG-TOOLCHAIN-001** (owner decision
+2026-06-05, **option C**; see `ASSUMPTIONS_OF_USE.md` → AOU-MSG-TOOLCHAIN-001 "Resolution").
+AOU-MSG-TOOLCHAIN-001 is marked **SUPERSEDED — discharged for the isolated-governor topology
+(TOPO-1)** via this curated interface, with the §5 bench PASS as the dated discharge evidence
+under the TOPO-1/TOPO-2 conditions. The precise **residual** — a co-resident-with-full-Autoware
+r2r codegen topology, which the curated package avoids by topology but does not fix — is carried
+by the new **AOU-MSG-TOOLCHAIN-002 (OPEN)**, cross-referenced to the r2r-codegen track.
