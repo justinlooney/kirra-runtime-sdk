@@ -1,0 +1,18 @@
+[package]
+name = "kirra-capture-schema"
+version = "0.1.0"
+edition = "2021"
+description = "Wire schema for Kirra's learning-loop capture records — the single authoritative, governor-free type set shared by the SDK emitters and the offline collector."
+repository = "https://github.com/justinlooney/kirra-runtime-sdk"
+authors = ["Justin Looney <justin@kirrasystems.io>"]
+license = "MIT OR Apache-2.0"
+
+# §0 SAFETY BOUNDARY: this crate depends on `serde` ONLY. It carries no governor
+# types and no logic — just the leaf record shapes. The offline collector depends
+# on THIS crate (never on `kirra-runtime-sdk`), which is what mechanically
+# guarantees the collector cannot link or reach the verdict path.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"

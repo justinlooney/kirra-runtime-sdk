@@ -13,7 +13,7 @@
 # That separation keeps the ML inference pipeline (parko-core / parko-onnx /
 # parko-kirra) independent of the safety-kernel build.
 [workspace]
-members = [".", "crates/kirra-ros2-adapter"]
+members = [".", "crates/kirra-ros2-adapter", "crates/kirra-capture-schema"]
 resolver = "2"
 
 [package]
@@ -48,6 +48,9 @@ tpm = ["dep:tss-esapi"]
 
 [dependencies]
 parko-core = { path = "parko/crates/parko-core" }
+# Governor-free wire schema for capture records, shared verbatim with the offline
+# collector (docs/COLLECTOR_DESIGN.md [C1]). Re-exported by `crate::capture`.
+kirra-capture-schema = { path = "crates/kirra-capture-schema" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hmac = "0.12"

@@ -58,8 +58,8 @@ use kirra_runtime_sdk::gateway::perception_monitor::{
 // (bounded mpsc + spawn_blocking JSONL drain); DEFAULT OFF via
 // `KIRRA_CAPTURE_ENABLED`. Additive only — never on / altering the verdict.
 use kirra_runtime_sdk::capture::{
-    capture_enabled, spawn_capture_writer, CaptureRecord, PoseSnapshot,
-    TrajectoryCaptureExt, TrajectoryDecision,
+    capture_enabled, record_from_trajectory_verdict, spawn_capture_writer, CaptureRecord,
+    PoseSnapshot, TrajectoryCaptureExt, TrajectoryDecision,
 };
 
 /// Read the subscription staleness timeout (ms) from
@@ -462,7 +462,7 @@ pub async fn run_adapter(
                     last_pose: traj.points.last().map(pose_snap),
                     target_speed_mps: traj.points.last().map(|p| p.velocity_mps),
                 };
-                let rec = CaptureRecord::from_trajectory_verdict(
+                let rec = record_from_trajectory_verdict(
                     capture_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     now_ms,
                     decision,
