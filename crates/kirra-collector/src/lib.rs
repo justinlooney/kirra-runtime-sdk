@@ -1,0 +1,229 @@
+// crates/kirra-collector/src/lib.rs
+//
+// kirra-collector — the OFFLINE learning-loop collector (docs/COLLECTOR_DESIGN.md).
+// It reads the two dark capture JSONL streams, keeps every intervention while
+// sampling passes [D5], joins each kept record to a bus recording [D2], attaches
+// the doer's model version [D3], and writes a training-ready Parquet dataset [D4]
+// with a reconciliation report.
+//
+// §0 SAFETY BOUNDARY: this crate depends on `kirra-capture-schema` ONLY (plus
+// serde / arrow / parquet) — NEVER on `kirra-runtime-sdk`. It is offline,
+// out-of-vehicle, produces only a dataset, and is mechanically incapable of
+// linking or reaching the verdict path. `cargo tree -p kirra-collector` is the
+// enforced check.
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+
+use kirra_capture_schema::{CaptureOutcome, CaptureRecord, CaptureSource};
+
+pub mod bag;
+pub mod dataset;
+pub mod join;
+pub mod reconcile;
+pub mod sample;
+
+use bag::BagReader;
+use join::JoinOutcome;
+use reconcile::Reconciliation;
+
+/// Stable string token for a capture source — the partition value and join key.
+#[must_use]
+pub fn source_token(s: CaptureSource) -> &'static str {
+    match s {
+        CaptureSource::CommandGateway => "COMMAND_GATEWAY",
+        CaptureSource::SlowLoopTrajectory => "SLOW_LOOP_TRAJECTORY",
+    }
+}
+
+/// Stable string token for an outcome — the dataset's training label. Matches the
+/// schema crate's SCREAMING_SNAKE serde rename so labels are consistent on disk.
+#[must_use]
+pub fn outcome_token(o: CaptureOutcome) -> &'static str {
+    match o {
+        CaptureOutcome::Allow => "ALLOW",
+        CaptureOutcome::ClampLinear => "CLAMP_LINEAR",
+        CaptureOutcome::ClampSteering => "CLAMP_STEERING",
+        CaptureOutcome::Deny => "DENY",
+    }
+}
+
+/// Collector run configuration (the CLI flags, or a test's choices).
+#[derive(Debug, Clone)]
+pub struct CollectorConfig {
+    /// Pass-sampling rate in [0, 1]; 1.0 keeps every pass [D5].
+    pub pass_rate: f64,
+    /// Join window (± ms) around each record's `t_wall_ms` [D2].
+    pub window_ms: u64,
+    /// Fail the run if the orphan rate exceeds this (data-quality gate).
+    pub max_orphan_rate: f64,
+    /// Output dataset root; partitions are written beneath it.
+    pub out_dir: PathBuf,
+}
+
+/// Errors the collector can fail with.
+#[derive(Debug)]
+pub enum CollectorError {
+    Io(std::io::Error),
+    Arrow(arrow::error::ArrowError),
+    Parquet(parquet::errors::ParquetError),
+    /// The orphan rate exceeded `max_orphan_rate`. The dataset was still written;
+    /// the reconciliation is carried so the caller can report it.
+    OrphanRateExceeded { recon: Box<Reconciliation>, max: f64 },
+}
+
+impl std::fmt::Display for CollectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CollectorError::Io(e) => write!(f, "io error: {e}"),
+            CollectorError::Arrow(e) => write!(f, "arrow error: {e}"),
+            CollectorError::Parquet(e) => write!(f, "parquet error: {e}"),
+            CollectorError::OrphanRateExceeded { recon, max } => write!(
+                f,
+                "orphan rate {:.3} exceeds ceiling {:.3} ({} of {} kept records unjoined)",
+                recon.orphan_rate, max, recon.orphans, recon.kept_after_sampling
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CollectorError {}
+
+/// Read capture records from one or more JSONL files. Blank lines are skipped;
+/// malformed lines are logged to stderr and skipped (a single bad line never
+/// aborts a whole session's ingest).
+pub fn read_jsonl(paths: &[PathBuf]) -> std::io::Result<Vec<CaptureRecord>> {
+    let mut out = Vec::new();
+    for path in paths {
+        let file = File::open(path)?;
+        for (lineno, line) in BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<CaptureRecord>(&line) {
+                Ok(rec) => out.push(rec),
+                Err(e) => eprintln!(
+                    "warn: skipping malformed capture line {}:{}: {e}",
+                    path.display(),
+                    lineno + 1
+                ),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Deduplicate by `(source, decision_seq)` (the primary key [D2]) and return a
+/// stably-ordered vec plus the count of duplicates dropped. First occurrence
+/// wins; BTreeMap gives a deterministic `(source, decision_seq)` ordering so the
+/// dataset is reproducible.
+#[must_use]
+pub fn index_dedup(records: Vec<CaptureRecord>) -> (Vec<CaptureRecord>, usize) {
+    let mut map: BTreeMap<(&'static str, u64), CaptureRecord> = BTreeMap::new();
+    let mut duplicates = 0usize;
+    for rec in records {
+        let key = (source_token(rec.source), rec.decision_seq);
+        if map.contains_key(&key) {
+            duplicates += 1;
+            continue;
+        }
+        map.insert(key, rec);
+    }
+    (map.into_values().collect(), duplicates)
+}
+
+/// The whole pipeline: dedup → stratified sample → join → write Parquet →
+/// reconcile. Writes the dataset under `cfg.out_dir` and returns the
+/// reconciliation. Fails (after writing) if the orphan rate exceeds the ceiling.
+pub fn run(
+    records: Vec<CaptureRecord>,
+    bag: &dyn BagReader,
+    cfg: &CollectorConfig,
+) -> Result<Reconciliation, CollectorError> {
+    let (deduped, duplicates_dropped) = index_dedup(records);
+
+    let mut recon = Reconciliation {
+        records_in: deduped.len(),
+        duplicates_dropped,
+        records_in_command_gateway: 0,
+        records_in_slow_loop_trajectory: 0,
+        interventions_in: 0,
+        passes_in: 0,
+        kept_after_sampling: 0,
+        interventions_kept: 0,
+        passes_kept: 0,
+        joined: 0,
+        orphans: 0,
+        applied_pass_rate: cfg.pass_rate,
+        orphan_rate: 0.0,
+    };
+
+    let mut rows = Vec::new();
+    for rec in &deduped {
+        match rec.source {
+            CaptureSource::CommandGateway => recon.records_in_command_gateway += 1,
+            CaptureSource::SlowLoopTrajectory => recon.records_in_slow_loop_trajectory += 1,
+        }
+        let intervention = sample::is_intervention(rec);
+        if intervention {
+            recon.interventions_in += 1;
+        } else {
+            recon.passes_in += 1;
+        }
+
+        if !sample::keep(rec, cfg.pass_rate) {
+            continue;
+        }
+        recon.kept_after_sampling += 1;
+        if intervention {
+            recon.interventions_kept += 1;
+        } else {
+            recon.passes_kept += 1;
+        }
+
+        match join::join_record(rec, bag, cfg.window_ms) {
+            JoinOutcome::Joined(m) => {
+                recon.joined += 1;
+                rows.push(dataset::build_row(rec, &m));
+            }
+            JoinOutcome::Orphan => recon.orphans += 1,
+        }
+    }
+
+    dataset::write_dataset(&rows, &cfg.out_dir)?;
+    recon.orphan_rate = recon.orphan_rate();
+
+    if recon.orphan_rate > cfg.max_orphan_rate {
+        return Err(CollectorError::OrphanRateExceeded {
+            recon: Box::new(recon),
+            max: cfg.max_orphan_rate,
+        });
+    }
+    Ok(recon)
+}
+
+/// Convenience: list the part files under a dataset root (sorted), for callers
+/// that want to enumerate what was written.
+pub fn list_parquet_parts(out_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut parts = Vec::new();
+    fn walk(dir: &Path, parts: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                walk(&path, parts)?;
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                parts.push(path);
+            }
+        }
+        Ok(())
+    }
+    walk(out_dir, &mut parts)?;
+    parts.sort();
+    Ok(parts)
+}
