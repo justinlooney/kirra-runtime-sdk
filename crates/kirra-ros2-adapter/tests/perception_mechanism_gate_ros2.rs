@@ -24,12 +24,17 @@
 // r2r message DECODE (half the CI-unreachable wiring) and reuses the same pure
 // pipeline + expected caps as Layer 1.
 //
-// LAUNCH-DOCUMENTED HERE (not a cargo assertion — needs a live node graph): the
-// full slow-loop tick. See `run_full_node_integration` (ignored) + the recipe in
-// its doc comment: launch `kirra_ros2_adapter_node`, set
-// KIRRA_PERCEPTION_DERATE_ENABLED=1, publish each scenario's PredictedObjects (+
-// a trajectory) with `publish_fixture_objects`, and observe the emitted gated
-// `~/output/control_cmd` matches the Layer-1 expected cap for that scenario.
+// AUTOMATED HERE (a real ros2 cargo test, gated `#[ignore]` for the live node
+// graph): the full slow-loop tick. `run_full_node_integration` spawns
+// `run_adapter` over real DDS, publishes each scenario's PredictedObjects (+ a
+// trajectory + odom) on the adapter's resolved `~/input/*` topics, and reads the
+// slow loop's `TrajectoryVerdict` from the SHARED `AdaptorState` — asserting
+// plausible→Accept and implausible/stale→Clamp with the derate enabled (and
+// every scenario→Accept with it OFF, the negative control). Run it with
+// `-- --ignored` on a ROS-sourced dev box (recipe in its doc comment). The node
+// publishes no output topic yet (Phase 4), so the shared state slot — not a
+// `~/output/control_cmd` message — is the observation point; the exact graded m/s
+// cap stays a Layer-1 assertion.
 // ====================================================================
 //
 // SCOPE (restated): the synthetic twists are values WE choose, so a green Layer 2
@@ -137,35 +142,224 @@ fn decoded_objects_produce_expected_caps() {
     }
 }
 
-// --- LAUNCH-DOCUMENTED: full node slow-loop tick (needs a live ROS 2 graph) ---
+// --- AUTOMATED: full node slow-loop tick over LIVE DDS (ros2; #[ignore]) ---
 
-/// FULL INTEGRATION — the node slow-loop tick end-to-end. NOT a self-contained
-/// cargo assertion: it needs a running `kirra_ros2_adapter_node`, a synthetic
-/// publisher, and an observer on the output topic. Marked `#[ignore]`; run it as
-/// a guided manual/launch procedure (or wire it into a ROS 2 launch_test):
-///
-///   1. Build + launch the adapter node (mock corridor; perception ON):
-///        KIRRA_PERCEPTION_DERATE_ENABLED=1 \
-///        cargo run -p kirra-ros2-adapter --features ros2 \
-///            --bin kirra_ros2_adapter_node -- --corridor-source mock
-///   2. Publish a steady trajectory on `~/input/trajectory` (≥ 2 poses, e.g.
-///      a straight line at the test speed) at planning rate (~10 Hz).
-///   3. For each scenario, publish `fixture_to_predicted_objects(&scenario_*())`
-///      on `~/input/objects` at sensor rate. For scenario (d), STOP publishing
-///      after a few cycles and wait > ttl (500 ms).
-///   4. Observe the emitted gated command on `~/output/control_cmd` and assert
-///      it matches the Layer-1 expectation for that scenario:
-///        (b) unchanged vs the perception-OFF baseline run;
-///        (c1) controlled stop (MRC);  (c2) clamped to 16.7625 m/s;
-///        (d) controlled stop after the stream goes silent;
-///        (e) re-run with the env var UNSET → byte-identical to the OFF baseline.
-///   This is the only step that exercises the node slow-loop tick
-///   (publish_perception_tick → resolve_perception_cap → validate_trajectory_slow_capped
-///   inside run_adapter); the round-trip tests above cover only the decode.
-#[test]
-#[ignore = "full node graph + synthetic publisher + topic observer; run via the launch recipe in the doc comment"]
-fn run_full_node_integration() {
-    // Intentionally a placeholder for the launch-driven procedure above. A
-    // future ROS 2 launch_test (or an r2r in-process publisher + a subscription
-    // on ~/output/control_cmd around `run_adapter`) would automate steps 1-4.
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use kirra_ros2_adapter::corridor::{CorridorSource, MockCorridorSource};
+use kirra_ros2_adapter::node::run_adapter;
+use kirra_ros2_adapter::perception_ingest::perception_derate_enabled;
+use kirra_ros2_adapter::state::{AdaptorState, TrajectoryVerdict};
+
+/// Adapter node name + namespace the harness publishes INTO. `run_adapter`
+/// creates the node in namespace `"kirra"`; the harness picks the name, so the
+/// adapter's relative `~/input/*` topics resolve to `/kirra/<NODE_NAME>/input/*`
+/// and the harness publishes on those fully-qualified names (G4).
+const NODE_NAME: &str = "pmon004_subgate1";
+const NS: &str = "kirra";
+
+/// Commanded trajectory speed. Chosen so the perception cap is the ONLY actor:
+///   < NOMINAL_CAP_MPS (22.35)  → plausible objects ⇒ Accept (no derate)
+///   > C2_GRADED_CAP_MPS (16.7625) and > MRC_FLOOR_CAP_MPS (0.0)
+///                              → implausible / stale ⇒ per-pose ClampLinear ⇒ Clamp
+const TRAJ_SPEED_MPS: f64 = 20.0;
+
+fn input_topic(leaf: &str) -> String {
+    format!("/{NS}/{NODE_NAME}/input/{leaf}")
 }
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A 3-pose straight trajectory at x = 60, 62, 64 (inside the 0..100 × ±5 m mock
+/// corridor → containment passes) and AHEAD of every fixture object (x ≤ 40), so
+/// each object is behind ego (`dx_ego ≤ 0`) and RSS is skipped — leaving the
+/// perception cap as the only thing that can change the verdict.
+fn build_trajectory_msg() -> r2r::autoware_planning_msgs::msg::Trajectory {
+    use r2r::autoware_planning_msgs::msg::{Trajectory, TrajectoryPoint};
+    let points = (0..3)
+        .map(|i| {
+            let mut pt = TrajectoryPoint::default();
+            pt.pose.position.x = 60.0 + 2.0 * i as f64;
+            pt.pose.position.y = 0.0;
+            pt.pose.orientation.w = 1.0; // identity → yaw 0
+            pt.longitudinal_velocity_mps = TRAJ_SPEED_MPS as f32;
+            pt.time_from_start.sec = 0;
+            pt.time_from_start.nanosec = (i as u32) * 100_000_000; // 0, 0.1, 0.2 s
+            pt
+        })
+        .collect();
+    Trajectory { points, ..Default::default() }
+}
+
+/// Ego odom at the trajectory speed, zero yaw-rate (→ derived current steering 0,
+/// so the per-pose kinematics isolate the velocity ceiling).
+fn build_odom_msg() -> r2r::nav_msgs::msg::Odometry {
+    let mut o = r2r::nav_msgs::msg::Odometry::default();
+    o.twist.twist.linear.x = TRAJ_SPEED_MPS;
+    o.twist.twist.angular.z = 0.0;
+    o
+}
+
+/// Publish trajectory + odom (+ optional objects) at ~20 Hz and poll the SHARED
+/// `AdaptorState` slot for `"ego"` until its fail-closed verdict equals `want`, or
+/// fail after a bounded timeout. `settle_before_ms` lets scenario (d) wait past
+/// the perception TTL so previously-published objects go stale.
+#[allow(clippy::too_many_arguments)]
+async fn drive_until(
+    state: &Arc<AdaptorState>,
+    traj_pub: &r2r::Publisher<r2r::autoware_planning_msgs::msg::Trajectory>,
+    odom_pub: &r2r::Publisher<r2r::nav_msgs::msg::Odometry>,
+    obj_pub: &r2r::Publisher<r2r::autoware_perception_msgs::msg::PredictedObjects>,
+    objects: Option<&r2r::autoware_perception_msgs::msg::PredictedObjects>,
+    want: TrajectoryVerdict,
+    settle_before_ms: u64,
+    label: &str,
+) {
+    let traj = build_trajectory_msg();
+    let odom = build_odom_msg();
+    if settle_before_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(settle_before_ms)).await;
+    }
+    // 8 s covers first-scenario DDS discovery + the slow-loop period; later
+    // scenarios are warm.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last = TrajectoryVerdict::MRCFallback;
+    while Instant::now() < deadline {
+        let _ = traj_pub.publish(&traj);
+        let _ = odom_pub.publish(&odom);
+        if let Some(o) = objects {
+            let _ = obj_pub.publish(o);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Read the slow loop's installed verdict for "ego" (the node's traj
+        // drain stamps that asset id). `current_verdict` collapses a stale slot
+        // to MRCFallback, so we publish fast enough (<200 ms) to keep it fresh.
+        last = state.current_verdict("ego", now_ms());
+        if last == want {
+            return;
+        }
+    }
+    panic!("scenario [{label}]: expected {want:?} within 8 s; last observed {last:?}");
+}
+
+/// FULL INTEGRATION — the node slow-loop tick end-to-end over LIVE DDS, AUTOMATED.
+/// Spawns `run_adapter` (its own r2r node) sharing an `Arc<AdaptorState>` with the
+/// harness, publishes each scenario's inputs on the adapter's resolved
+/// `~/input/{objects,trajectory,odometry}` topics, and asserts the slow loop's
+/// `TrajectoryVerdict` (read from the shared state) responds to the perception
+/// derate. This exercises the CI-unreachable wiring:
+///   subscriptions → drain tasks → slow loop → publish_perception_tick →
+///   resolve_perception_cap → validate_trajectory_slow_capped → update_trajectory.
+///
+/// Still `#[ignore]` (needs a live ROS 2 graph; not for `cargo test`); run it on a
+/// dev box with ROS sourced + the Autoware msgs discoverable:
+///
+///   source /opt/ros/${ROS_DISTRO}/setup.bash
+///   # derate ON (asserts plausible→Accept, implausible/stale→Clamp):
+///   KIRRA_PERCEPTION_DERATE_ENABLED=1 cargo test -p kirra-ros2-adapter \
+///       --features ros2 --test perception_mechanism_gate_ros2 -- --ignored
+///   # negative control, derate OFF (env unset → every scenario Accepts):
+///   cargo test -p kirra-ros2-adapter --features ros2 \
+///       --test perception_mechanism_gate_ros2 -- --ignored
+///
+/// SCOPE: this proves the derate MECHANISM is live through the node (plausible vs
+/// implausible discrimination + the ON/OFF delta). The verdict is coarse
+/// (Accept / Clamp / MRCFallback), so it does NOT pin the exact graded cap (c1's
+/// 0.0 vs c2's 16.7625) — those exact m/s caps stay a Layer-1 assertion
+/// (`decoded_objects_produce_expected_caps`). It also says NOTHING about whether
+/// real Autoware emits absolute map-frame twist: that is sub-gate 2 (AWSIM),
+/// AOU-PERCEPTION-FRAME-001 stays OPEN, and KIRRA_PERCEPTION_DERATE_ENABLED stays
+/// OFF in production. Governor boundary: the harness only publishes and reads
+/// shared state — it builds no perception and never touches the decision logic.
+#[test]
+#[ignore = "live ROS 2 node graph over real DDS; run via `-- --ignored` on a ROS-sourced dev box (see doc comment)"]
+fn run_full_node_integration() {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_full_node_integration_async());
+}
+
+async fn run_full_node_integration_async() {
+    // INV-4: the derate is enabled ONLY by the process env (the run recipe
+    // exports it); we READ it here, never `set_var`. The node reads the same env
+    // internally, so the harness expectation and the node behaviour agree.
+    let derate_on = perception_derate_enabled();
+
+    // 1) Spawn the adapter node, sharing the AdaptorState so we can observe the
+    //    slow-loop verdict (the node publishes no output topic — Phase 4 — so the
+    //    shared slot is the observation point).
+    let state = AdaptorState::new();
+    let corridor: Arc<dyn CorridorSource> =
+        Arc::new(MockCorridorSource::straight_5m_half_width(100.0));
+    let adapter_state = Arc::clone(&state);
+    let adapter = tokio::spawn(async move {
+        let _ = run_adapter(adapter_state, corridor, NODE_NAME).await;
+    });
+
+    // 2) Harness publisher node (its own r2r context → real DDS to the adapter).
+    let ctx = r2r::Context::create().expect("harness r2r context");
+    let mut node = r2r::Node::create(ctx, "pmon004_harness", NS).expect("harness node");
+    let traj_pub = node
+        .create_publisher::<r2r::autoware_planning_msgs::msg::Trajectory>(
+            &input_topic("trajectory"),
+            r2r::QosProfile::default(),
+        )
+        .expect("trajectory publisher");
+    let obj_pub = node
+        .create_publisher::<r2r::autoware_perception_msgs::msg::PredictedObjects>(
+            &input_topic("objects"),
+            r2r::QosProfile::default(),
+        )
+        .expect("objects publisher");
+    let odom_pub = node
+        .create_publisher::<r2r::nav_msgs::msg::Odometry>(
+            &input_topic("odometry"),
+            r2r::QosProfile::default(),
+        )
+        .expect("odometry publisher");
+
+    let objs_b = fixture_to_predicted_objects(&scenario_b());
+    let objs_c1 = fixture_to_predicted_objects(&scenario_c1());
+    let objs_c2 = fixture_to_predicted_objects(&scenario_c2());
+
+    if derate_on {
+        // (b) PLAUSIBLE → no derate → trajectory accepted at 20 m/s.
+        drive_until(&state, &traj_pub, &odom_pub, &obj_pub, Some(&objs_b),
+            TrajectoryVerdict::Accept, 0, "b plausible → Accept").await;
+        // (c1) SINGLE IMPLAUSIBLE → MRC-floor cap (0.0) → per-pose clamp → Clamp.
+        drive_until(&state, &traj_pub, &odom_pub, &obj_pub, Some(&objs_c1),
+            TrajectoryVerdict::Clamp, 0, "c1 single-implausible → derated (Clamp)").await;
+        // (c2) GRADED (1-of-10) → cap 16.7625 < 20 → per-pose clamp → Clamp.
+        drive_until(&state, &traj_pub, &odom_pub, &obj_pub, Some(&objs_c2),
+            TrajectoryVerdict::Clamp, 0, "c2 graded → derated (Clamp)").await;
+        // (d) SILENT → objects go stale past the TTL → swept to the MRC-floor cap
+        //     → Clamp. Settle > TTL_MS so the prior (c2) objects are stale, then
+        //     publish NO objects.
+        drive_until(&state, &traj_pub, &odom_pub, &obj_pub, None,
+            TrajectoryVerdict::Clamp, TTL_MS + 200, "d silent → staleness → derated (Clamp)").await;
+    } else {
+        // NEGATIVE CONTROL (#159-style): derate OFF → the cap is never applied, so
+        // every scenario — plausible OR implausible — accepts at 20 m/s. The
+        // ON-vs-OFF delta is the evidence the mechanism is what changed the verdict.
+        for (objs, label) in [
+            (&objs_b, "b (derate OFF) → Accept"),
+            (&objs_c1, "c1 (derate OFF) → Accept"),
+            (&objs_c2, "c2 (derate OFF) → Accept"),
+        ] {
+            drive_until(&state, &traj_pub, &odom_pub, &obj_pub, Some(objs),
+                TrajectoryVerdict::Accept, 0, label).await;
+        }
+    }
+
+    // Clean shutdown: stop the adapter task (run_adapter spins forever — there is
+    // no shutdown channel yet, Phase 4 — so abort is the clean exit), then drop
+    // the harness node.
+    adapter.abort();
+    let _ = adapter.await;
+}
+

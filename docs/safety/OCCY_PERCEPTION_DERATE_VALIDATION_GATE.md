@@ -63,13 +63,19 @@ A **synthetic `PredictedObjects` publisher** → the `ros2` adapter harness → 
 **(b)–(e)**. This is what **first exercises the CI-unreachable `parse_predicted_objects` +
 node slow-loop tick**. **Buildable now, no AWSIM dependency.**
 
-> **STATUS (2026-06-04): Layer-2 automated tests PASS on ROS 2 Jazzy.** The decode
-> boundary (`parse_predicted_objects` over a real r2r-generated `PredictedObjects`) is
-> exercised and green; the full node-tick over live DDS (`run_full_node_integration`)
-> remains the manual launch step. See §8 for the dated execution record + scope. Sub-gate 1
-> is **substantially but not fully** discharged (the manual node-tick step is outstanding),
-> sub-gate 2 is **pending**, AOU-PERCEPTION-FRAME-001 stays **OPEN**, and the flag stays
-> **OFF**.
+> **STATUS: Layer-2 automated tests PASS on ROS 2 Jazzy (decode boundary,
+> 2026-06-04).** The full node-tick over live DDS (`run_full_node_integration`) is
+> now an **automated `#[ignore]` test** (run via `-- --ignored` on a ROS-sourced
+> dev box) rather than a manual launch recipe: it spawns `run_adapter` over real
+> DDS, drives each scenario's inputs, and asserts the slow-loop `TrajectoryVerdict`
+> (read from the shared `AdaptorState`) — plausible→`Accept`, implausible/stale→
+> `Clamp`, and every scenario→`Accept` with the derate OFF (negative control). It
+> proves the derate **mechanism** is live through the node; it does **not** pin the
+> exact graded m/s cap (the verdict is coarse — that stays the Layer-1 assertion),
+> and it says **nothing** about real-Autoware frame correctness. Sub-gate 1 is now
+> **discharged** (both the decode boundary and the node-tick are executable tests);
+> sub-gate 2 is **pending**, AOU-PERCEPTION-FRAME-001 stays **OPEN**, and the flag
+> stays **OFF**.
 
 ### Sub-gate 2 — FRAME (deferred, gated on AWSIM)
 Scenario **(a)** — **real Autoware perception on AWSIM** (NOT AWSIM ground-truth objects:
@@ -234,7 +240,10 @@ dated validation-log entry).
 - `tests/perception_mechanism_gate_ros2.rs` (**Layer 2**): **2 passed, 1 ignored**
   - `parse_predicted_objects_roundtrips_all_scenarios` … **ok**
   - `decoded_objects_produce_expected_caps` … **ok**
-  - `run_full_node_integration` … **ignored** (manual launch recipe; NOT executed)
+  - `run_full_node_integration` … **`#[ignore]`** — now an **automated live-DDS
+    harness** (spawns `run_adapter`, drives inputs, asserts the slow-loop
+    `TrajectoryVerdict` from shared state); run via `-- --ignored` on a ROS-sourced
+    dev box. Its dated green result on the dev box is recorded by the operator run.
 - `tests/perception_mechanism_gate.rs` (Layer 1): **8 passed**.
 - `tests/validation_tests.rs`: **14 passed**; lib unit + conformance suites: green.
 
@@ -251,8 +260,11 @@ decode path against a genuine message.
   output, so this proves the *mechanism + decode*, **not** that real Autoware emits absolute
   map/world-frame twist. **AOU-PERCEPTION-FRAME-001 stays OPEN.**
 - **`KIRRA_PERCEPTION_DERATE_ENABLED` stays OFF** — sub-gate 2 is still pending.
-- **`run_full_node_integration`** (full node slow-loop tick over live DDS topics) was **NOT
-  run** — it remains the manual launch-recipe step (§4 of the harness file).
+- **`run_full_node_integration`** is now an **automated `#[ignore]` test** (no longer a
+  manual recipe), but its assertion is **verdict-level** — `TrajectoryVerdict` from the
+  shared `AdaptorState` (plausible→`Accept`, implausible/stale→`Clamp`) — because the node
+  emits no output topic yet (Phase 4). It does **not** pin the exact graded m/s cap (0.0 vs
+  16.7625); that stays the Layer-1 assertion. The mechanism-vs-frame caveat below is unchanged.
 - **Sub-gate 2** (frame confirm on AWSIM + real Autoware perception, GPU host) is
   **unchanged / pending**.
 
@@ -290,7 +302,7 @@ deployment consequence and is tracked as an AoU.
 | Item | Status |
 |------|--------|
 | Sub-gate 1 — decode boundary (Layer 2 automated) | **PASS** (ROS 2 Jazzy, 2026-06-04) |
-| Sub-gate 1 — full node tick (`run_full_node_integration`) | **outstanding** (manual launch) |
+| Sub-gate 1 — full node tick (`run_full_node_integration`) | **automated** (`--ignored` live-DDS test; verdict-level, exact cap stays Layer-1) |
 | Sub-gate 2 — frame confirm (AWSIM) | **pending** |
 | AOU-PERCEPTION-FRAME-001 | **OPEN** (unchanged) |
 | `KIRRA_PERCEPTION_DERATE_ENABLED` | **OFF** (unchanged) |
