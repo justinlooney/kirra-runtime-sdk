@@ -2,9 +2,8 @@
 
 The collector is the **offline** Linux tool that turns the two dark capture
 streams + a recording of the bus into a versioned training dataset. It closes the
-gap between "Kirra emits corrective-supervision records" (Phase 1 on `main`;
-Phase 1.5 pending merge — see note below) and "the doer's models get retrained"
-(downstream).
+gap between "Kirra emits corrective-supervision records" (Phase 1 + 1.5 on `main`)
+and "the doer's models get retrained" (downstream).
 
 It is the first place the capture-spec §6 decisions actually bind, plus one the
 spec didn't list (where the collector lives / what language).
@@ -12,12 +11,11 @@ spec didn't list (where the collector lives / what language).
 > **Status (2026-06-06):** D1–D6 below are **CONFIRMED** (owner sign-off). This
 > doc is the design of record the build prompt elaborates from.
 
-> **Source-stream note:** the collector's two-stream design assumes both emit
-> points exist. **Phase 1** (`COMMAND_GATEWAY` records) is merged to `main`
-> (#191). **Phase 1.5** (`SLOW_LOOP_TRAJECTORY` records, the ROS 2 adapter
-> slow-loop emit) is implemented and pushed on `feat/capture-phase1_5-trajectory`
-> but **not yet merged**. The collector's `SLOW_LOOP_TRAJECTORY` path only has
-> records to consume once 1.5 lands on `main`.
+> **Source-stream note:** both emit points exist on `main`. **Phase 1**
+> (`COMMAND_GATEWAY` records) merged via #191; **Phase 1.5**
+> (`SLOW_LOOP_TRAJECTORY` records — the ROS 2 adapter slow-loop emit) merged via
+> #192 (`from_trajectory_verdict` + `CaptureSource::SlowLoopTrajectory` live in
+> `src/capture.rs`). The collector can safely assume both streams exist on `main`.
 
 ---
 
@@ -156,5 +154,4 @@ D4 Parquet + bulk-ref ✓  D5 stratified, bench `pass_rate=1.0` ✓
 D6 **Rust, in-repo** ✓  (owner sign-off 2026-06-06)
 
 Open follow-ups, tracked but non-blocking:
-- Land Phase 1.5 on `main` so `SLOW_LOOP_TRAJECTORY` records exist there.
 - Gateway-record asset/instance id, *iff* multi-asset comes into scope (D2 sharpening).
