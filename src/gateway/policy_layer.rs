@@ -258,7 +258,7 @@ pub async fn enforce_actuator_safety_envelope(
     // emit): the `KIRRA_CAPTURE_ENABLED` env decides INSTALLATION at startup, so
     // default-off / tests → `get()` is `None` → pure no-op (INV-3).
     if let Some(tx) = svc.app.capture_writer_tx.get() {
-        let rec = crate::capture::CaptureRecord::from_verdict(
+        let rec = crate::capture::record_from_verdict(
             svc.app
                 .capture_decision_seq
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
