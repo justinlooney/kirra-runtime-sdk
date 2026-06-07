@@ -96,3 +96,254 @@ impl BagReader for InMemoryBag {
             .collect()
     }
 }
+
+/// Errors from opening a real rosbag2 bag.
+#[derive(Debug)]
+pub enum BagError {
+    /// Failed to open the sqlite file or run the topic-resolution query.
+    Open(rusqlite::Error),
+    /// The requested join topic is not present in the bag's `topics` table.
+    TopicNotFound(String),
+}
+
+impl std::fmt::Display for BagError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BagError::Open(e) => write!(f, "opening rosbag2 db3: {e}"),
+            BagError::TopicNotFound(t) => write!(f, "join topic not found in bag: {t}"),
+        }
+    }
+}
+
+impl std::error::Error for BagError {}
+
+/// Real rosbag2 sqlite3 (`.db3`) backend [C2].
+///
+/// This reads the bag's `topics`/`messages` tables and indexes the join topic
+/// by message timestamp — it does NOT deserialize the CDR payloads
+/// (docs/COLLECTOR_DESIGN.md [D4]: reference the heavy frames, never copy or
+/// decode them). Consequently it populates `t_wall_ms`, the run's `doer_version`
+/// [D3], and a `bulk_ref` (`uri#topic@stamp_ns`); the [D2] cross-check keys
+/// (`asset_id`/`trajectory_id`/`objects_ms`) are left `None`, which the join
+/// treats as "not asserted" (it never vetoes — see `join::keys_agree`). Richer
+/// cross-check stamping requires the doer to emit a structured bus-index topic,
+/// deferred to [C2b]. MCAP is a separate follow-up.
+pub struct Db3BagReader {
+    uri: String,
+    topic: String,
+    conn: rusqlite::Connection,
+    topic_id: i64,
+    doer_version: String,
+}
+
+impl Db3BagReader {
+    /// Open a rosbag2 `.db3` read-only and resolve the join `topic` to its id.
+    /// `doer_version` is supplied out-of-band (one recording == one doer build);
+    /// it can't be read without decoding the payload, which we deliberately don't.
+    pub fn open(
+        path: &std::path::Path,
+        topic: &str,
+        doer_version: impl Into<String>,
+    ) -> Result<Self, BagError> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(BagError::Open)?;
+        let topic_id: i64 = conn
+            .query_row("SELECT id FROM topics WHERE name = ?1", [topic], |r| r.get(0))
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => BagError::TopicNotFound(topic.to_string()),
+                other => BagError::Open(other),
+            })?;
+        Ok(Self {
+            uri: path.display().to_string(),
+            topic: topic.to_string(),
+            conn,
+            topic_id,
+            doer_version: doer_version.into(),
+        })
+    }
+}
+
+impl BagReader for Db3BagReader {
+    fn bag_uri(&self) -> &str {
+        &self.uri
+    }
+
+    fn messages_in_window(&self, t_wall_ms: u64, window_ms: u64) -> Vec<BusMessage> {
+        // rosbag2 stamps are nanoseconds; the join window is milliseconds. Mirror
+        // InMemoryBag's inclusive [t-window, t+window] ms window (the +999_999
+        // covers the whole upper millisecond).
+        let lo_ns = t_wall_ms.saturating_sub(window_ms).saturating_mul(1_000_000);
+        let hi_ns = t_wall_ms
+            .saturating_add(window_ms)
+            .saturating_mul(1_000_000)
+            .saturating_add(999_999);
+        let mut stmt = match self.conn.prepare(
+            "SELECT timestamp FROM messages WHERE topic_id = ?1 AND timestamp BETWEEN ?2 AND ?3",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        // The trait signature is infallible (Vec); a query error degrades to an
+        // empty window -> the record becomes an ORPHAN, surfaced by reconciliation
+        // rather than silently lost. `open()` already validated topic + handle.
+        let rows = stmt.query_map(
+            rusqlite::params![self.topic_id, lo_ns as i64, hi_ns as i64],
+            |r| r.get::<_, i64>(0),
+        );
+        let Ok(rows) = rows else { return Vec::new() };
+        rows.flatten()
+            .map(|ts| {
+                let ts_ns = ts as u64;
+                BusMessage {
+                    t_wall_ms: ts_ns / 1_000_000,
+                    doer_version: self.doer_version.clone(),
+                    asset_id: None,
+                    trajectory_id: None,
+                    objects_ms: None,
+                    bulk_ref: format!("{}#{}@{}", self.uri, self.topic, ts_ns),
+                }
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod db3_tests {
+    use super::*;
+
+    // Build a faithful synthetic rosbag2 db3 (core schema + the extra Jazzy
+    // `type_description_hash` column, to prove the reader doesn't depend on it).
+    fn make_bag(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE topics(
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL,
+                serialization_format TEXT NOT NULL, offered_qos_profiles TEXT NOT NULL,
+                type_description_hash TEXT NOT NULL);
+             CREATE TABLE messages(
+                id INTEGER PRIMARY KEY, topic_id INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL, data BLOB NOT NULL);
+             CREATE INDEX timestamp_idx ON messages(timestamp ASC);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO topics VALUES (1,'/planning/trajectory','autoware_planning_msgs/msg/Trajectory','cdr','','h1')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO topics VALUES (2,'/perception/objects','autoware_perception_msgs/msg/PredictedObjects','cdr','','h2')",
+            [],
+        ).unwrap();
+        let payload: &[u8] = &[0xAA, 0xBB]; // opaque CDR — the reader must never decode it
+        for (id, ts) in [(1i64, 1_000_000_000i64), (2, 1_010_000_000), (3, 1_050_000_000), (4, 2_000_000_000)] {
+            conn.execute(
+                "INSERT INTO messages (id, topic_id, timestamp, data) VALUES (?1, 1, ?2, ?3)",
+                rusqlite::params![id, ts, payload],
+            ).unwrap();
+        }
+        // a message on the OTHER topic must never leak into the trajectory query
+        conn.execute(
+            "INSERT INTO messages (id, topic_id, timestamp, data) VALUES (99, 2, 1005000000, ?1)",
+            rusqlite::params![payload],
+        ).unwrap();
+    }
+
+    fn tmp_db() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("kirra_db3_{}_{}.db3", std::process::id(), nanos))
+    }
+
+    #[test]
+    fn window_math_matches_inmemory_semantics() {
+        let db = tmp_db();
+        make_bag(&db);
+        let r = Db3BagReader::open(&db, "/planning/trajectory", "doer-v1.2.3").unwrap();
+
+        // ±100ms around 1000ms == [900,1100] -> 1000,1010,1050 (NOT 2000)
+        let mut ms: Vec<u64> = r.messages_in_window(1000, 100).iter().map(|m| m.t_wall_ms).collect();
+        ms.sort_unstable();
+        assert_eq!(ms, vec![1000, 1010, 1050]);
+
+        // ±30ms around 1050 -> just 1050
+        let ms2: Vec<u64> = r.messages_in_window(1050, 30).iter().map(|m| m.t_wall_ms).collect();
+        assert_eq!(ms2, vec![1050]);
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn stamps_version_refs_topic_and_isolates_topic() {
+        let db = tmp_db();
+        make_bag(&db);
+        let r = Db3BagReader::open(&db, "/planning/trajectory", "doer-v1.2.3").unwrap();
+
+        let all = r.messages_in_window(1005, 1000); // huge window
+        assert_eq!(all.len(), 4, "only the 4 trajectory msgs; the perception topic is excluded");
+        assert!(all.iter().all(|m| m.doer_version == "doer-v1.2.3"), "doer_version stamped [D3]");
+        assert!(
+            all.iter().all(|m| m.asset_id.is_none() && m.trajectory_id.is_none() && m.objects_ms.is_none()),
+            "cross-check keys left None (no CDR decode); join treats None as not-asserted [D2]/[D4]"
+        );
+        assert!(all.iter().all(|m| m.bulk_ref.contains("#/planning/trajectory@")));
+
+        let exact = r.messages_in_window(1000, 5);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].bulk_ref, format!("{}#/planning/trajectory@1000000000", db.display()));
+        assert_eq!(r.bag_uri(), db.display().to_string());
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn topic_not_found_is_a_clean_error() {
+        let db = tmp_db();
+        make_bag(&db);
+        assert!(matches!(
+            Db3BagReader::open(&db, "/does/not/exist", "v"),
+            Err(BagError::TopicNotFound(_))
+        ));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // The real reason this backend is valid as a first cut: a record joins
+    // against it through the same join path, using time + version + bulk_ref.
+    #[test]
+    fn joins_through_the_real_join_path() {
+        use crate::join::{join_record, JoinOutcome};
+        use kirra_capture_schema::{CaptureOutcome, CaptureRecord, CaptureSource};
+
+        let db = tmp_db();
+        make_bag(&db);
+        let r = Db3BagReader::open(&db, "/planning/trajectory", "doer-v1.2.3").unwrap();
+
+        let rec = CaptureRecord {
+            decision_seq: 0,
+            t_mono_ns: 0,
+            t_wall_ms: 1008, // within ±100ms of the 1000/1010 stamps
+            source: CaptureSource::CommandGateway,
+            proposed: None,
+            traj: None,
+            outcome: CaptureOutcome::Allow,
+            deny_code: None,
+            safe_value: None,
+            mrc: false,
+            posture: "NOMINAL".to_string(),
+            derate_enabled: false,
+        };
+        let JoinOutcome::Joined(m) = join_record(&rec, &r, 100) else {
+            panic!("expected a join against the db3 bag");
+        };
+        assert_eq!(m.doer_version, "doer-v1.2.3");
+        assert_eq!(m.matched_t_wall_ms, 1010, "nearest-in-time to 1008 is the 1010 stamp");
+        assert!(m.bulk_ref.ends_with("@1010000000"));
+
+        let _ = std::fs::remove_file(&db);
+    }
+}
