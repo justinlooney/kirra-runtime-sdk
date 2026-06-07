@@ -383,15 +383,24 @@ jobs:
         with:
           required-ros-distributions: jazzy
       - name: Build curated message workspace
-        # The curated, integrator-pinned message set (autoware_perception_msgs +
-        # autoware_planning_msgs + the kirra bridge/safety packages) — NOT the
-        # full upstream autoware msgs. Building only these reproduces the clean,
-        # curated-only environment the adapter links against, so r2r doesn't
+        # Build ONLY the curated, integrator-pinned message packages the adapter
+        # links against (autoware_perception_msgs + autoware_planning_msgs) — NOT
+        # the full upstream autoware msgs, and NOT the rest of ros2_ws. This
+        # reproduces the clean, curated-only environment so r2r doesn't
         # over-discover a stray full perception_msgs.
+        #
+        # `--packages-up-to` (vs a bare `colcon build`) deliberately EXCLUDES the
+        # sibling C++ packages in ros2_ws/src — notably `kirra_bridge_cpp`, which
+        # `#include "kirra.h"` (a generated cdylib FFI header not staged in this
+        # msgs-only job) and therefore fails to compile, aborting the msgs builds
+        # alongside it. The perception/planning msgs the adapter needs have no
+        # workspace deps, so up-to == just these two here; the flag keeps it
+        # correct if a curated dep is added later. The bridge's own build is a
+        # separate concern, out of scope for this feature-compile gate.
         run: |
           source /opt/ros/jazzy/setup.bash
           cd ros2_ws
-          colcon build
+          colcon build --packages-up-to autoware_perception_msgs autoware_planning_msgs
       # Repo convention: dtolnay/rust-toolchain@stable (no rust-cache used).
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo build -p kirra-ros2-adapter --features ros2
