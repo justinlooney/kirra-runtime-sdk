@@ -897,6 +897,18 @@ impl VerifierStore {
         self.conn.query_row("SELECT 1", [], |_| Ok(()))
     }
 
+    /// SG-008 startup-invariant support: true when the hot connection reports
+    /// `journal_mode = wal`. `new()` sets `PRAGMA journal_mode=WAL`, so a
+    /// file-backed store reports "wal"; a `:memory:` store reports "memory"
+    /// (WAL is unavailable for in-memory DBs). The startup sentinel reads this
+    /// to fail closed before binding the listener if the DB is not in WAL mode.
+    pub fn is_wal_mode(&self) -> bool {
+        self.conn
+            .query_row("PRAGMA journal_mode;", [], |r| r.get::<_, String>(0))
+            .map(|m| m.eq_ignore_ascii_case("wal"))
+            .unwrap_or(false)
+    }
+
     pub fn load_all_posture_events(&self) -> Result<Vec<serde_json::Value>> {
         let mut stmt = self.conn.prepare(
             "SELECT node_id, event_type, posture_json, reason, created_at_ms

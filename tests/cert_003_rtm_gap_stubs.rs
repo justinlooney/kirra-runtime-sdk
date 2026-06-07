@@ -46,17 +46,16 @@ fn test_safety_goal_sg_007_causal_log_records_propagation_event() {
     todo!("wire propagate_cross_asset_trust to FabricCausalLog, then assert the leader→follower event")
 }
 
-#[test]
-#[ignore = "TODO(CERT-003): implement test for SG-008"]
-fn test_safety_goal_sg_008_process_fail_closed_on_crash() {
-    // Safety Goal: SG-008 — Process Fail-Closed on Crash (ASIL D)
-    // This test must verify: startup_sentinel aborts the process if any
-    // safety invariant fails (admin token missing, watchdog not spawned,
-    // posture engine not running, SQLite not in WAL mode), and the TCP
-    // listener never binds before all invariants pass.
-    // Currently unimplemented — tracked in CERT-003
-    todo!("implement SG-008 verification")
-}
+// SG-008 — Process Fail-Closed on Startup (ASIL D): IMPLEMENTED (CERT-003).
+// The startup-invariant predicate `check_startup_invariants` + its
+// `StartupContext` / `StartupInvariant` live in
+// `src/bin/kirra_verifier_service.rs` and are tested by mod `sg_008_cert_tests`
+// there (admin-token / WAL / watchdog / posture-engine violations, the
+// all-present Ok case, the Active-vs-PassiveStandby distinction, and check-order
+// stability). They are `pub(crate)` in the binary, so the tests must be in-bin —
+// not in this external integration file. `main` evaluates the predicate
+// immediately before `TcpListener::bind` and aborts on Err, so the listener
+// never binds before invariants pass. The predicate carries `// Verifies: SG-008`.
 
 #[test]
 #[ignore = "TODO(CERT-003): implement test for SG-009"]
