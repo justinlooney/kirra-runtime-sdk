@@ -266,6 +266,14 @@ pub async fn run_adapter(
         let mut traj_seq: u64 = 0;
         while let Some(msg) = s.next().await {
             let now = now_ms_wall();
+            // Phase I observability (integration-harness §I.1a): a per-callback
+            // entry event PROVES delivery (vs staleness) for the A-vs-B split.
+            tracing::info!(
+                target: "kirra::ingress",
+                topic = "trajectory",
+                stamp_ms = now,
+                "subscription_callback"
+            );
             traj_state.touch_trajectory(now);
             tracing::debug!(points = msg.points.len(), "trajectory_msg_received");
             let parsed = crate::parsing::parse_trajectory(&msg, now);
@@ -303,7 +311,14 @@ pub async fn run_adapter(
     tokio::spawn(async move {
         let mut s = obj_stream;
         while let Some(msg) = s.next().await {
-            obj_state.touch_objects(now_ms_wall());
+            let now = now_ms_wall();
+            tracing::info!(
+                target: "kirra::ingress",
+                topic = "objects",
+                stamp_ms = now,
+                "subscription_callback"
+            );
+            obj_state.touch_objects(now);
             let parsed = crate::parsing::parse_predicted_objects(&msg);
             obj_state.update_objects(parsed);
         }
@@ -314,7 +329,14 @@ pub async fn run_adapter(
     tokio::spawn(async move {
         let mut s = odom_stream;
         while let Some(msg) = s.next().await {
-            odom_state.touch_odom(now_ms_wall());
+            let now = now_ms_wall();
+            tracing::info!(
+                target: "kirra::ingress",
+                topic = "odometry",
+                stamp_ms = now,
+                "subscription_callback"
+            );
+            odom_state.touch_odom(now);
             let parsed = crate::parsing::parse_odom(&msg);
             odom_state.update_odom(parsed);
         }
@@ -418,10 +440,28 @@ pub async fn run_adapter(
                 now_ms,
             );
             let elapsed_us = start.elapsed().as_micros();
+            // Phase I observability (integration-harness §I.1b): carry posture +
+            // per-input freshness ages on the verdict span so a derate caused by
+            // stale inputs (Branch B) is distinguishable from non-delivery
+            // (Branch A) directly from the logs. A never-seen slot (last_*_ms == 0)
+            // reports u64::MAX rather than a misleadingly-huge "age since epoch".
+            let now_fresh = now_ms_wall();
+            let age_of =
+                |t: u64| if t == 0 { u64::MAX } else { now_fresh.saturating_sub(t) };
+            let traj_age_ms =
+                age_of(slow_state.last_trajectory_ms.load(std::sync::atomic::Ordering::Relaxed));
+            let objects_age_ms =
+                age_of(slow_state.last_objects_ms.load(std::sync::atomic::Ordering::Relaxed));
+            let odom_age_ms =
+                age_of(slow_state.last_odom_ms.load(std::sync::atomic::Ordering::Relaxed));
             tracing::info!(
                 asset_id = %traj.asset_id,
                 trajectory_id = traj.trajectory_id,
                 verdict = ?verdict,
+                posture = ?posture,
+                traj_age_ms,
+                objects_age_ms,
+                odom_age_ms,
                 elapsed_us = elapsed_us,
                 "trajectory_verdict"
             );
