@@ -402,7 +402,7 @@ pub async fn run_adapter(
                 &objects,
                 &slow_state.config,
                 odom.as_ref(),
-                posture,
+                posture.clone(),
                 effective_perception_cap,
             );
             let now_ms = std::time::SystemTime::now()
