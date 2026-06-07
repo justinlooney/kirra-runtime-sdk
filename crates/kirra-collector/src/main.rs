@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use kirra_collector::bag::{BagReader, Db3BagReader, InMemoryBag};
+use kirra_collector::bag::{BagReader, Db3BagReader, InMemoryBag, McapBagReader};
 use kirra_collector::{read_jsonl_with_digests, run, CollectorConfig, CollectorError, Lineage};
 
 struct Args {
@@ -52,7 +52,7 @@ kirra-collector — offline learning-loop collector
 
   --capture <path>          capture JSONL (repeatable; at least one required)
   --bag-json <path>         synthetic bus recording (JSON array of bus messages)
-  --bag <path>              real rosbag2 .db3 backend (C2). Requires --bag-topic + --doer-version
+  --bag <path>              real rosbag2 .db3/.mcap backend (C2). Requires --bag-topic + --doer-version
   --bag-topic <topic>       doer trajectory/proposal topic to index in the .db3
   --doer-version <ver>      doer build stamped on joined rows (can't be read from CDR)
   --out <dir>               output dataset root (required)
@@ -134,16 +134,28 @@ fn main() -> ExitCode {
                 }
             }
             Some("mcap") => {
-                eprintln!(
-                    "error: --bag {} — the MCAP backend is deferred (C2b). \
-                     Use a .db3 bag or --bag-json.",
-                    p.display()
-                );
-                return ExitCode::FAILURE;
+                let Some(topic) = args.bag_topic.as_deref() else {
+                    eprintln!("error: --bag <mcap> requires --bag-topic <doer trajectory topic>");
+                    return ExitCode::FAILURE;
+                };
+                let Some(ver) = args.doer_version.as_deref() else {
+                    eprintln!(
+                        "error: --bag <mcap> requires --doer-version <run's doer build> \
+                         (it can't be read without decoding payloads)"
+                    );
+                    return ExitCode::FAILURE;
+                };
+                match McapBagReader::open(p, topic, ver) {
+                    Ok(r) => (Box::new(r), "mcap"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
             }
             _ => {
                 eprintln!(
-                    "error: --bag {} — unrecognized bag extension (expected .db3).",
+                    "error: --bag {} — unrecognized bag extension (expected .db3 or .mcap).",
                     p.display()
                 );
                 return ExitCode::FAILURE;

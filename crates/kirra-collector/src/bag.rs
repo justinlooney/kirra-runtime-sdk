@@ -100,9 +100,11 @@ impl BagReader for InMemoryBag {
 /// Errors from opening a real rosbag2 bag.
 #[derive(Debug)]
 pub enum BagError {
-    /// Failed to open the sqlite file or run the topic-resolution query.
+    /// Failed to open the sqlite file or run the topic-resolution query (db3).
     Open(rusqlite::Error),
-    /// The requested join topic is not present in the bag's `topics` table.
+    /// Failed to open or read an MCAP bag.
+    Mcap(String),
+    /// The requested join topic is not present in the bag.
     TopicNotFound(String),
 }
 
@@ -110,6 +112,7 @@ impl std::fmt::Display for BagError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BagError::Open(e) => write!(f, "opening rosbag2 db3: {e}"),
+            BagError::Mcap(e) => write!(f, "opening mcap: {e}"),
             BagError::TopicNotFound(t) => write!(f, "join topic not found in bag: {t}"),
         }
     }
@@ -345,5 +348,209 @@ mod db3_tests {
         assert!(m.bulk_ref.ends_with("@1010000000"));
 
         let _ = std::fs::remove_file(&db);
+    }
+}
+
+/// Real rosbag2 MCAP (`.mcap`) backend [C2] — the sibling of [`Db3BagReader`].
+///
+/// rosbag2's other storage format (increasingly the default). Like the db3
+/// reader it does NOT decode CDR payloads ([D4]); on open it pre-indexes the
+/// join topic's message `log_time`s (sorted) and references heavy frames via
+/// `bulk_ref` (`uri#topic@log_time_ns`). It populates `t_wall_ms` +
+/// `doer_version` [D3] + `bulk_ref`; the [D2] cross-check keys are left `None`
+/// (the join treats `None` as not-asserted). Reading compressed chunks relies on
+/// the `mcap` crate's lz4/zstd features (enabled in Cargo.toml); the reader code
+/// is identical whether or not chunks are compressed.
+pub struct McapBagReader {
+    uri: String,
+    topic: String,
+    doer_version: String,
+    stamps_ns: Vec<u64>,
+}
+
+impl McapBagReader {
+    /// Open an `.mcap`, validate the join `topic`, and pre-index its message
+    /// `log_time`s. `doer_version` is supplied out-of-band (see `Db3BagReader`).
+    pub fn open(
+        path: &std::path::Path,
+        topic: &str,
+        doer_version: impl Into<String>,
+    ) -> Result<Self, BagError> {
+        let bytes = std::fs::read(path).map_err(|e| BagError::Mcap(e.to_string()))?;
+
+        // Validate the topic via the summary's channel list when present.
+        let mut topic_known = false;
+        if let Ok(Some(summary)) = mcap::Summary::read(&bytes) {
+            topic_known = summary.channels.values().any(|c| c.topic == topic);
+            if !summary.channels.is_empty() && !topic_known {
+                return Err(BagError::TopicNotFound(topic.to_string()));
+            }
+        }
+
+        let mut stamps_ns = Vec::new();
+        for msg in mcap::MessageStream::new(&bytes).map_err(|e| BagError::Mcap(e.to_string()))? {
+            let m = msg.map_err(|e| BagError::Mcap(e.to_string()))?;
+            if m.channel.topic == topic {
+                topic_known = true;
+                stamps_ns.push(m.log_time);
+            }
+        }
+        if !topic_known {
+            return Err(BagError::TopicNotFound(topic.to_string()));
+        }
+        stamps_ns.sort_unstable();
+
+        Ok(Self {
+            uri: path.display().to_string(),
+            topic: topic.to_string(),
+            doer_version: doer_version.into(),
+            stamps_ns,
+        })
+    }
+}
+
+impl BagReader for McapBagReader {
+    fn bag_uri(&self) -> &str {
+        &self.uri
+    }
+
+    fn messages_in_window(&self, t_wall_ms: u64, window_ms: u64) -> Vec<BusMessage> {
+        let lo_ns = t_wall_ms.saturating_sub(window_ms).saturating_mul(1_000_000);
+        let hi_ns = t_wall_ms
+            .saturating_add(window_ms)
+            .saturating_mul(1_000_000)
+            .saturating_add(999_999);
+        // stamps_ns is sorted: binary-search the lower bound, take the run.
+        let start = self.stamps_ns.partition_point(|&ts| ts < lo_ns);
+        self.stamps_ns[start..]
+            .iter()
+            .take_while(|&&ts| ts <= hi_ns)
+            .map(|&ts_ns| BusMessage {
+                t_wall_ms: ts_ns / 1_000_000,
+                doer_version: self.doer_version.clone(),
+                asset_id: None,
+                trajectory_id: None,
+                objects_ms: None,
+                bulk_ref: format!("{}#{}@{}", self.uri, self.topic, ts_ns),
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod mcap_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn write_msg(w: &mut mcap::Writer<std::io::BufWriter<std::fs::File>>, chan_id: u16, ts: u64) {
+        w.write_to_known_channel(
+            &mcap::records::MessageHeader { channel_id: chan_id, sequence: 0, log_time: ts, publish_time: ts },
+            &[0xAA, 0xBB], // opaque payload — the reader must never decode it
+        )
+        .unwrap();
+    }
+
+    fn make_bag(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        let mut w = mcap::Writer::new(f).unwrap();
+        let traj = mcap::Channel {
+            topic: "/planning/trajectory".to_string(),
+            schema: None,
+            message_encoding: "cdr".to_string(),
+            metadata: BTreeMap::new(),
+        };
+        let perc = mcap::Channel {
+            topic: "/perception/objects".to_string(),
+            schema: None,
+            message_encoding: "cdr".to_string(),
+            metadata: BTreeMap::new(),
+        };
+        let traj_id = w.add_channel(&traj).unwrap();
+        let perc_id = w.add_channel(&perc).unwrap();
+        for ts in [1_000_000_000u64, 1_010_000_000, 1_050_000_000, 2_000_000_000] {
+            write_msg(&mut w, traj_id, ts);
+        }
+        write_msg(&mut w, perc_id, 1_005_000_000); // other topic — must not leak
+        w.finish().unwrap();
+    }
+
+    fn tmp_bag() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("kirra_mcap_{}_{}.mcap", std::process::id(), nanos))
+    }
+
+    #[test]
+    fn window_math_matches_inmemory_semantics() {
+        let p = tmp_bag();
+        make_bag(&p);
+        let r = McapBagReader::open(&p, "/planning/trajectory", "doer-v1.2.3").unwrap();
+        let mut ms: Vec<u64> = r.messages_in_window(1000, 100).iter().map(|m| m.t_wall_ms).collect();
+        ms.sort_unstable();
+        assert_eq!(ms, vec![1000, 1010, 1050]);
+        let ms2: Vec<u64> = r.messages_in_window(1050, 30).iter().map(|m| m.t_wall_ms).collect();
+        assert_eq!(ms2, vec![1050]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn stamps_version_refs_topic_and_isolates_topic() {
+        let p = tmp_bag();
+        make_bag(&p);
+        let r = McapBagReader::open(&p, "/planning/trajectory", "doer-v1.2.3").unwrap();
+        let all = r.messages_in_window(1005, 1000);
+        assert_eq!(all.len(), 4, "only the 4 trajectory msgs; the perception topic is excluded");
+        assert!(all.iter().all(|m| m.doer_version == "doer-v1.2.3"));
+        assert!(all.iter().all(|m| m.asset_id.is_none() && m.trajectory_id.is_none() && m.objects_ms.is_none()));
+        assert!(all.iter().all(|m| m.bulk_ref.contains("#/planning/trajectory@")));
+        let exact = r.messages_in_window(1000, 5);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].bulk_ref, format!("{}#/planning/trajectory@1000000000", p.display()));
+        assert_eq!(r.bag_uri(), p.display().to_string());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn topic_not_found_is_a_clean_error() {
+        let p = tmp_bag();
+        make_bag(&p);
+        assert!(matches!(
+            McapBagReader::open(&p, "/does/not/exist", "v"),
+            Err(BagError::TopicNotFound(_))
+        ));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn joins_through_the_real_join_path() {
+        use crate::join::{join_record, JoinOutcome};
+        use kirra_capture_schema::{CaptureOutcome, CaptureRecord, CaptureSource};
+        let p = tmp_bag();
+        make_bag(&p);
+        let r = McapBagReader::open(&p, "/planning/trajectory", "doer-v1.2.3").unwrap();
+        let rec = CaptureRecord {
+            decision_seq: 0,
+            t_mono_ns: 0,
+            t_wall_ms: 1008,
+            source: CaptureSource::CommandGateway,
+            proposed: None,
+            traj: None,
+            outcome: CaptureOutcome::Allow,
+            deny_code: None,
+            safe_value: None,
+            mrc: false,
+            posture: "NOMINAL".to_string(),
+            derate_enabled: false,
+        };
+        let JoinOutcome::Joined(m) = join_record(&rec, &r, 100) else {
+            panic!("expected a join against the mcap bag");
+        };
+        assert_eq!(m.doer_version, "doer-v1.2.3");
+        assert_eq!(m.matched_t_wall_ms, 1010);
+        assert!(m.bulk_ref.ends_with("@1010000000"));
+        let _ = std::fs::remove_file(&p);
     }
 }
