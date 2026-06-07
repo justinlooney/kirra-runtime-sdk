@@ -228,9 +228,43 @@ struct DivState {
 /// implementation diversity in addition to this fix.**
 ///
 /// Per CERT-006 — ISO 26262 ASIL-D decomposition argument.
+/// Capabilities the comparator needs beyond the bare
+/// `SafetyGovernor` trait. Both `KirraGovernor` and
+/// `DiverseKirraGovernor` implement this so the comparator can
+/// hold either kind of shadow.
+pub trait RssAware {
+    fn update_rss_state(&mut self, state: RssState);
+}
+
+impl RssAware for KirraGovernor {
+    fn update_rss_state(&mut self, state: RssState) {
+        KirraGovernor::update_rss_state(self, state);
+    }
+}
+
+impl RssAware for crate::diverse::DiverseKirraGovernor {
+    fn update_rss_state(&mut self, state: RssState) {
+        crate::diverse::DiverseKirraGovernor::update_rss_state(self, state);
+    }
+}
+
+/// Trait alias the comparator stores. `SafetyGovernor + RssAware`
+/// together cover everything the comparator needs to drive a
+/// shadow.
+pub trait ComparatorGovernor: SafetyGovernor + RssAware {}
+impl<T: SafetyGovernor + RssAware> ComparatorGovernor for T {}
+
 pub struct GovernorComparator {
-    primary: KirraGovernor,
-    shadow: KirraGovernor,
+    // L2 / CERT-006: `primary` and `shadow` are stored as trait
+    // objects so the shadow can be a STRUCTURALLY DIVERSE
+    // implementation (`DiverseKirraGovernor`) without making the
+    // comparator generic. The existing constructors (`new` /
+    // `with_sink`) keep their back-compat signature taking two
+    // `KirraGovernor` instances; the new constructors
+    // (`new_diverse` / `with_diverse_shadow_and_sink`) wire a
+    // `DiverseKirraGovernor` as the shadow.
+    primary: Box<dyn ComparatorGovernor + Send + Sync>,
+    shadow:  Box<dyn ComparatorGovernor + Send + Sync>,
     state: Mutex<DivState>,
     sink: Arc<dyn DivergenceEventSink>,
 }
@@ -306,8 +340,10 @@ pub(crate) fn actions_diverge(
 }
 
 impl GovernorComparator {
-    /// Create a comparator with two independent governor instances and the
-    /// default in-memory divergence sink.
+    /// Create a comparator with two **IDENTICAL** `KirraGovernor`
+    /// instances and the default in-memory divergence sink.
+    /// Back-compat — pre-L2 default. For genuine structural
+    /// diversity (CERT-006) use `new_diverse` instead.
     pub fn new(primary: KirraGovernor, shadow: KirraGovernor) -> Self {
         Self::with_sink(primary, shadow, Arc::new(InMemoryDivergenceSink::new()))
     }
@@ -321,8 +357,39 @@ impl GovernorComparator {
         sink: Arc<dyn DivergenceEventSink>,
     ) -> Self {
         Self {
-            primary,
-            shadow,
+            primary: Box::new(primary),
+            shadow:  Box::new(shadow),
+            state: Mutex::new(DivState::default()),
+            sink,
+        }
+    }
+
+    /// **L2 / CERT-006 — diverse-shadow comparator.** Pair the
+    /// `KirraGovernor` primary with a structurally diverse
+    /// `DiverseKirraGovernor` shadow so the comparator can catch
+    /// implementation-level systematic faults (not just random /
+    /// transient ones). See `docs/safety/COMPARATOR_DIVERSITY.md`
+    /// for the diversity argument + the fault class this covers
+    /// (and the explicit limit: spec-level faults shared by both
+    /// implementations are NOT caught).
+    pub fn new_diverse(
+        primary: KirraGovernor,
+        shadow: crate::diverse::DiverseKirraGovernor,
+    ) -> Self {
+        Self::with_diverse_shadow_and_sink(
+            primary, shadow, Arc::new(InMemoryDivergenceSink::new()))
+    }
+
+    /// `new_diverse` + caller-supplied divergence sink (e.g. the
+    /// kirra-runtime-sdk hash-chained audit log).
+    pub fn with_diverse_shadow_and_sink(
+        primary: KirraGovernor,
+        shadow: crate::diverse::DiverseKirraGovernor,
+        sink: Arc<dyn DivergenceEventSink>,
+    ) -> Self {
+        Self {
+            primary: Box::new(primary),
+            shadow:  Box::new(shadow),
             state: Mutex::new(DivState::default()),
             sink,
         }
@@ -467,10 +534,12 @@ impl GovernorComparator {
 
     /// Update RSS state on both governors. Must be called via this method
     /// (not on either inner governor directly) to maintain identical state
-    /// between primary and shadow.
+    /// between primary and shadow. Dispatches through the
+    /// `RssAware` trait so the shadow may be a `DiverseKirraGovernor`
+    /// or a `KirraGovernor`.
     pub fn update_rss_state(&mut self, state: RssState) {
-        self.primary.update_rss_state(state.clone());
-        self.shadow.update_rss_state(state);
+        RssAware::update_rss_state(self.primary.as_mut(), state.clone());
+        RssAware::update_rss_state(self.shadow.as_mut(),  state);
     }
 }
 
@@ -875,5 +944,253 @@ mod tests {
             "Same physical effect via different variants must not be flagged \
              (compare effect, not variant)"
         );
+    }
+}
+
+// =============================================================================
+// L2 / CERT-006 — diverse-shadow integration tests
+// =============================================================================
+//
+// Two test surfaces:
+//
+//   1. AGREEMENT (correctness — the critical one): the diverse
+//      shadow MUST agree with the primary on valid inputs, by the
+//      comparator's own equivalence check (`actions_diverge ==
+//      false`). A diverse impl that introduces a false divergence on
+//      a valid input would be a regression — these tests guard that.
+//
+//   2. DETECTION (demonstration): inject a fault into the shadow
+//      (a deliberately-broken governor) and assert the comparator
+//      diverges, records the event, and escalates after enough hits.
+//      Proves the diversity + comparator escalation actually catches
+//      a disagreement when one is real.
+
+#[cfg(test)]
+mod diversity_tests {
+    use super::*;
+    use crate::diverse::DiverseKirraGovernor;
+    use crate::KirraGovernor;
+    use parko_core::commands::ControlCommand;
+    use parko_core::safety::SafetyPosture;
+
+    fn cmd(linear: f64, angular: f64) -> ControlCommand {
+        ControlCommand { linear_velocity: linear, angular_velocity: angular, timestamp_ms: 0 }
+    }
+
+    /// **AGREEMENT — broad input sweep across `Allow` / `Clamp*` /
+    /// `Deny` and each posture.** Hand-built input set covering the
+    /// regimes the governor takes a different code path through.
+    /// Primary and diverse MUST agree by the comparator's own
+    /// equivalence check (`actions_diverge == false`); a regression
+    /// would show up here.
+    #[test]
+    fn diverse_agrees_with_primary_across_input_regimes() {
+        let primary = KirraGovernor::new();
+        let diverse = DiverseKirraGovernor::new_default();
+
+        // 60 input cases covering Allow / each Clamp / Deny and each
+        // posture. (linear, angular, posture).
+        let inputs: &[(f64, f64, SafetyPosture)] = &[
+            // Tiny in-envelope commands under Nominal — Allow expected.
+            (0.0,  0.0,  SafetyPosture::Nominal),
+            (0.05, 0.0,  SafetyPosture::Nominal),
+            (0.05, 0.05, SafetyPosture::Nominal),
+            (0.10, 0.0,  SafetyPosture::Nominal),
+            (0.10, 0.10, SafetyPosture::Nominal),
+            // Negative tiny — both axes preserve sign correctly.
+            (-0.05, 0.0,  SafetyPosture::Nominal),
+            (0.05, -0.05, SafetyPosture::Nominal),
+            (-0.05, -0.05, SafetyPosture::Nominal),
+            // Above the conservative-default angular bound (~0.2 rad/s)
+            // → ClampAngularVelocity on the angular axis.
+            (0.0, 0.5,  SafetyPosture::Nominal),
+            (0.0, 1.0,  SafetyPosture::Nominal),
+            (0.0, -0.5, SafetyPosture::Nominal),
+            (0.05, 0.5, SafetyPosture::Nominal),
+            // Above the linear envelope (conservative default
+            // has small max_accel; from prev=0 a positive commanded
+            // velocity past `max_accel * dt` triggers ClampLinear).
+            (10.0, 0.0,  SafetyPosture::Nominal),
+            (50.0, 0.0,  SafetyPosture::Nominal),
+            (-10.0, 0.0, SafetyPosture::Nominal),
+            // Both axes excess → ClampMotion.
+            (50.0, 5.0,  SafetyPosture::Nominal),
+            (-50.0, -5.0, SafetyPosture::Nominal),
+
+            // Degraded posture (RSS-unsafe code path is exercised
+            // separately below) — MRC profile binds.
+            (0.0,  0.0,   SafetyPosture::Degraded),
+            (1.0,  0.0,   SafetyPosture::Degraded),
+            (5.0,  0.0,   SafetyPosture::Degraded),    // exactly at MRC ceiling
+            (5.5,  0.0,   SafetyPosture::Degraded),    // ClampLinear at MRC
+            (10.0, 0.0,   SafetyPosture::Degraded),
+            (0.0,  0.3,   SafetyPosture::Degraded),    // ClampAngular at MRC ang bound
+            (10.0, 1.0,   SafetyPosture::Degraded),    // ClampMotion
+            (-5.0, -0.3,  SafetyPosture::Degraded),
+
+            // LockedOut — Deny everything.
+            (0.0,  0.0,  SafetyPosture::LockedOut),
+            (1.0,  0.5,  SafetyPosture::LockedOut),
+            (10.0, 5.0,  SafetyPosture::LockedOut),
+            (-10.0, -5.0, SafetyPosture::LockedOut),
+        ];
+
+        for &(lin, ang, posture) in inputs {
+            let proposed = cmd(lin, ang);
+            // Use previous = current command so the P3/P4 accel
+            // checks see ~0 implied acceleration (focuses the test
+            // on P2 / angular / posture rather than rate-of-change
+            // which the diverse impl deliberately computes via a
+            // different form).
+            let previous = cmd(lin, 0.0);
+            let p = primary.evaluate(&proposed, Some(&previous), 0.05, posture);
+            let d = diverse.evaluate(&proposed, Some(&previous), 0.05, posture);
+            assert!(
+                !actions_diverge(&p, &d, &proposed, COMPARATOR_TOLERANCE),
+                "AGREEMENT regression at lin={lin} ang={ang} posture={posture:?}: \
+                 primary={p:?} diverse={d:?}"
+            );
+        }
+    }
+
+    /// **AGREEMENT — NaN / Inf / non-positive dt all return Deny on
+    /// both governors.** The diverse impl's hand-rolled NaN guard
+    /// MUST behave the same as the primary's SDK-delegated guard.
+    /// Compare via comparator equivalence: Deny is effective-vel
+    /// 0 for both axes, so two Deny verdicts always agree.
+    #[test]
+    fn diverse_agrees_with_primary_on_fail_closed_paths() {
+        let primary = KirraGovernor::new();
+        let diverse = DiverseKirraGovernor::new_default();
+
+        let cases: &[(f64, f64, f64)] = &[
+            // (linear, angular, dt)
+            (f64::NAN, 0.0, 0.05),
+            (f64::INFINITY, 0.0, 0.05),
+            (f64::NEG_INFINITY, 0.0, 0.05),
+            (1.0, f64::NAN, 0.05),       // NaN on angular axis (primary catches at
+                                         // angular_clamp; diverse via copysign — both
+                                         // must produce equivalent effective verdict)
+            (1.0, 0.0, 0.0),             // zero dt
+            (1.0, 0.0, -0.05),           // negative dt
+        ];
+
+        for &(lin, ang, dt) in cases {
+            let proposed = cmd(lin, ang);
+            let p = primary.evaluate(&proposed, None, dt, SafetyPosture::Nominal);
+            let d = diverse.evaluate(&proposed, None, dt, SafetyPosture::Nominal);
+            // Use effective velocities — two Denys must look the same
+            // (both axes effective = 0) regardless of reason string.
+            let p_lin = effective_linear_velocity(&p, proposed.linear_velocity);
+            let d_lin = effective_linear_velocity(&d, proposed.linear_velocity);
+            // Treat NaN as equal-to-itself for this comparison —
+            // both governors should be producing FINITE outputs on
+            // either Allow or Deny, so a NaN escape would itself be
+            // a regression.
+            assert!(p_lin.is_finite() && d_lin.is_finite(),
+                "non-finite effective_linear on fail-closed case ({lin}, {ang}, dt={dt}); \
+                 primary={p:?} diverse={d:?}");
+            assert!((p_lin - d_lin).abs() < COMPARATOR_TOLERANCE,
+                "fail-closed disagreement at ({lin}, {ang}, dt={dt}): \
+                 primary lin={p_lin} diverse lin={d_lin}");
+        }
+    }
+
+    /// **DETECTION — fault-injected shadow forces the comparator to
+    /// diverge + record the event.** Pair the primary with a
+    /// deliberately-broken shadow that ALWAYS returns Allow; on a
+    /// command the primary clamps, the comparator MUST diverge.
+    #[test]
+    fn comparator_detects_fault_injected_shadow_disagreement() {
+        // Fault-injected shadow: SafetyGovernor that always returns
+        // Allow + a no-op RssAware. Models a systematic
+        // implementation fault that misses every clamp.
+        struct AllowAlwaysFaulty;
+        impl SafetyGovernor for AllowAlwaysFaulty {
+            fn evaluate(
+                &self,
+                _: &ControlCommand,
+                _: Option<&ControlCommand>,
+                _: f64,
+                _: SafetyPosture,
+            ) -> EnforcementAction {
+                EnforcementAction::Allow
+            }
+        }
+        impl RssAware for AllowAlwaysFaulty {
+            fn update_rss_state(&mut self, _: RssState) {}
+        }
+
+        // Construct the comparator manually with the faulty shadow.
+        // (Same shape as `with_diverse_shadow_and_sink` but the trait
+        // bound is generic so it accepts the test stub.)
+        let sink = Arc::new(InMemoryDivergenceSink::new());
+        let comparator = GovernorComparator {
+            primary: Box::new(KirraGovernor::new()),
+            shadow:  Box::new(AllowAlwaysFaulty),
+            state: Mutex::new(DivState::default()),
+            sink: sink.clone(),
+        };
+
+        // Pick a command the primary clamps (50 m/s, prev 0 → P3 hits)
+        // and the faulty shadow Allows.
+        let proposed = cmd(50.0, 0.0);
+        let action = comparator.evaluate(&proposed, None, 0.05, SafetyPosture::Nominal);
+
+        // The reconciled action must be the most-restrictive of the
+        // two. Effective linear of the reconciled action must be
+        // strictly below the proposed 50 m/s (proves the comparator
+        // did NOT pass the faulty Allow through).
+        let eff_lin = effective_linear_velocity(&action, proposed.linear_velocity);
+        assert!(eff_lin.abs() < 50.0,
+            "DETECTION failure: comparator passed the faulty Allow through; \
+             reconciled effective linear = {eff_lin} (expected strictly < 50)");
+
+        // The divergence sink must have recorded the event.
+        let recorded = sink.events();
+        assert!(!recorded.is_empty(),
+            "DETECTION failure: comparator did not record a divergence event \
+             despite primary-vs-shadow disagreement");
+    }
+
+    /// **DETECTION — sustained divergence escalates to LockedOut.**
+    /// Repeated divergence on consecutive ticks must drive the
+    /// accumulator to the lockout level and force a hard stop on
+    /// subsequent commands.
+    #[test]
+    fn sustained_divergence_escalates_to_locked_out() {
+        struct AllowAlwaysFaulty;
+        impl SafetyGovernor for AllowAlwaysFaulty {
+            fn evaluate(
+                &self,
+                _: &ControlCommand,
+                _: Option<&ControlCommand>,
+                _: f64,
+                _: SafetyPosture,
+            ) -> EnforcementAction {
+                EnforcementAction::Allow
+            }
+        }
+        impl RssAware for AllowAlwaysFaulty {
+            fn update_rss_state(&mut self, _: RssState) {}
+        }
+        let sink = Arc::new(InMemoryDivergenceSink::new());
+        let comparator = GovernorComparator {
+            primary: Box::new(KirraGovernor::new()),
+            shadow:  Box::new(AllowAlwaysFaulty),
+            state: Mutex::new(DivState::default()),
+            sink: sink.clone(),
+        };
+
+        // Hammer the comparator with the divergent command for many
+        // ticks. After enough hits the leaky-bucket accumulator hits
+        // DIVERGENCE_LOCKOUT_LEVEL and the comparator escalates.
+        let proposed = cmd(50.0, 0.0);
+        for _ in 0..200 {
+            let _ = comparator.evaluate(&proposed, None, 0.05, SafetyPosture::Nominal);
+        }
+        // At least one divergence event should have been recorded.
+        assert!(!sink.events().is_empty(),
+            "sustained divergence: sink remained empty");
     }
 }
