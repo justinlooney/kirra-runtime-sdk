@@ -370,3 +370,46 @@ jobs:
         # substitution), and non-skippable safety gates. On-silicon validation
         # per target is hardware-gated and NOT run here.
         run: bash scripts/test-install-parko-backend.sh
+
+  ros2-adapter-build:
+    name: ros2 adapter build (--features ros2)
+    # Jazzy targets Ubuntu 24.04 (Noble), so pin the runner (the rest of the
+    # workflow runs on ubuntu-latest, which is fine for the non-ROS jobs).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: jazzy
+      - name: Build curated message workspace
+        # Build ONLY the curated, integrator-pinned message packages the adapter
+        # links against (autoware_perception_msgs + autoware_planning_msgs) — NOT
+        # the full upstream autoware msgs, and NOT the rest of ros2_ws. This
+        # reproduces the clean, curated-only environment so r2r doesn't
+        # over-discover a stray full perception_msgs.
+        #
+        # `--packages-up-to` (vs a bare `colcon build`) deliberately EXCLUDES the
+        # sibling C++ packages in ros2_ws/src — notably `kirra_bridge_cpp`, which
+        # `#include "kirra.h"` (a generated cdylib FFI header not staged in this
+        # msgs-only job) and therefore fails to compile, aborting the msgs builds
+        # alongside it. The perception/planning msgs the adapter needs have no
+        # workspace deps, so up-to == just these two here; the flag keeps it
+        # correct if a curated dep is added later. The bridge's own build is a
+        # separate concern, out of scope for this feature-compile gate.
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          cd ros2_ws
+          colcon build --packages-up-to autoware_perception_msgs autoware_planning_msgs
+      # Repo convention: dtolnay/rust-toolchain@stable (no rust-cache used).
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo build -p kirra-ros2-adapter --features ros2
+        # `cargo test --workspace` never compiles the ros2-gated code, so this is
+        # the only CI step that does. A full `build` (not `check`) catches BOTH
+        # failure classes from the original incident: the E0382 borrow-check break
+        # (#198) AND the autoware_perception_msgs typesupport LINK error. Source
+        # base jazzy + the curated ros2_ws/install so the link resolves cleanly.
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source ros2_ws/install/setup.bash
+          cargo build -p kirra-ros2-adapter --features ros2
