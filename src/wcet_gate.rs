@@ -153,6 +153,11 @@ pub const GOVERNOR_PERCEPTION_GUARD_WCET_CI_THRESHOLD_MICROS: u64 = 10_000;
 /// code-path regression).
 #[cfg(test)]
 fn measure_stats<F: FnMut()>(iterations: u32, mut f: F) -> (u128, u128) {
+    // Imported here (function-local, test-only) rather than at module scope:
+    // `measure_stats` is the sole user and is itself `#[cfg(test)]`, so a
+    // module-level `use std::time::Instant;` is flagged unused by non-test
+    // `cargo build` (which is what previously prompted its erroneous removal).
+    use std::time::Instant;
     let mut samples: Vec<u128> = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
         let t0 = Instant::now();
