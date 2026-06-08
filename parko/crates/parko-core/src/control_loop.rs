@@ -12,6 +12,18 @@ use crate::scheduler::InferenceLoop;
 use crate::sensor::SensorStream;
 use crate::telemetry::PostureSnapshot;
 
+/// Default number of consecutive non-degraded ticks required before the loop
+/// recovers out of `Degraded` back to `Nominal`.
+///
+// SAFETY PARAMETER — default pending owner confirmation against the ODD's
+// recovery-confirmation requirement (cf. Kirra SG-013 streak/window).
+//
+// (Note: the prior single-confirmation behavior — `Degraded -> Recovery ->
+// Nominal` — was effectively a 2-tick threshold; this conservative default
+// of 3 makes recovery strictly harder, never easier. The degrade path is
+// unchanged: a single degraded tick still drops to `Degraded` immediately.)
+pub const DEFAULT_RECOVERY_CONFIRM_TICKS: u32 = 3;
+
 /// Clock-driven control loop wrapping an InferenceLoop with a lifecycle
 /// state machine.
 ///
@@ -31,6 +43,13 @@ pub struct ControlLoop<B: InferenceBackend, S: SensorStream> {
     /// Stored as Option so the first tick always fires regardless of
     /// the clock's current value (including t=0 with MockClock).
     last_tick_ms: Option<u64>,
+    /// Consecutive non-degraded ticks required to recover `Degraded -> Nominal`.
+    /// SAFETY PARAMETER — see `DEFAULT_RECOVERY_CONFIRM_TICKS`.
+    recovery_confirm_ticks: u32,
+    /// Running count of consecutive non-degraded ticks. Reset to 0 on any
+    /// degraded tick (the degrade path is immediate and unchanged); only the
+    /// recovery transition consults it against `recovery_confirm_ticks`.
+    recovery_streak: u32,
 }
 
 impl<B, S> ControlLoop<B, S>
@@ -58,7 +77,25 @@ where
             clock: Arc::new(WallClock),
             tick_interval_ms: (1000.0 / hz).round() as u64,
             last_tick_ms: None,
+            recovery_confirm_ticks: DEFAULT_RECOVERY_CONFIRM_TICKS,
+            recovery_streak: 0,
         }
+    }
+
+    /// Override the recovery-confirmation threshold (consecutive non-degraded
+    /// ticks required for `Degraded -> Nominal`). Tunable because the value is
+    /// a SAFETY PARAMETER that must be set against the deployment ODD's
+    /// recovery-confirmation requirement — see `DEFAULT_RECOVERY_CONFIRM_TICKS`.
+    /// A threshold of 0 is treated as 1 (at least one good tick is always
+    /// required to leave a degraded condition).
+    pub fn with_recovery_confirm_ticks(mut self, ticks: u32) -> Self {
+        self.recovery_confirm_ticks = ticks.max(1);
+        self
+    }
+
+    /// Current recovery-confirmation threshold.
+    pub fn recovery_confirm_ticks(&self) -> u32 {
+        self.recovery_confirm_ticks
     }
 
     /// Override the clock. Primarily used in tests to inject a `MockClock`
@@ -124,9 +161,35 @@ where
             RuntimeState::EmergencyStop => crate::safety::SafetyPosture::LockedOut,
             _ => crate::safety::SafetyPosture::Degraded,
         };
-        let snapshot = self.inner.tick(current_frame, safety_posture).await?;
+        // Fail-closed: a propagated inner-tick error drives the runtime to
+        // EmergencyStop BEFORE returning, matching the sensor-exhaustion path
+        // above. This makes the runtime's own state reflect the safe condition
+        // rather than relying on the caller honoring the "Err = unrecoverable"
+        // contract.
+        let snapshot = match self.inner.tick(current_frame, safety_posture).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.state = RuntimeState::EmergencyStop;
+                return Err(e);
+            }
+        };
 
-        self.state = next_state(self.state, snapshot.active_state_degraded);
+        // Recovery hysteresis: a degraded tick resets the streak immediately
+        // (degrade path unchanged); a non-degraded tick advances it. The streak
+        // gates only the `Degraded -> Nominal` recovery transition inside
+        // `next_state`.
+        let degraded = snapshot.active_state_degraded;
+        if degraded {
+            self.recovery_streak = 0;
+        } else {
+            self.recovery_streak = self.recovery_streak.saturating_add(1);
+        }
+        self.state = next_state(
+            self.state,
+            degraded,
+            self.recovery_streak,
+            self.recovery_confirm_ticks,
+        );
 
         Ok(Some(snapshot))
     }
@@ -134,10 +197,26 @@ where
 
 /// Pure state-transition function — extracted for testability.
 ///
-/// Note: Recovery is a single-tick hysteresis state. A real safety
-/// integration would likely require N consecutive non-degraded ticks
-/// before fully transitioning to Nominal.
-fn next_state(current: RuntimeState, degraded: bool) -> RuntimeState {
+/// Recovery hysteresis: leaving `Degraded` back to `Nominal` now requires
+/// `recovery_confirm_ticks` consecutive non-degraded ticks. `streak` is the
+/// caller-maintained count of consecutive non-degraded ticks INCLUDING the
+/// current one (reset to 0 by the caller on any degraded tick). While the
+/// streak is below the threshold the loop dwells in `Recovery` (the confirming
+/// state); it promotes to `Nominal` only once `streak >= threshold`.
+///
+/// The degrade direction is unchanged and immediate: any degraded tick drops to
+/// `Degraded` regardless of streak. `EmergencyStop` is terminal. Startup
+/// (`Warmup -> Nominal`) is not gated — only the recovery transition is.
+///
+/// (A threshold of 2 reproduces the prior `Degraded -> Recovery -> Nominal`
+/// two-tick behavior exactly; the default of 3 is strictly more conservative.)
+fn next_state(
+    current: RuntimeState,
+    degraded: bool,
+    streak: u32,
+    recovery_confirm_ticks: u32,
+) -> RuntimeState {
+    let threshold = recovery_confirm_ticks.max(1);
     match current {
         RuntimeState::Initializing => RuntimeState::Warmup,
         RuntimeState::Warmup => {
@@ -157,6 +236,9 @@ fn next_state(current: RuntimeState, degraded: bool) -> RuntimeState {
         RuntimeState::Degraded => {
             if degraded {
                 RuntimeState::Degraded
+            } else if streak >= threshold {
+                // Single-tick threshold: recover directly.
+                RuntimeState::Nominal
             } else {
                 RuntimeState::Recovery
             }
@@ -164,8 +246,12 @@ fn next_state(current: RuntimeState, degraded: bool) -> RuntimeState {
         RuntimeState::Recovery => {
             if degraded {
                 RuntimeState::Degraded
-            } else {
+            } else if streak >= threshold {
                 RuntimeState::Nominal
+            } else {
+                // Still confirming — dwell in Recovery until the streak reaches
+                // the threshold.
+                RuntimeState::Recovery
             }
         }
         // EmergencyStop is terminal; no transitions out.
@@ -177,15 +263,20 @@ fn next_state(current: RuntimeState, degraded: bool) -> RuntimeState {
 mod tests {
     use super::*;
 
+    // Default-threshold (3) constant for these pure transition tests. `streak`
+    // is "consecutive non-degraded ticks including the current one".
+    const T: u32 = DEFAULT_RECOVERY_CONFIRM_TICKS;
+
     #[test]
     fn warmup_stays_warmup_while_degraded() {
-        assert_eq!(next_state(RuntimeState::Warmup, true), RuntimeState::Warmup);
+        assert_eq!(next_state(RuntimeState::Warmup, true, 0, T), RuntimeState::Warmup);
     }
 
     #[test]
     fn warmup_transitions_to_nominal_when_healthy() {
+        // Startup is NOT gated by the recovery streak — one good tick promotes.
         assert_eq!(
-            next_state(RuntimeState::Warmup, false),
+            next_state(RuntimeState::Warmup, false, 1, T),
             RuntimeState::Nominal
         );
     }
@@ -193,7 +284,7 @@ mod tests {
     #[test]
     fn nominal_transitions_to_degraded_when_degraded() {
         assert_eq!(
-            next_state(RuntimeState::Nominal, true),
+            next_state(RuntimeState::Nominal, true, 0, T),
             RuntimeState::Degraded
         );
     }
@@ -201,15 +292,16 @@ mod tests {
     #[test]
     fn nominal_stays_nominal_when_healthy() {
         assert_eq!(
-            next_state(RuntimeState::Nominal, false),
+            next_state(RuntimeState::Nominal, false, 5, T),
             RuntimeState::Nominal
         );
     }
 
     #[test]
     fn degraded_transitions_to_recovery_when_healthy() {
+        // First good tick (streak=1) below threshold 3 → dwell in Recovery.
         assert_eq!(
-            next_state(RuntimeState::Degraded, false),
+            next_state(RuntimeState::Degraded, false, 1, T),
             RuntimeState::Recovery
         );
     }
@@ -217,15 +309,16 @@ mod tests {
     #[test]
     fn degraded_stays_degraded_when_still_degraded() {
         assert_eq!(
-            next_state(RuntimeState::Degraded, true),
+            next_state(RuntimeState::Degraded, true, 0, T),
             RuntimeState::Degraded
         );
     }
 
     #[test]
     fn recovery_transitions_to_nominal_when_confirmed_healthy() {
+        // Streak has reached the threshold → confirmed recovery.
         assert_eq!(
-            next_state(RuntimeState::Recovery, false),
+            next_state(RuntimeState::Recovery, false, T, T),
             RuntimeState::Nominal
         );
     }
@@ -233,7 +326,7 @@ mod tests {
     #[test]
     fn recovery_returns_to_degraded_when_flapping() {
         assert_eq!(
-            next_state(RuntimeState::Recovery, true),
+            next_state(RuntimeState::Recovery, true, 0, T),
             RuntimeState::Degraded
         );
     }
@@ -241,11 +334,11 @@ mod tests {
     #[test]
     fn emergency_stop_is_sticky() {
         assert_eq!(
-            next_state(RuntimeState::EmergencyStop, false),
+            next_state(RuntimeState::EmergencyStop, false, T, T),
             RuntimeState::EmergencyStop
         );
         assert_eq!(
-            next_state(RuntimeState::EmergencyStop, true),
+            next_state(RuntimeState::EmergencyStop, true, 0, T),
             RuntimeState::EmergencyStop
         );
     }
@@ -253,13 +346,51 @@ mod tests {
     #[test]
     fn initializing_transitions_unconditionally_to_warmup() {
         assert_eq!(
-            next_state(RuntimeState::Initializing, false),
+            next_state(RuntimeState::Initializing, false, 1, T),
             RuntimeState::Warmup
         );
         assert_eq!(
-            next_state(RuntimeState::Initializing, true),
+            next_state(RuntimeState::Initializing, true, 0, T),
             RuntimeState::Warmup
         );
+    }
+
+    // ── CHANGE 2: recovery hysteresis (pure next_state) ──────────────────────
+
+    #[test]
+    fn recovery_dwells_until_streak_reaches_threshold() {
+        // threshold 3: streaks 1 and 2 stay in Recovery; streak 3 promotes.
+        assert_eq!(next_state(RuntimeState::Degraded, false, 1, 3), RuntimeState::Recovery);
+        assert_eq!(next_state(RuntimeState::Recovery, false, 2, 3), RuntimeState::Recovery);
+        assert_eq!(next_state(RuntimeState::Recovery, false, 3, 3), RuntimeState::Nominal);
+    }
+
+    #[test]
+    fn threshold_one_recovers_in_a_single_good_tick() {
+        // A threshold of 1 collapses to direct Degraded → Nominal recovery.
+        assert_eq!(next_state(RuntimeState::Degraded, false, 1, 1), RuntimeState::Nominal);
+    }
+
+    #[test]
+    fn threshold_two_reproduces_prior_two_tick_behavior() {
+        // Prior behavior: Degraded → Recovery → Nominal (two good ticks).
+        assert_eq!(next_state(RuntimeState::Degraded, false, 1, 2), RuntimeState::Recovery);
+        assert_eq!(next_state(RuntimeState::Recovery, false, 2, 2), RuntimeState::Nominal);
+    }
+
+    #[test]
+    fn degrade_is_immediate_regardless_of_streak() {
+        // A degraded tick drops to Degraded from any recovering state, even with
+        // a large prior streak (the degrade path is never gated).
+        assert_eq!(next_state(RuntimeState::Nominal, true, 99, 3), RuntimeState::Degraded);
+        assert_eq!(next_state(RuntimeState::Recovery, true, 99, 3), RuntimeState::Degraded);
+        assert_eq!(next_state(RuntimeState::Degraded, true, 99, 3), RuntimeState::Degraded);
+    }
+
+    #[test]
+    fn zero_threshold_is_clamped_to_one() {
+        // A 0 threshold must not allow recovery with no confirmation; clamped to 1.
+        assert_eq!(next_state(RuntimeState::Degraded, false, 1, 0), RuntimeState::Nominal);
     }
 
     #[test]
@@ -432,5 +563,163 @@ mod tests {
         assert!(result.is_ok(), "tick must not error: {:?}", result);
         let snapshot = result.unwrap();
         assert!(snapshot.is_some(), "first tick must fire with WallClock default");
+    }
+
+    // ── CHANGE 1 + CHANGE 2: loop-driven fail-closed / hysteresis tests ──────
+    //
+    // These drive the real `ControlLoop::tick()` (not just the pure `next_state`)
+    // to prove the error→EmergencyStop wiring and the streak management.
+
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex;
+    use crate::backend::{
+        BackendError, InferenceBackend as IB, ModelHandle as MH, PrecisionMode, TensorBatch,
+        TensorStorage,
+    };
+    use crate::sensor::{SensorFrame, SensorStream as SS};
+
+    fn empty_model(id: &str) -> MH {
+        MH {
+            model_id: id.into(),
+            input_shapes: HashMap::new(),
+            output_shapes: HashMap::new(),
+            expected_precision: PrecisionMode::FP32,
+        }
+    }
+
+    /// Backend whose degraded-ness is scripted per tick. For each `degrade` flag
+    /// (front→back) it emits a NaN `cmd_vel_linear`, which the scheduler's parser
+    /// rejects → `active_state_degraded == true` (a deterministic, timing-free
+    /// lever — unlike frame age, which depends on the monotonic clock). A `false`
+    /// flag emits finite zero velocities → healthy. Exhausted script → healthy.
+    struct ScriptedBackend { degrade: Mutex<VecDeque<bool>> }
+    impl IB for ScriptedBackend {
+        fn load_model(&self, _: &str) -> Result<MH, BackendError> { Ok(empty_model("scripted")) }
+        fn run(&self, _: &MH, _: &TensorBatch) -> Result<TensorBatch<'static>, BackendError> {
+            let degrade = self.degrade.lock().unwrap().pop_front().unwrap_or(false);
+            let linear = if degrade { f32::NAN } else { 0.0_f32 };
+            let mut map = HashMap::new();
+            map.insert("cmd_vel_linear".to_string(), TensorStorage::Owned(vec![linear]));
+            map.insert("cmd_vel_angular".to_string(), TensorStorage::Owned(vec![0.0_f32]));
+            Ok(TensorBatch { named_tensors: map, metadata: HashMap::new() })
+        }
+    }
+
+    /// Backend whose inference always fails — forces `inner.tick()` to return Err.
+    struct ErrBackend;
+    impl IB for ErrBackend {
+        fn load_model(&self, _: &str) -> Result<MH, BackendError> { Ok(empty_model("err")) }
+        fn run(&self, _: &MH, _: &TensorBatch) -> Result<TensorBatch<'static>, BackendError> {
+            Err(BackendError::ExecutionFailure("forced inner-tick failure".into()))
+        }
+    }
+
+    /// Always-fresh frame source (degraded-ness is driven by the backend, not the
+    /// frame, so the frames just need to exist).
+    struct FreshStream { id: u64 }
+    impl SS for FreshStream {
+        fn next_frame(&mut self) -> Option<SensorFrame> {
+            self.id += 1;
+            Some(SensorFrame::new(
+                self.id,
+                TensorBatch { named_tensors: HashMap::new(), metadata: HashMap::new() },
+            ))
+        }
+    }
+
+    /// Builds a loop driven by a per-tick degrade script, and RETURNS the actuator
+    /// receiver so the caller keeps it alive — otherwise the channel closes and
+    /// the per-tick command flush would error (and, post-CHANGE-1, trip
+    /// EmergencyStop), masking the hysteresis under test.
+    fn loop_with(
+        degrade_script: Vec<bool>,
+        threshold: u32,
+    ) -> (ControlLoop<ScriptedBackend, FreshStream>, mpsc::Receiver<ControlCommand>) {
+        let backend = Arc::new(ScriptedBackend { degrade: Mutex::new(degrade_script.into()) });
+        let model = backend.load_model("").unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let control =
+            ControlLoop::new(backend, model, FreshStream { id: 0 }, tx, 10.0)
+                .with_tick_interval_ms(0) // every tick() fires
+                .with_recovery_confirm_ticks(threshold);
+        (control, rx)
+    }
+
+    /// CHANGE 1: a propagated inner-tick error drives the runtime to
+    /// EmergencyStop before returning Err (state consistency, fail-closed).
+    #[tokio::test]
+    async fn inner_tick_error_drives_emergency_stop() {
+        let backend = Arc::new(ErrBackend);
+        let model = backend.load_model("").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut control = ControlLoop::new(
+            backend, model, FreshStream { id: 0 }, tx, 10.0,
+        )
+        .with_tick_interval_ms(0);
+
+        let r = control.tick().await;
+        assert!(r.is_err(), "a failing inner tick must propagate as Err, got {r:?}");
+        assert_eq!(
+            control.state(),
+            RuntimeState::EmergencyStop,
+            "a propagated inner-tick error must set EmergencyStop (matching the sensor path)"
+        );
+    }
+
+    /// CHANGE 2 (a + b): recovery requires exactly `threshold` consecutive good
+    /// ticks — one good tick does NOT recover when threshold > 1.
+    #[tokio::test]
+    async fn loop_recovery_requires_threshold_consecutive_good_ticks() {
+        let (mut control, _rx) = loop_with(vec![], 3); // all healthy ticks
+        control.set_state_for_test(RuntimeState::Degraded);
+
+        // (a) one good tick must not recover at threshold 3.
+        control.tick().await.unwrap();
+        assert_eq!(control.state(), RuntimeState::Recovery, "1 good tick → confirming, not Nominal");
+
+        control.tick().await.unwrap();
+        assert_ne!(control.state(), RuntimeState::Nominal, "2 good ticks still below threshold");
+
+        // (b) the 3rd consecutive good tick confirms recovery → Nominal.
+        control.tick().await.unwrap();
+        assert_eq!(control.state(), RuntimeState::Nominal, "exactly 3 consecutive good ticks recover");
+    }
+
+    /// CHANGE 2 (c): a degraded tick mid-streak resets the counter, so recovery
+    /// must restart from zero (no early promotion to Nominal).
+    #[tokio::test]
+    async fn loop_degraded_tick_mid_streak_resets_recovery() {
+        // healthy, healthy, DEGRADED, then healthy… (exhausted → healthy).
+        let (mut control, _rx) = loop_with(vec![false, false, true], 3);
+        control.set_state_for_test(RuntimeState::Degraded);
+
+        control.tick().await.unwrap(); // healthy → Recovery (streak 1)
+        control.tick().await.unwrap(); // healthy → Recovery (streak 2)
+        assert_eq!(control.state(), RuntimeState::Recovery);
+
+        control.tick().await.unwrap(); // DEGRADED → Degraded (streak reset 0)
+        assert_eq!(control.state(), RuntimeState::Degraded, "mid-streak degrade drops back to Degraded");
+
+        control.tick().await.unwrap(); // healthy → Recovery (streak 1)
+        assert_ne!(control.state(), RuntimeState::Nominal, "counter reset: must not recover immediately");
+        control.tick().await.unwrap(); // healthy → Recovery (streak 2)
+        assert_ne!(control.state(), RuntimeState::Nominal, "still below threshold after reset");
+        control.tick().await.unwrap(); // healthy → Nominal (streak 3) — proves restart from 0
+        assert_eq!(control.state(), RuntimeState::Nominal, "3 fresh ticks after the reset recover");
+    }
+
+    /// CHANGE 2 (d): the degrade direction is unchanged — a single degraded tick
+    /// drops to Degraded immediately (never gated by the streak).
+    #[tokio::test]
+    async fn loop_degrade_is_immediate_on_first_degraded_tick() {
+        let (mut control, _rx) = loop_with(vec![true], 3); // first tick degraded
+        control.set_state_for_test(RuntimeState::Nominal);
+
+        control.tick().await.unwrap();
+        assert_eq!(
+            control.state(),
+            RuntimeState::Degraded,
+            "one degraded tick must drop to Degraded immediately (degrade path unchanged)"
+        );
     }
 }
