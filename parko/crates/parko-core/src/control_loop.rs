@@ -124,7 +124,18 @@ where
             RuntimeState::EmergencyStop => crate::safety::SafetyPosture::LockedOut,
             _ => crate::safety::SafetyPosture::Degraded,
         };
-        let snapshot = self.inner.tick(current_frame, safety_posture).await?;
+        // Fail-closed: a propagated inner-tick error drives the runtime to
+        // EmergencyStop BEFORE returning, matching the sensor-exhaustion path
+        // above. This makes the runtime's own state reflect the safe condition
+        // rather than relying on the caller honoring the "Err = unrecoverable"
+        // contract.
+        let snapshot = match self.inner.tick(current_frame, safety_posture).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.state = RuntimeState::EmergencyStop;
+                return Err(e);
+            }
+        };
 
         self.state = next_state(self.state, snapshot.active_state_degraded);
 
@@ -432,5 +443,65 @@ mod tests {
         assert!(result.is_ok(), "tick must not error: {:?}", result);
         let snapshot = result.unwrap();
         assert!(snapshot.is_some(), "first tick must fire with WallClock default");
+    }
+
+    // ── CHANGE 1: propagated inner-tick error sets EmergencyStop ──────────────
+
+    use std::collections::HashMap;
+    use crate::backend::{
+        BackendError, InferenceBackend as IB, ModelHandle as MH, PrecisionMode, TensorBatch,
+    };
+    use crate::sensor::{SensorFrame, SensorStream as SS};
+
+    fn empty_model(id: &str) -> MH {
+        MH {
+            model_id: id.into(),
+            input_shapes: HashMap::new(),
+            output_shapes: HashMap::new(),
+            expected_precision: PrecisionMode::FP32,
+        }
+    }
+
+    /// Backend whose inference always fails — forces `inner.tick()` to return Err.
+    struct ErrBackend;
+    impl IB for ErrBackend {
+        fn load_model(&self, _: &str) -> Result<MH, BackendError> { Ok(empty_model("err")) }
+        fn run(&self, _: &MH, _: &TensorBatch) -> Result<TensorBatch<'static>, BackendError> {
+            Err(BackendError::ExecutionFailure("forced inner-tick failure".into()))
+        }
+    }
+
+    /// Always-fresh frame source.
+    struct FreshStream { id: u64 }
+    impl SS for FreshStream {
+        fn next_frame(&mut self) -> Option<SensorFrame> {
+            self.id += 1;
+            Some(SensorFrame::new(
+                self.id,
+                TensorBatch { named_tensors: HashMap::new(), metadata: HashMap::new() },
+            ))
+        }
+    }
+
+    /// A propagated inner-tick error must drive the runtime to EmergencyStop
+    /// before returning Err (state consistency, fail-closed) — matching the
+    /// sensor-exhaustion path.
+    #[tokio::test]
+    async fn inner_tick_error_drives_emergency_stop() {
+        let backend = Arc::new(ErrBackend);
+        let model = backend.load_model("").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut control = ControlLoop::new(
+            backend, model, FreshStream { id: 0 }, tx, 10.0,
+        )
+        .with_tick_interval_ms(0);
+
+        let r = control.tick().await;
+        assert!(r.is_err(), "a failing inner tick must propagate as Err, got {r:?}");
+        assert_eq!(
+            control.state(),
+            RuntimeState::EmergencyStop,
+            "a propagated inner-tick error must set EmergencyStop (matching the sensor path)"
+        );
     }
 }
