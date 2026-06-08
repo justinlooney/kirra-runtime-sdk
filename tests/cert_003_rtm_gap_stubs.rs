@@ -71,28 +71,27 @@ fn test_safety_goal_sg_009_ha_standby_promotion_within_timeout() {
     // See src/standby_monitor.rs mod sg_009_promotion_act_tests (CERT-003).
 }
 
+// SG-010 — Audit Chain Tamper Detection (ASIL B): tamper-detection IMPLEMENTED;
+// startup-verification sub-gap OPEN.
+//
+// Tamper detection is verified IN-CRATE in `src/verifier_store.rs` mod
+// `sg_010_audit_tamper_tests` (file-backed tempfile DB + the `#[cfg(test)]
+// pub(crate) raw_conn` seam): a second connection back-dates a previously
+// written row and `verify_audit_chain_full` reports `chain_intact == false` and
+// `first_invalid_signature_index == Some(<first tampered index>)`; an unsigned
+// chain is still caught by the hash linkage alone. In-crate because `raw_conn`
+// is `#[cfg(test)] pub(crate)` (invisible to this external crate).
+//
+// OPEN sub-gap (mechanism does not exist — reported, not faked): SG-010 also
+// requires audit-chain verification to run AUTOMATICALLY at startup BEFORE the
+// listener binds. Today the bin runs only `check_startup_invariants` before
+// `TcpListener::bind` and verifies the chain on demand via `/system/audit/verify`
+// (plus a shutdown checkpoint). Wiring verify-and-abort into startup is a
+// behavior change, out of scope for a test-only increment.
 #[test]
-#[ignore = "TODO(CERT-004): SG-010 needs file-backed DB; in-memory store is per-connection"]
+#[ignore = "Implemented in src/verifier_store.rs — mod sg_010_audit_tamper_tests (startup-verify sub-gap OPEN, see note)"]
 fn test_safety_goal_sg_010_audit_chain_tamper_detection() {
-    // Safety Goal: SG-010 — Audit Chain Tamper Detection (ASIL B)
-    // This test must verify: AuditChainLinker detects any modification to a
-    // previously written entry (prev_hash mismatch), the
-    // /system/audit/verify endpoint returns the first tampered index, and
-    // verification runs automatically on service startup before the
-    // listener binds.
-    //
-    // INFRASTRUCTURE NEEDED:
-    // - File-backed SQLite (not `:memory:`) so a second connection can
-    //   tamper rows after the first connection wrote them.
-    //   `:memory:` databases are per-connection — a tamper-via-second-
-    //   connection approach is not viable against in-memory stores.
-    //   Alternative: add a `#[cfg(test)] pub fn raw_conn(&mut self) -> &mut Connection`
-    //   helper to VerifierStore that exposes the connection for tampering.
-    // - tempfile crate (or std::env::temp_dir + std::fs::remove_file) for
-    //   the DB path; add to dev-dependencies in a follow-up.
-    // - Use verifier_store::VerifierStore::verify_audit_chain_full(None)
-    //   to assert chain_intact == false after tampering.
-    todo!("implement SG-010 verification")
+    // See src/verifier_store.rs mod sg_010_audit_tamper_tests (CERT-003).
 }
 
 #[test]
