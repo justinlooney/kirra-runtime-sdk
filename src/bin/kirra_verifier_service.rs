@@ -79,6 +79,81 @@ async fn require_admin_token(request: Request, next: Next) -> Result<Response, S
     Ok(next.run(request).await)
 }
 
+// --- SG-008: process fail-closed startup sentinel ---------------------------
+//
+// Verifies: SG-008 (ASIL D) — Process Fail-Closed on Startup. The service must
+// refuse to bind its listener unless the safety-critical startup invariants
+// hold. The checks are factored into a pure predicate so they are
+// deterministically testable without `process::exit` (see sg_008_cert_tests):
+// `main` builds a `StartupContext` from the real boot facts, and aborts BEFORE
+// `TcpListener::bind` on any `Err` — so "the listener never binds before
+// invariants pass" holds by construction (bind is strictly after the check).
+
+/// The boot facts the startup sentinel evaluates. Built once in `main` from the
+/// real environment/store/wiring; consumed by `check_startup_invariants`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StartupContext {
+    /// `KIRRA_ADMIN_TOKEN` is present and non-empty (CRITICAL INVARIANT #6).
+    pub admin_token_present: bool,
+    /// The SQLite store reports `journal_mode = wal` (CRITICAL INVARIANT #12
+    /// ordering depends on the WAL-mode durable seam).
+    pub sqlite_wal: bool,
+    /// True on the Active path. PassiveStandby is read-only and intentionally
+    /// runs neither the watchdog nor the posture engine, so those two
+    /// invariants are evaluated ONLY when this is true.
+    pub mode_active: bool,
+    /// The telemetry watchdog task was spawned (Active path; SG-003 / SG9).
+    pub watchdog_spawned: bool,
+    /// The serialized posture-engine worker is running (`posture_engine_tx` set).
+    pub posture_engine_running: bool,
+}
+
+/// The first violated startup invariant, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupInvariant {
+    AdminTokenMissing,
+    SqliteNotWal,
+    WatchdogNotSpawned,
+    PostureEngineDown,
+}
+
+impl std::fmt::Display for StartupInvariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::AdminTokenMissing => "KIRRA_ADMIN_TOKEN absent or empty",
+            Self::SqliteNotWal => "SQLite store is not in WAL journal mode",
+            Self::WatchdogNotSpawned => "telemetry watchdog not spawned (Active path)",
+            Self::PostureEngineDown => "posture-engine worker not running (Active path)",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// SG-008 (ASIL D) — pure startup-invariant predicate. Returns the first
+/// violated invariant, or `Ok(())` when all hold. Fail-closed and order-stable.
+/// The watchdog / posture-engine invariants apply only to the Active path
+/// (`mode_active`); PassiveStandby is read-only and runs neither, so requiring
+/// them there would wrongly abort a valid standby.
+//
+// Verifies: SG-008
+pub(crate) fn check_startup_invariants(ctx: &StartupContext) -> Result<(), StartupInvariant> {
+    if !ctx.admin_token_present {
+        return Err(StartupInvariant::AdminTokenMissing);
+    }
+    if !ctx.sqlite_wal {
+        return Err(StartupInvariant::SqliteNotWal);
+    }
+    if ctx.mode_active {
+        if !ctx.watchdog_spawned {
+            return Err(StartupInvariant::WatchdogNotSpawned);
+        }
+        if !ctx.posture_engine_running {
+            return Err(StartupInvariant::PostureEngineDown);
+        }
+    }
+    Ok(())
+}
+
 async fn require_client_identity(
     State(svc): State<Arc<ServiceState>>,
     request: Request,
@@ -1856,6 +1931,10 @@ async fn main() {
     // PassiveStandby does not run this — its promotion path already calls
     // recalculate_and_broadcast once on transition to Active. Ongoing
     // freshness on the freshly-promoted node is filed as a C2 follow-up.
+    // SG-008 startup-invariant fact: set true once the watchdog is spawned on
+    // the Active path (PassiveStandby leaves it false — and the sentinel does
+    // not require it there).
+    let mut watchdog_spawned = false;
     if svc_state.app.is_active() {
         kirra_runtime_sdk::posture_engine::recalculate_and_broadcast(
             &svc_state.app,
@@ -1888,6 +1967,7 @@ async fn main() {
             Arc::clone(&svc_state.app),
             posture_tx.clone(),
         );
+        watchdog_spawned = true;
         tracing::info!(
             timeout_ms = kirra_runtime_sdk::telemetry_watchdog::AV_TELEMETRY_TIMEOUT_MS,
             "telemetry watchdog spawned (SG9 sensor-liveness)"
@@ -2006,6 +2086,29 @@ async fn main() {
             enforce_posture_routing,
         ));
 
+    // SG-008 (ASIL D): fail closed BEFORE binding the listener. Build the boot
+    // facts and evaluate the startup-invariant predicate; on any violation, log
+    // and abort so no request can reach a half-initialized service. Bind is
+    // strictly AFTER this check, so "the listener never binds before invariants
+    // pass" holds by construction.
+    let startup_ctx = StartupContext {
+        admin_token_present: std::env::var("KIRRA_ADMIN_TOKEN")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false),
+        sqlite_wal: svc_state.app.store.lock().unwrap().is_wal_mode(),
+        mode_active: svc_state.app.is_active(),
+        watchdog_spawned,
+        posture_engine_running: svc_state.posture_engine_tx.get().is_some(),
+    };
+    if let Err(violation) = check_startup_invariants(&startup_ctx) {
+        tracing::error!(
+            invariant = %violation,
+            "SG-008: startup invariant violated — aborting before listener bind (fail-closed)"
+        );
+        std::process::exit(1);
+    }
+    tracing::info!("SG-008: startup invariants satisfied; binding listener");
+
     println!("Kirra Verifier Service listening on {listen_addr} (db: {db_path})");
     let listener = tokio::net::TcpListener::bind(&listen_addr).await
         .expect("failed to bind listener");
@@ -2049,5 +2152,142 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CERT-003 — SG-008 RTM coverage (ASIL D): Process Fail-Closed on Startup
+//
+// Verifies: SG-008 — the startup sentinel refuses to bind unless every
+// safety-critical startup invariant holds. We test the PURE predicate
+// (`check_startup_invariants`) for each individual violation, the all-present
+// Ok case, and the mode distinction (watchdog/posture-engine are required only
+// on the Active path). The abort + bind ordering is structural: `main` calls
+// this predicate immediately before `TcpListener::bind` and `process::exit(1)`s
+// on Err, so a failing predicate means the listener is never reached. These
+// live in the bin (the predicate is `pub(crate)` and not visible to an external
+// integration test).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod sg_008_cert_tests {
+    use super::{check_startup_invariants, StartupContext, StartupInvariant};
+
+    /// All invariants satisfied on the Active path.
+    fn all_ok_active() -> StartupContext {
+        StartupContext {
+            admin_token_present: true,
+            sqlite_wal: true,
+            mode_active: true,
+            watchdog_spawned: true,
+            posture_engine_running: true,
+        }
+    }
+
+    #[test]
+    fn test_startup_ok_when_all_invariants_hold() {
+        assert_eq!(
+            check_startup_invariants(&all_ok_active()),
+            Ok(()),
+            "SG-008: startup must succeed when all invariants hold"
+        );
+    }
+
+    #[test]
+    fn test_startup_aborts_without_admin_token() {
+        let ctx = StartupContext { admin_token_present: false, ..all_ok_active() };
+        assert_eq!(
+            check_startup_invariants(&ctx),
+            Err(StartupInvariant::AdminTokenMissing),
+            "SG-008: startup must fail closed when KIRRA_ADMIN_TOKEN is absent/empty"
+        );
+    }
+
+    #[test]
+    fn test_startup_aborts_when_sqlite_not_wal() {
+        let ctx = StartupContext { sqlite_wal: false, ..all_ok_active() };
+        assert_eq!(
+            check_startup_invariants(&ctx),
+            Err(StartupInvariant::SqliteNotWal),
+            "SG-008: startup must fail closed when the store is not in WAL mode"
+        );
+    }
+
+    #[test]
+    fn test_startup_aborts_when_watchdog_not_spawned_on_active() {
+        let ctx = StartupContext { watchdog_spawned: false, ..all_ok_active() };
+        assert_eq!(
+            check_startup_invariants(&ctx),
+            Err(StartupInvariant::WatchdogNotSpawned),
+            "SG-008: an Active node must fail closed if the telemetry watchdog is not spawned"
+        );
+    }
+
+    #[test]
+    fn test_startup_aborts_when_posture_engine_down_on_active() {
+        let ctx = StartupContext { posture_engine_running: false, ..all_ok_active() };
+        assert_eq!(
+            check_startup_invariants(&ctx),
+            Err(StartupInvariant::PostureEngineDown),
+            "SG-008: an Active node must fail closed if the posture-engine worker is not running"
+        );
+    }
+
+    /// PassiveStandby is read-only and runs neither the watchdog nor the
+    /// posture engine — so their absence must NOT abort a standby, but the
+    /// admin-token and WAL invariants still apply.
+    #[test]
+    fn test_standby_ok_without_watchdog_or_posture_engine() {
+        let ctx = StartupContext {
+            admin_token_present: true,
+            sqlite_wal: true,
+            mode_active: false,
+            watchdog_spawned: false,
+            posture_engine_running: false,
+        };
+        assert_eq!(
+            check_startup_invariants(&ctx),
+            Ok(()),
+            "SG-008: PassiveStandby must boot without watchdog/posture-engine (not required in read-only mode)"
+        );
+    }
+
+    #[test]
+    fn test_standby_still_requires_admin_token_and_wal() {
+        let no_token = StartupContext {
+            admin_token_present: false,
+            sqlite_wal: true,
+            mode_active: false,
+            watchdog_spawned: false,
+            posture_engine_running: false,
+        };
+        assert_eq!(
+            check_startup_invariants(&no_token),
+            Err(StartupInvariant::AdminTokenMissing),
+            "SG-008: admin token is required in every mode"
+        );
+        let no_wal = StartupContext { admin_token_present: true, sqlite_wal: false, ..no_token };
+        assert_eq!(
+            check_startup_invariants(&no_wal),
+            Err(StartupInvariant::SqliteNotWal),
+            "SG-008: WAL mode is required in every mode"
+        );
+    }
+
+    /// Order stability: when multiple invariants are violated, the admin-token
+    /// check (first/highest-priority) wins — deterministic diagnosis.
+    #[test]
+    fn test_invariant_check_order_is_stable() {
+        let ctx = StartupContext {
+            admin_token_present: false,
+            sqlite_wal: false,
+            mode_active: true,
+            watchdog_spawned: false,
+            posture_engine_running: false,
+        };
+        assert_eq!(
+            check_startup_invariants(&ctx),
+            Err(StartupInvariant::AdminTokenMissing),
+            "SG-008: the admin-token invariant must be reported first when several are violated"
+        );
     }
 }

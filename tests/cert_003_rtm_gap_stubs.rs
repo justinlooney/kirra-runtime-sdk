@@ -14,17 +14,13 @@
 // Traceability matrix:    docs/safety/REQUIREMENTS_TRACEABILITY.md
 // Gap report:             docs/safety/RTM_GAP_REPORT.md
 
-#[test]
-#[ignore = "TODO(CERT-003): implement test for SG-003"]
-fn test_safety_goal_sg_003_sensor_timeout_fault_detection() {
-    // Safety Goal: SG-003 — Sensor Timeout Fault Detection (ASIL D)
-    // This test must verify: spawn_telemetry_watchdog marks any sensor
-    // node Untrusted within AV_TELEMETRY_TIMEOUT_MS (2000 ms) +
-    // AV_WATCHDOG_SWEEP_MS (100 ms) of last telemetry, and sends a
-    // PostureRecalcTrigger within the same sweep cycle.
-    // Currently unimplemented — tracked in CERT-003
-    todo!("implement SG-003 verification")
-}
+// SG-003 — Sensor Timeout Fault Detection (ASIL D): IMPLEMENTED (CERT-003).
+// The RTM-named tests live in `src/telemetry_watchdog.rs` mod `sg_003_cert_tests`
+// (test_watchdog_marks_node_untrusted_after_timeout,
+//  test_watchdog_detection_latency_within_bound,
+//  test_watchdog_triggers_posture_recalculation). They drive `watchdog_sweep_once`,
+// which is `pub(crate)`, so they must be in-crate unit tests — not this external
+// integration file. The mechanism carries a `// Verifies: SG-003` tag.
 
 #[test]
 #[ignore = "Implemented in tests/fault_injection.rs — test_safety_goal_sg_006_unknown_command_denial"]
@@ -32,29 +28,34 @@ fn test_safety_goal_sg_006_unknown_command_denial() {
     // See tests/fault_injection.rs for full implementation (CERT-004).
 }
 
+// SG-007 — Cross-Asset Fleet Lockout Propagation (ASIL D): the propagation
+// SAFETY PROPERTY (leader LockedOut → all Nominal followers Degraded within one
+// synchronous fabric pass) is IMPLEMENTED in tests/fault_injection.rs
+// (test_safety_goal_sg_007_cross_asset_lockout_propagation); the mechanism
+// (FabricRouter::propagate_cross_asset_trust) carries a `// Verifies: SG-007` tag.
+//
+// REMAINING SUB-GAP — the RTM also names a causal-log assertion, but
+// propagate_cross_asset_trust does NOT record propagation events to any causal
+// log (FabricCausalLog lives on ServiceState and is not wired into the router).
+// Satisfying it requires adding audit/causal-log wiring to the propagation
+// mechanism (a code change, not just a test). Kept as an explicit ignored stub
+// so the gap stays visible and honest.
 #[test]
-#[ignore = "TODO(CERT-003): implement test for SG-007"]
-fn test_safety_goal_sg_007_cross_asset_lockout_propagation() {
-    // Safety Goal: SG-007 — Cross-Asset Fleet Lockout Propagation (ASIL D)
-    // This test must verify: when a leader asset transitions to LockedOut,
-    // propagate_cross_asset_trust degrades all follower assets within one
-    // fabric governor tick (target <= 500 ms), and the propagation event
-    // is recorded in the fabric causal log.
-    // Currently unimplemented — tracked in CERT-003
-    todo!("implement SG-007 verification")
+#[ignore = "TODO(CERT-003): SG-007 propagation→causal-log recording not yet wired (see note above)"]
+fn test_safety_goal_sg_007_causal_log_records_propagation_event() {
+    todo!("wire propagate_cross_asset_trust to FabricCausalLog, then assert the leader→follower event")
 }
 
-#[test]
-#[ignore = "TODO(CERT-003): implement test for SG-008"]
-fn test_safety_goal_sg_008_process_fail_closed_on_crash() {
-    // Safety Goal: SG-008 — Process Fail-Closed on Crash (ASIL D)
-    // This test must verify: startup_sentinel aborts the process if any
-    // safety invariant fails (admin token missing, watchdog not spawned,
-    // posture engine not running, SQLite not in WAL mode), and the TCP
-    // listener never binds before all invariants pass.
-    // Currently unimplemented — tracked in CERT-003
-    todo!("implement SG-008 verification")
-}
+// SG-008 — Process Fail-Closed on Startup (ASIL D): IMPLEMENTED (CERT-003).
+// The startup-invariant predicate `check_startup_invariants` + its
+// `StartupContext` / `StartupInvariant` live in
+// `src/bin/kirra_verifier_service.rs` and are tested by mod `sg_008_cert_tests`
+// there (admin-token / WAL / watchdog / posture-engine violations, the
+// all-present Ok case, the Active-vs-PassiveStandby distinction, and check-order
+// stability). They are `pub(crate)` in the binary, so the tests must be in-bin —
+// not in this external integration file. `main` evaluates the predicate
+// immediately before `TcpListener::bind` and aborts on Err, so the listener
+// never binds before invariants pass. The predicate carries `// Verifies: SG-008`.
 
 #[test]
 #[ignore = "TODO(CERT-003): implement test for SG-009"]
