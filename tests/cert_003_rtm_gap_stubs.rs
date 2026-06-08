@@ -94,16 +94,25 @@ fn test_safety_goal_sg_010_audit_chain_tamper_detection() {
     // See src/verifier_store.rs mod sg_010_audit_tamper_tests (CERT-003).
 }
 
+// SG-012 — DNP3 Broadcast Command Mandatory Audit (ASIL B): MECHANISM GAP (OPEN).
+//
+// Investigated (CERT-003, 2026-06-08): the property is NOT testable today because
+// the mechanism does not exist. `src/adapters/dnp3.rs::Dnp3Adapter::evaluate` is a
+// PURE classifier — it returns a `Dnp3Evaluation { is_broadcast, is_control, ... }`
+// and nothing else. There is:
+//   - no audit-chain write on the DNP3 path (broadcast or otherwise),
+//   - no control-output application at this layer, hence
+//   - no "audit-before-control" ordering and no "block control on audit-write
+//     failure" fail-closed path to assert.
+// The only caller, `protocol_adapter.rs` (the `/industrial/dnp3/evaluate` route),
+// likewise just classifies. Writing a passing test here would assert nothing
+// (DO NOT FAKE COVERAGE). Closing SG-012 requires ADDING the mandatory-audit-
+// before-control mechanism — a behavior change, out of scope for a test-only
+// increment. Reported as an open mechanism gap. See RTM_GAP_REPORT.md (SG-012).
 #[test]
-#[ignore = "TODO(CERT-003): implement test for SG-012"]
+#[ignore = "MECHANISM GAP (CERT-003): DNP3 audit-before-control does not exist; see note + RTM_GAP_REPORT.md"]
 fn test_safety_goal_sg_012_dnp3_broadcast_mandatory_audit() {
-    // Safety Goal: SG-012 — DNP3 Broadcast Command Mandatory Audit (ASIL B)
-    // This test must verify: the DNP3 adapter writes an audit chain entry
-    // for every message to DNP3_BROADCAST_ADDRESS *before* any control
-    // output is applied, and an audit write failure on a broadcast command
-    // blocks the control output (fail-closed audit ordering).
-    // Currently unimplemented — tracked in CERT-003
-    todo!("implement SG-012 verification")
+    todo!("SG-012 mechanism (mandatory audit before control output) not implemented — see note above")
 }
 
 // SG-013 — Recovery Hysteresis Streak and Window Enforcement (ASIL B): IMPLEMENTED
