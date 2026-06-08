@@ -233,34 +233,21 @@ fn test_safety_goal_sg_014_federation_report_replay_prevention() {
     // integration test against VerifierStore in a future increment.
 }
 
+// SG-015 — Admin Token Absent Fail-Closed (ASIL B): IMPLEMENTED.
+// The env-var check is factored out of the `require_admin_token` middleware into
+// the pure `security::admin_token_ok(provided, configured)` (which uses
+// `constant_time_compare`, never `==`), so the fail-closed truth table is tested
+// without mutating process env vars (forbidden in the multithreaded runner —
+// INVARIANT #13). Tests live IN-CRATE in `src/security.rs` mod
+// `sg_015_admin_token_tests` (absent/empty configured → deny → caller maps to
+// 503; absent/mismatched provided → deny → 401; exact token → allow). The
+// middleware still maps configured-absent/empty → 503 and provided-absent/
+// mismatch → 401 (behavior unchanged); it now calls `admin_token_ok` for the
+// comparison. `admin_token_ok` carries `// Verifies: SG-015`.
 #[test]
-#[ignore = "TODO(CERT-004): SG-015 needs subprocess isolation (env-var manipulation is unsafe in Rust 1.94+)"]
+#[ignore = "Implemented in src/security.rs — mod sg_015_admin_token_tests"]
 fn test_safety_goal_sg_015_admin_token_absent_fail_closed() {
-    // Safety Goal: SG-015 — Admin Token Absent Fail-Closed (ASIL B)
-    // This test must verify: require_admin_token returns HTTP 503 when
-    // KIRRA_ADMIN_TOKEN is absent or empty, all mutation route handlers
-    // call require_admin_token, and token comparison uses
-    // constant_time_compare (never the `==` operator).
-    //
-    // INFRASTRUCTURE NEEDED:
-    // - `std::env::set_var` and `remove_var` became `unsafe` in Rust 1.80+
-    //   and CRITICAL SECURITY INVARIANT #13 forbids env-var mutation in
-    //   any multithreaded context. The default `cargo test` runner is
-    //   multithreaded, so this test must either:
-    //     a. Spawn a subprocess via `std::process::Command` invoking a
-    //        helper binary that sets/clears KIRRA_ADMIN_TOKEN and runs
-    //        the assertion in its own process address space, OR
-    //     b. Use the `serial_test` crate (dev-dependency add — currently
-    //        not allowed by the scope of this commit) to serialize.
-    // - `require_admin_token` is an axum middleware fn taking
-    //   `(Request, Next) -> Result<Response, StatusCode>`. The test must
-    //   either construct a minimal axum Router with the middleware applied
-    //   and exercise it via `tower::ServiceExt::oneshot`, or extract the
-    //   env-var check pattern into a smaller `pub(crate) fn` that's
-    //   testable in isolation.
-    // - Both routes (e.g. `/system/backup/export`) must round-trip 503
-    //   when KIRRA_ADMIN_TOKEN is absent.
-    todo!("implement SG-015 verification")
+    // See src/security.rs mod sg_015_admin_token_tests (CERT-003).
 }
 
 #[test]
