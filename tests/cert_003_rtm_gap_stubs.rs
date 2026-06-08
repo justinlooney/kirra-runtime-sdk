@@ -106,30 +106,122 @@ fn test_safety_goal_sg_012_dnp3_broadcast_mandatory_audit() {
     todo!("implement SG-012 verification")
 }
 
+// SG-013 — Recovery Hysteresis Streak and Window Enforcement (ASIL B): IMPLEMENTED
+// here (external) — the whole closure is reachable through the PUBLIC API
+// (`evaluate_recovery_report`, `HysteresisDecision`, the `AV_RECOVERY_*`
+// constants, and `VerifierStore::{new,register_av_subsystem_meta,
+// reset_recovery_streak}`), so per the placement rule it stays in this external
+// crate rather than moving in-crate.
+//
+// `evaluate_recovery_report` takes `now_ms` directly, so time is injected
+// deterministically (the VirtualClock principle: controlled timestamps, no wall
+// clock). The "injected unhealthy report" is driven through the EXACT store
+// mutation the production unhealthy path performs — `reset_recovery_streak`
+// (see the degraded branch of `handle_sensor_fault_report`) — not a test-only
+// backdoor.
 #[test]
-#[ignore = "TODO(CERT-004): SG-013 needs VerifierStore + multi-tick driver with controlled clock"]
 fn test_safety_goal_sg_013_recovery_hysteresis_streak_and_window() {
-    // Safety Goal: SG-013 — Recovery Hysteresis Streak and Window Enforcement (ASIL B)
-    // This test must verify: evaluate_recovery_report requires exactly
-    // AV_RECOVERY_STREAK_THRESHOLD (5) consecutive healthy reports inside a
-    // single AV_RECOVERY_WINDOW_MS (10000 ms) window before transitioning
-    // a node Untrusted -> Trusted; any gap or unhealthy report resets the
-    // streak counter to 0.
-    //
-    // INFRASTRUCTURE NEEDED:
-    // - `evaluate_recovery_report(store, node_id, now_ms)` loads streak
-    //   state from VerifierStore — it does not take an "is_healthy" arg,
-    //   so driving the unhealthy/streak-reset path requires a separate
-    //   API call (or direct streak-table mutation) we don't yet expose.
-    // - Test scenarios to cover:
-    //     a. 4 calls within window → StreakBuilding{current:4}
-    //     b. 5th call within window → RecoveryConfirmed{streak:5}
-    //     c. 4 calls + 11s gap + 4 calls → still StreakBuilding (window reset)
-    //     d. 4 calls + injected unhealthy report + 4 calls → still StreakBuilding
-    // - Currently no public "report unhealthy" entry point; need either
-    //   a new public fn or expose store streak helpers under #[cfg(test)].
-    // - Should reuse the temporal_scenario_tests.rs VirtualClock pattern.
-    todo!("implement SG-013 verification")
+    use kirra_runtime_sdk::recovery_hysteresis::{
+        evaluate_recovery_report, HysteresisDecision, AV_RECOVERY_STREAK_THRESHOLD,
+        AV_RECOVERY_WINDOW_MS,
+    };
+    use kirra_runtime_sdk::verifier_store::VerifierStore;
+
+    assert_eq!(AV_RECOVERY_STREAK_THRESHOLD, 5, "spec pins the threshold at 5");
+
+    // Fresh in-memory store with one registered AV node (single connection ⇒
+    // streak increments/loads are self-consistent).
+    fn store_with_node(node: &str) -> VerifierStore {
+        let store = VerifierStore::new(":memory:").expect("memory store");
+        store
+            .register_av_subsystem_meta(node, "LIDAR", "hw-0001", 0.7, 0)
+            .expect("register subsystem");
+        store
+    }
+
+    // --- Scenarios a + b: streak builds to 4, then the 5th in-window confirms.
+    {
+        let node = "lidar_a";
+        let store = store_with_node(node);
+        let base = 1_000u64;
+        for i in 0..(AV_RECOVERY_STREAK_THRESHOLD - 1) {
+            let d = evaluate_recovery_report(&store, node, base + (i as u64) * 100);
+            match d {
+                HysteresisDecision::StreakBuilding { current, required, .. } => {
+                    assert_eq!(current, i + 1, "streak must advance one per healthy report");
+                    assert_eq!(required, AV_RECOVERY_STREAK_THRESHOLD);
+                }
+                other => panic!("report {} must be StreakBuilding, got {other:?}", i + 1),
+            }
+        }
+        // (a) after exactly 4 healthy reports the streak is StreakBuilding{4}:
+        // the 4th call above asserted current == 4. (b) the 5th in-window confirms.
+        let fifth = evaluate_recovery_report(&store, node, base + 400);
+        match fifth {
+            HysteresisDecision::RecoveryConfirmed { streak } => {
+                assert_eq!(streak, AV_RECOVERY_STREAK_THRESHOLD,
+                    "the 5th in-window healthy report must confirm recovery at streak=5");
+            }
+            other => panic!("5th in-window report must be RecoveryConfirmed, got {other:?}"),
+        }
+    }
+
+    // --- Scenario c: a gap longer than the window resets the streak; the second
+    //     run of 4 reports never reaches confirmation.
+    {
+        let node = "lidar_c";
+        let store = store_with_node(node);
+        let base = 1_000u64;
+        for i in 0..4 {
+            evaluate_recovery_report(&store, node, base + i * 100); // streak 1..4, start=base
+        }
+        // First report AFTER an > AV_RECOVERY_WINDOW_MS gap → window expired.
+        let after_gap = base + AV_RECOVERY_WINDOW_MS + 1_000; // 11s after streak start
+        let expired = evaluate_recovery_report(&store, node, after_gap);
+        match expired {
+            HysteresisDecision::WindowExpired { old_streak } => {
+                assert_eq!(old_streak, 4, "the stale 4-streak must be discarded");
+            }
+            other => panic!("post-gap report must be WindowExpired, got {other:?}"),
+        }
+        // Three more in the fresh window → back up to 4, never 5 → no confirm.
+        let mut last = None;
+        for i in 1..4 {
+            last = Some(evaluate_recovery_report(&store, node, after_gap + i * 100));
+        }
+        match last.unwrap() {
+            HysteresisDecision::StreakBuilding { current, .. } => {
+                assert_eq!(current, 4,
+                    "after a window reset the streak rebuilds to 4 (8 total reports), not confirmed");
+            }
+            other => panic!("a gap must prevent confirmation; got {other:?}"),
+        }
+    }
+
+    // --- Scenario d: an injected unhealthy report (production reset path) resets
+    //     the streak; the following 4 healthy reports never confirm.
+    {
+        let node = "lidar_d";
+        let store = store_with_node(node);
+        let base = 1_000u64;
+        for i in 0..4 {
+            evaluate_recovery_report(&store, node, base + i * 100); // streak 1..4
+        }
+        // Unhealthy report ⇒ the degraded branch calls reset_recovery_streak.
+        store.reset_recovery_streak(node, base + 450).expect("reset on fault");
+
+        let mut last = None;
+        for i in 0..4 {
+            last = Some(evaluate_recovery_report(&store, node, base + 500 + i * 100)); // streak 1..4
+        }
+        match last.unwrap() {
+            HysteresisDecision::StreakBuilding { current, .. } => {
+                assert_eq!(current, 4,
+                    "an unhealthy report resets the streak to 0; 4 fresh reports rebuild to 4, not confirmed");
+            }
+            other => panic!("an unhealthy report must prevent confirmation; got {other:?}"),
+        }
+    }
 }
 
 #[test]
