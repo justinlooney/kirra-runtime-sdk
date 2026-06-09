@@ -140,6 +140,75 @@ pub fn longitudinal_safe_distance(
     raw.max(0.0)
 }
 
+// ---------------------------------------------------------------------------
+// Agent-set input model for pairwise RSS (issue #92)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of agents evaluated in a single pairwise RSS pass.
+///
+/// Bounds the worst-case execution time of the checker. A scene carrying more
+/// agents than this is treated as fail-closed (unsafe) rather than evaluated
+/// partially — a truncated safety check is worse than a conservative stop.
+pub const MAX_RSS_AGENTS: usize = 64;
+
+/// Ego RSS profile parameters (vehicle constants) the safe-distance primitives
+/// need beyond the per-pair kinematics.
+///
+/// Invalid values need no validation here: the primitives fail closed
+/// (`RSS_FAILSAFE_DISTANCE_M`) on any non-finite / non-positive brake or accel,
+/// so a bad profile yields an unreachable *required* distance — never a falsely
+/// small one.
+#[derive(Debug, Clone, Copy)]
+pub struct RssParams {
+    /// Actor reaction / response time (s).
+    pub reaction_time: f64,
+    /// Maximum ego longitudinal acceleration during the response phase (m/s²).
+    pub accel_max: f64,
+    /// Minimum ego braking deceleration after response (m/s²); must be > 0.
+    pub brake_min: f64,
+    /// Maximum lead-vehicle braking deceleration (m/s²); must be > 0.
+    pub brake_max: f64,
+    /// Maximum lateral acceleration / deceleration (m/s²); must be > 0.
+    pub lat_accel_max: f64,
+}
+
+/// One perceived agent's measured state for a pairwise RSS check.
+///
+/// Carries the ACTUAL measured separations alongside the velocities the
+/// primitives need, so the checker can compare actual-vs-required per axis.
+#[derive(Debug, Clone, Copy)]
+pub struct RssAgent {
+    /// Ego longitudinal velocity (m/s).
+    pub ego_vel: f64,
+    /// Lead-vehicle longitudinal velocity (m/s).
+    pub lead_vel: f64,
+    /// ACTUAL longitudinal gap to the lead (m).
+    pub actual_longitudinal_gap_m: f64,
+    /// Ego lateral velocity (m/s, signed).
+    pub ego_lat_vel: f64,
+    /// Object lateral velocity (m/s, signed).
+    pub obj_lat_vel: f64,
+    /// ACTUAL lateral separation to the object (m).
+    pub actual_lateral_separation_m: f64,
+}
+
+/// The agent scene the governor sees this tick.
+///
+/// The ABSENT vs KNOWN-EMPTY distinction is safety-critical: "no agents in the
+/// list" must NOT be read as "the scene is clear". Only perception that ran and
+/// reported a clear scene (`KnownEmpty`) is RSS-safe; a missing perception
+/// update (`Absent`) is fail-closed UNSAFE.
+#[derive(Debug, Clone)]
+pub enum AgentScene {
+    /// No perception data this tick (sensor gap) → fail-closed UNSAFE.
+    Absent,
+    /// Perception ran and reported a clear scene → RSS-safe.
+    KnownEmpty,
+    /// One or more agents to check pairwise. An empty vector here is treated
+    /// fail-closed (callers must use `KnownEmpty` for a verified-clear scene).
+    Agents(Vec<RssAgent>),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
