@@ -926,11 +926,82 @@ async fn evaluate_canopen_adapter(
     let (allowed, denial_reason) = kirra_runtime_sdk::protocol_adapter::command_allowed_for_posture_pub(&eval.command, &posture);
     let audit_ref = now_ms().to_string();
 
+    // #84: resolve the CANopen bus node-id to a FLEET node so an NMT-offline
+    // event marks the correct asset and the recalc is EFFECTFUL. Unmapped or
+    // unregistered ids are FAIL-CLOSED — surfaced as an unattributed offline
+    // (distinct audit event + warning + response flag), never a silent no-op.
+    let offline_outcome = if eval.triggers_recalculation {
+        use kirra_runtime_sdk::adapters::canopen::{classify_nmt_offline, global_resolve};
+        let resolved = global_resolve(eval.node_id);
+        let registered = resolved
+            .as_deref()
+            .map(|n| svc.app.nodes.contains_key(n))
+            .unwrap_or(false);
+        Some(classify_nmt_offline(eval.node_id, resolved, registered))
+    } else {
+        None
+    };
+
+    // Apply the offline effect (mark the node + drive a recalc). The fleet node
+    // actually marked offline (if any) is recorded for the audit + response.
+    let mut attributed_fleet_node: Option<String> = None;
+    if let Some(outcome) = &offline_outcome {
+        use kirra_runtime_sdk::adapters::canopen::{NmtOfflineOutcome, UnattributedReason};
+        use kirra_runtime_sdk::posture_engine_v2::PostureRecalcTrigger;
+        match outcome {
+            NmtOfflineOutcome::Attributed { fleet_node_id } => {
+                match svc.app.mark_node_untrusted(fleet_node_id, "CANOPEN_NMT_OFFLINE", now_ms()) {
+                    Ok(true) => {
+                        attributed_fleet_node = Some(fleet_node_id.clone());
+                        tracing::warn!(
+                            canopen_node_id = eval.node_id,
+                            fleet_node_id = %fleet_node_id,
+                            "CANopen NMT node-offline → fleet node marked Untrusted; effectful recalc enqueued"
+                        );
+                        enqueue_recalc(&svc, PostureRecalcTrigger::NodeTrustChanged {
+                            node_id: fleet_node_id.clone(),
+                            reason: "CANOPEN_NMT_OFFLINE".to_string(),
+                        });
+                    }
+                    // Mapping raced a deregistration, or the store write failed:
+                    // fail-closed exactly like an unattributed offline.
+                    Ok(false) | Err(()) => {
+                        tracing::error!(
+                            canopen_node_id = eval.node_id,
+                            fleet_node_id = %fleet_node_id,
+                            "CANopen NMT node-offline: mapped node missing or store write failed — \
+                             treating as UNATTRIBUTED (fail-closed)"
+                        );
+                        enqueue_recalc(&svc, PostureRecalcTrigger::DependencyGraphChanged);
+                    }
+                }
+            }
+            NmtOfflineOutcome::Unattributed { canopen_node_id, reason } => {
+                let reason_str = match reason {
+                    UnattributedReason::NoMapping => "NO_MAPPING",
+                    UnattributedReason::NodeNotRegistered => "NODE_NOT_REGISTERED",
+                };
+                tracing::warn!(
+                    canopen_node_id = *canopen_node_id,
+                    source_node = %msg.source_node,
+                    reason = reason_str,
+                    "CANopen NMT node-offline UNATTRIBUTED — recorded as unattributed offline; \
+                     recalc enqueued (fail-closed, never silently dropped)"
+                );
+                enqueue_recalc(&svc, PostureRecalcTrigger::DependencyGraphChanged);
+            }
+        }
+    }
+
     if !allowed || eval.triggers_recalculation {
         match svc.app.store.lock() {
             Ok(mut store) => {
                 let event_type = if eval.triggers_recalculation {
-                    "CANOPEN_NMT_NODE_OFFLINE"
+                    if attributed_fleet_node.is_some() {
+                        "CANOPEN_NMT_NODE_OFFLINE"
+                    } else {
+                        "CANOPEN_NMT_OFFLINE_UNATTRIBUTED"
+                    }
                 } else {
                     "INDUSTRIAL_ACTION_DENIED"
                 };
@@ -938,6 +1009,8 @@ async fn evaluate_canopen_adapter(
                     "canopen_adapter", event_type,
                     &json!({
                         "node_id": eval.node_id,
+                        "fleet_node_id": attributed_fleet_node.clone(),
+                        "node_offline_attributed": attributed_fleet_node.is_some(),
                         "message_type": format!("{:?}", eval.message_type),
                         "is_emergency": eval.is_emergency,
                         "triggers_recalculation": eval.triggers_recalculation,
@@ -958,32 +1031,17 @@ async fn evaluate_canopen_adapter(
         }
     }
 
-    // CANopen NMT node-offline / reset surfaces an underlying-fleet change,
-    // but there is no production CANopen-bus-address → fleet-node-id
-    // mapping in this repo today. The honest minimal wiring is to enqueue
-    // a `DependencyGraphChanged` so the freshness pipeline runs — but
-    // because no underlying state changed, the resulting recalc recomputes
-    // the SAME posture. This is a partial fix; tracked as follow-up so the
-    // recalc becomes effectful once the mapping exists.
-    if eval.triggers_recalculation {
-        tracing::warn!(
-            canopen_node_id = eval.node_id,
-            source_node     = %msg.source_node,
-            "CANopen NMT node-offline triggers recalc, but no CANopen→fleet-node \
-             mapping exists yet — recalc is a no-op until that mapping is defined"
-        );
-        enqueue_recalc(
-            &svc,
-            kirra_runtime_sdk::posture_engine_v2::PostureRecalcTrigger::DependencyGraphChanged,
-        );
-    }
-
     Json(json!({
         "protocol": "canopen",
         "command": format!("{:?}", eval.command),
         "allowed": allowed,
         "denial_reason": denial_reason,
         "posture_at_evaluation": posture_str,
+        // #84: whether the NMT-offline was attributed to a fleet node (and which).
+        // `false` on an offline event means the id was unmapped/unregistered and
+        // handled fail-closed — surfaced here so callers never read silence as success.
+        "node_offline_attributed": attributed_fleet_node.is_some(),
+        "fleet_node_id": attributed_fleet_node,
         "adapter_details": {
             "message_type": format!("{:?}", eval.message_type),
             "node_id": eval.node_id,
@@ -1669,6 +1727,12 @@ async fn main() {
 
     let mode = VerifierOperationMode::from_env();
     println!("Kirra Verifier starting in {mode:?} mode (db: {db_path})");
+
+    // #84: load the CANopen-node-id → fleet-node-id map from config so an NMT
+    // node-offline event marks the correct asset (effectful recalc). Sourced
+    // from KIRRA_CANOPEN_NODE_MAP; unset → empty map (every offline is then
+    // unattributed, handled fail-closed in evaluate_canopen_adapter).
+    kirra_runtime_sdk::adapters::canopen::init_node_map_from_env();
 
     let audit_signing_key: Option<ed25519_dalek::SigningKey> =
         std::env::var("KIRRA_LOG_SIGNING_KEY").ok()

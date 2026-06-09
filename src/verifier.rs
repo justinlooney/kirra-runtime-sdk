@@ -310,6 +310,31 @@ impl AppState {
         Ok(())
     }
 
+    /// Mark a registered node `Untrusted` (e.g. a CANopen NMT node-offline,
+    /// #84) so the next DAG recalc reflects it. Disk-first (invariant #12):
+    /// re-persists via `persist_and_insert_node`.
+    ///
+    /// Returns `Ok(true)` if the node existed and was updated, `Ok(false)` if
+    /// no such node is registered (the caller fail-closes on this), `Err(())`
+    /// on a store failure.
+    pub fn mark_node_untrusted(
+        &self,
+        node_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<bool, ()> {
+        let Some(existing) = self.nodes.get(node_id).map(|n| n.clone()) else {
+            return Ok(false);
+        };
+        let updated = RegisteredNode {
+            status: NodeTrustState::Untrusted(reason.to_string()),
+            last_trust_update_ms: now_ms,
+            ..existing
+        };
+        self.persist_and_insert_node(updated)?;
+        Ok(true)
+    }
+
     /// Persist dependency list to SQLite then update in-memory graph (fail-closed).
     pub fn persist_and_insert_deps(&self, node_id: &str, deps: Vec<String>) -> Result<(), ()> {
         self.store.lock()
@@ -456,5 +481,61 @@ mod transport_identity_tests {
         headers.insert("x-custom-identity", HeaderValue::from_static("fleet-controller"));
         assert!(validate_client_identity_headers(true, "x-custom-identity", &headers));
         assert!(!validate_client_identity_headers(true, "x-kirra-client-id", &headers));
+    }
+}
+
+#[cfg(test)]
+mod mark_node_untrusted_tests {
+    use super::*;
+    use crate::verifier_store::VerifierStore;
+
+    fn app() -> AppState {
+        let store = VerifierStore::new(":memory:").expect("in-memory store");
+        AppState::new(store, VerifierOperationMode::Active)
+    }
+
+    fn trusted_node(id: &str) -> RegisteredNode {
+        RegisteredNode {
+            node_id: id.to_string(),
+            status: NodeTrustState::Trusted,
+            registered_at_ms: 1,
+            last_trust_update_ms: 1,
+            ak_public_pem: None,
+            expected_pcr16_digest_hex: None,
+        }
+    }
+
+    // #84: marking the resolved fleet node offline must be EFFECTFUL — the DAG
+    // recalc flips the node's posture from Nominal to LockedOut.
+    #[test]
+    fn marking_registered_node_untrusted_is_effectful() {
+        let app = app();
+        app.persist_and_insert_node(trusted_node("robot-01")).unwrap();
+        assert_eq!(
+            app.calculate_posture("robot-01").propagated_status,
+            FleetPosture::Nominal,
+            "a Trusted node is Nominal before the offline"
+        );
+
+        let updated = app.mark_node_untrusted("robot-01", "CANOPEN_NMT_OFFLINE", 1_000).unwrap();
+        assert!(updated, "an existing node is updated");
+
+        assert!(matches!(
+            app.nodes.get("robot-01").unwrap().status,
+            NodeTrustState::Untrusted(_)
+        ));
+        assert_eq!(
+            app.calculate_posture("robot-01").propagated_status,
+            FleetPosture::LockedOut,
+            "marking the node offline must change the recalculated posture (effectful)"
+        );
+    }
+
+    // Marking a node the verifier doesn't know returns Ok(false) so the caller
+    // can fail-closed (treat as an unattributed offline) rather than no-op.
+    #[test]
+    fn marking_unknown_node_returns_false() {
+        let app = app();
+        assert!(!app.mark_node_untrusted("ghost", "CANOPEN_NMT_OFFLINE", 1).unwrap());
     }
 }
