@@ -45,9 +45,22 @@ pub struct KirraLiveGateway {
     pub max_allowed_workers: u32, pub log_directory: String, pub io_writer_lock: Arc<Mutex<()>>,
 }
 
+/// Bundled construction parameters for [`KirraLiveGateway::new`].
+#[derive(Debug, Clone)]
+pub struct GatewayConfig {
+    pub proxy_port: u16,
+    pub plc_target_port: u16,
+    pub admin_port: u16,
+    pub metrics_port: u16,
+    pub config: ContractProfile,
+    pub auth_key: Vec<u8>,
+    pub max_threads: u32,
+    pub log_dir: String,
+}
+
 impl KirraLiveGateway {
-    pub fn new(proxy_port: u16, plc_target_port: u16, admin_port: u16, metrics_port: u16, config: ContractProfile, auth_key: Vec<u8>, max_threads: u32, log_dir: String) -> Self {
-        Self { proxy_port, plc_target_port, admin_reset_port: admin_port, metrics_port, runtime_config: config, system_auth_key: auth_key, max_allowed_workers: max_threads.max(1), log_directory: log_dir, io_writer_lock: Arc::new(Mutex::new(())) }
+    pub fn new(cfg: GatewayConfig) -> Self {
+        Self { proxy_port: cfg.proxy_port, plc_target_port: cfg.plc_target_port, admin_reset_port: cfg.admin_port, metrics_port: cfg.metrics_port, runtime_config: cfg.config, system_auth_key: cfg.auth_key, max_allowed_workers: cfg.max_threads.max(1), log_directory: cfg.log_dir, io_writer_lock: Arc::new(Mutex::new(())) }
     }
 
     fn read_exact_frame<R: Read>(stream: &mut R, expected_len: usize, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
@@ -245,7 +258,17 @@ impl KirraLiveGateway {
                                     _ => GlobalSystemState::Degraded,
                                 };
 
-                                rec.log(now_ms, "NETWORK_PROXY", "SESSION_TOKEN", "MODBUS_WRITE", dynamic_resolution_text, system_state_enum, gov.trust_mode(), gov.trust_engine.current_score, intercept.mitigation_narrative.clone());
+                                rec.log(crate::kirra_core::JournalLogEntry {
+                                    ts: now_ms,
+                                    actor: "NETWORK_PROXY",
+                                    token: "SESSION_TOKEN",
+                                    action: "MODBUS_WRITE",
+                                    res: dynamic_resolution_text,
+                                    state: system_state_enum,
+                                    mode: gov.trust_mode(),
+                                    score: gov.trust_engine.current_score,
+                                    narrative: intercept.mitigation_narrative.clone(),
+                                });
                                 flush_payload = Some(rec.clone());
                             }
                             adapter_clone.encode_response(intercept.sanitized_scalar, raw_frame)

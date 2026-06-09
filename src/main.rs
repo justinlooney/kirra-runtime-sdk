@@ -3,7 +3,7 @@
 use std::env;
 use std::sync::mpsc::channel;
 use kirra_runtime_sdk::config::KirraRuntimeConfig;
-use kirra_runtime_sdk::gateway::KirraLiveGateway;
+use kirra_runtime_sdk::gateway::{KirraLiveGateway, GatewayConfig};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -33,16 +33,16 @@ fn main() {
 
     let secure_key = raw_key_string.into_bytes();
 
-    let interposer = KirraLiveGateway::new(
-        runtime_config.network.proxy_listen_port,
-        runtime_config.network.plc_target_port,
-        runtime_config.network.admin_reset_port,
-        runtime_config.network.metrics_http_port,
-        runtime_config.contract,
-        secure_key,
-        runtime_config.network.max_concurrent_connections,
-        runtime_config.telemetry.log_directory,
-    );
+    let interposer = KirraLiveGateway::new(GatewayConfig {
+        proxy_port: runtime_config.network.proxy_listen_port,
+        plc_target_port: runtime_config.network.plc_target_port,
+        admin_port: runtime_config.network.admin_reset_port,
+        metrics_port: runtime_config.network.metrics_http_port,
+        config: runtime_config.contract,
+        auth_key: secure_key,
+        max_threads: runtime_config.network.max_concurrent_connections,
+        log_dir: runtime_config.telemetry.log_directory,
+    });
 
     let (tx, rx) = channel();
     interposer.spawn_mock_plc_target(tx);

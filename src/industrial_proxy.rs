@@ -125,17 +125,17 @@ impl LiveProtocolSimulator {
             crate::kirra_core::TrustMode::LockedOut => GlobalSystemState::Failsafe,
         };
 
-        self.recorder.log(
-            sim_time_ms,
-            "INDUSTRIAL_MASTER",
-            &format!("TX_{}", packet.extract_transaction_id()),
-            &format!("WRITE_REG_{}", packet.extract_target_register()),
-            if was_mitigated { "MUTATED_CLAMP" } else { "TRANSPARENT" },
-            system_state,
-            active_trust,
-            self.unified_governor.trust_evaluator.current_score,
-            result.mitigation_narrative.clone(),
-        );
+        self.recorder.log(crate::kirra_core::JournalLogEntry {
+            ts: sim_time_ms,
+            actor: "INDUSTRIAL_MASTER",
+            token: &format!("TX_{}", packet.extract_transaction_id()),
+            action: &format!("WRITE_REG_{}", packet.extract_target_register()),
+            res: if was_mitigated { "MUTATED_CLAMP" } else { "TRANSPARENT" },
+            state: system_state,
+            mode: active_trust,
+            score: self.unified_governor.trust_evaluator.current_score,
+            narrative: result.mitigation_narrative.clone(),
+        });
 
         ProxyResolutionSummary {
             outbound_bytes,

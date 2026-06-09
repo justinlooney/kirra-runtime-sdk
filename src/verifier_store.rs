@@ -292,6 +292,24 @@ fn ledger_row_is_self_attested(r: &LedgerRow) -> bool {
     audit_verify_sig(&vk, &payload, &r.signature_b64)
 }
 
+/// Bundled event-data inputs for [`VerifierStore::append_causal_event`].
+///
+/// Groups the causal-event payload fields (everything that describes the event
+/// being appended). The `signing_key` is intentionally kept as a separate
+/// parameter on the method, since it is a distinct concern (signing identity,
+/// not event data).
+#[derive(Debug, Clone)]
+pub struct CausalEventInput<'a> {
+    pub entry_id: &'a str,
+    pub asset_id: &'a str,
+    pub event_type: &'a str,
+    pub payload: &'a str,
+    pub caused_by: &'a [String],
+    pub affects_assets: &'a [String],
+    pub fabric_generation: u64,
+    pub timestamp_ms: u64,
+}
+
 impl VerifierStore {
     pub fn new(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -2291,19 +2309,21 @@ impl VerifierStore {
     /// the content-addressed `key_id`, INSERTs the row, and advances the signed
     /// causal anchor-head in the SAME transaction. Returns the fully-populated
     /// `CausalLogEntry`.
-    #[allow(clippy::too_many_arguments)]
     pub fn append_causal_event(
         &mut self,
-        entry_id: &str,
-        asset_id: &str,
-        event_type: &str,
-        payload: &str,
-        caused_by: &[String],
-        affects_assets: &[String],
-        fabric_generation: u64,
-        timestamp_ms: u64,
+        event: &CausalEventInput<'_>,
         signing_key: Option<&ed25519_dalek::SigningKey>,
     ) -> Result<crate::fabric::causal_log::CausalLogEntry> {
+        let CausalEventInput {
+            entry_id,
+            asset_id,
+            event_type,
+            payload,
+            caused_by,
+            affects_assets,
+            fabric_generation,
+            timestamp_ms,
+        } = *event;
         use crate::audit_chain::{
             canonical_causal_anchor_head_payload, canonical_causal_signing_payload,
             compute_causal_record_hash, verifying_key_id,
@@ -2327,18 +2347,19 @@ impl VerifierStore {
         };
         let sequence: u64 = (prev_seq + 1) as u64;
 
-        let record_hash = compute_causal_record_hash(
-            &previous_hash,
-            entry_id,
-            asset_id,
-            event_type,
-            payload,
-            caused_by,
-            affects_assets,
-            timestamp_ms,
-            fabric_generation,
-            sequence,
-        );
+        let record_hash =
+            compute_causal_record_hash(&crate::audit_chain::CausalRecordHashInput {
+                previous_hash: &previous_hash,
+                entry_id,
+                asset_id,
+                event_type,
+                payload,
+                caused_by,
+                affects_assets,
+                timestamp_ms,
+                fabric_generation,
+                sequence,
+            });
 
         let signature_b64: Option<String> = signing_key.map(|k| {
             let payload_str = canonical_causal_signing_payload(
@@ -2583,18 +2604,18 @@ impl VerifierStore {
             let caused_by: Vec<String> = serde_json::from_str(&caused_by_json).unwrap_or_default();
             let affects_assets: Vec<String> =
                 serde_json::from_str(&affects_json).unwrap_or_default();
-            let recalc = compute_causal_record_hash(
-                &previous_hash_hex,
-                &entry_id,
-                &asset_id,
-                &event_type,
-                &payload,
-                &caused_by,
-                &affects_assets,
-                timestamp_ms.max(0) as u64,
-                fabric_generation.max(0) as u64,
-                sequence.max(0) as u64,
-            );
+            let recalc = compute_causal_record_hash(&crate::audit_chain::CausalRecordHashInput {
+                previous_hash: &previous_hash_hex,
+                entry_id: &entry_id,
+                asset_id: &asset_id,
+                event_type: &event_type,
+                payload: &payload,
+                caused_by: &caused_by,
+                affects_assets: &affects_assets,
+                timestamp_ms: timestamp_ms.max(0) as u64,
+                fabric_generation: fabric_generation.max(0) as u64,
+                sequence: sequence.max(0) as u64,
+            });
             if recalc != record_hash_hex {
                 chain_intact = false;
             }
@@ -4431,12 +4452,21 @@ mod causal_chain_87_tests {
     fn append3_causal(s: &mut VerifierStore) {
         let sk = s.signing_key.clone();
         let id1 = "entry-1".to_string();
-        s.append_causal_event("entry-1", "leader", "FAULT", "{}",
-            &[], &["follower".to_string()], 1, 100, sk.as_ref()).unwrap();
-        s.append_causal_event("entry-2", "follower", "DEGRADE", "{}",
-            &[id1.clone()], &[], 1, 200, sk.as_ref()).unwrap();
-        s.append_causal_event("entry-3", "follower", "STOP", "{}",
-            &[id1], &["leader".to_string()], 2, 300, sk.as_ref()).unwrap();
+        s.append_causal_event(&CausalEventInput {
+            entry_id: "entry-1", asset_id: "leader", event_type: "FAULT", payload: "{}",
+            caused_by: &[], affects_assets: &["follower".to_string()],
+            fabric_generation: 1, timestamp_ms: 100,
+        }, sk.as_ref()).unwrap();
+        s.append_causal_event(&CausalEventInput {
+            entry_id: "entry-2", asset_id: "follower", event_type: "DEGRADE", payload: "{}",
+            caused_by: &[id1.clone()], affects_assets: &[],
+            fabric_generation: 1, timestamp_ms: 200,
+        }, sk.as_ref()).unwrap();
+        s.append_causal_event(&CausalEventInput {
+            entry_id: "entry-3", asset_id: "follower", event_type: "STOP", payload: "{}",
+            caused_by: &[id1], affects_assets: &["leader".to_string()],
+            fabric_generation: 2, timestamp_ms: 300,
+        }, sk.as_ref()).unwrap();
     }
 
     #[test]
@@ -4539,11 +4569,17 @@ mod causal_chain_87_tests {
         let entry_id;
         {
             let mut s = VerifierStore::new(&path_str).expect("file store");
-            let e = s.append_causal_event("persist-1", "a", "EVT", "{}",
-                &[], &["x".to_string()], 3, 1000, None).unwrap();
+            let e = s.append_causal_event(&CausalEventInput {
+                entry_id: "persist-1", asset_id: "a", event_type: "EVT", payload: "{}",
+                caused_by: &[], affects_assets: &["x".to_string()],
+                fabric_generation: 3, timestamp_ms: 1000,
+            }, None).unwrap();
             entry_id = e.entry_id.clone();
-            s.append_causal_event("persist-2", "b", "EVT2", "{}",
-                &[entry_id.clone()], &[], 3, 2000, None).unwrap();
+            s.append_causal_event(&CausalEventInput {
+                entry_id: "persist-2", asset_id: "b", event_type: "EVT2", payload: "{}",
+                caused_by: &[entry_id.clone()], affects_assets: &[],
+                fabric_generation: 3, timestamp_ms: 2000,
+            }, None).unwrap();
         } // drop closes the connection
 
         {
