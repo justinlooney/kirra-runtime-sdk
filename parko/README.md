@@ -23,7 +23,7 @@ The intended use case is robotics and edge systems where ML perception drives ac
 
 ## Current capabilities
 
-The workspace contains three crates:
+The workspace contains six crates (`parko-core`, `parko-onnx`, `parko-openvino`, `parko-tensorrt`, `parko-kirra`, `parko-ros2`):
 
 **`parko-core`** — Core types and traits. No backends.
 - `InferenceBackend` trait
@@ -33,11 +33,11 @@ The workspace contains three crates:
 - `InferenceLoop` with one-tick-delayed actuator publication, degraded-mode detection, and optional `SafetyGovernor`
 - `ControlLoop` with a clock-driven state machine
 - `SafetyGovernor` trait for pluggable command envelope enforcement
-- 33 unit and integration tests
+- extensive unit + integration tests (RSS and posture-divergence proptests, the `ControlLoop` state machine incl. recovery hysteresis)
 
 **`parko-onnx`** — ONNX Runtime backend, using the `ort` crate.
-- One backend implementation: `OrtBackend` (CPU only)
-- Integration test passing against MNIST-12
+- `OrtBackend`: CPU by default; the **`cuda`** feature adds a **fail-closed** NVIDIA CUDA execution provider (`new_cuda` / `with_cuda_config`) — a missing GPU/driver/provider errors out, never a silent CPU fallback
+- Integration test passing against MNIST-12 (the CUDA-vs-CPU cross-check is GPU-CI-gated)
 
 **`parko-openvino`** — OpenVINO backend, using the `openvino` crate.
 - One backend implementation: `OvBackend` (CPU device, ingests ONNX directly)
@@ -51,8 +51,9 @@ The workspace contains three crates:
 | Backend | Crate | Hardware | Runtime install | Status |
 |---|---|---|---|---|
 | ONNX Runtime CPU | `parko-onnx` | any x86 CPU | `libonnxruntime.so` + `ORT_DYLIB_PATH` (v1.23.2) | ✅ full |
+| ONNX Runtime CUDA | `parko-onnx` (`cuda` feature) | NVIDIA GPU | CUDA-enabled `libonnxruntime.so` + GPU | ✅ code (fail-closed); runtime test GPU-CI-gated |
 | Intel OpenVINO | `parko-openvino` | any x86 Intel CPU | `libopenvino_c.so` from the Intel apt repo (`openvino-2024.x`) | ✅ full (CPU; `cargo build` does not require the toolkit) |
-| TensorRT (NVIDIA) | — | NVIDIA GPU | — | planned (PARK-020) |
+| TensorRT (NVIDIA) | `parko-tensorrt` | NVIDIA GPU / Jetson | TensorRT-enabled ORT runtime | CI-buildable skeleton; real inference Jetson-gated (PARK-021) |
 | Qualcomm QNN | — | Qualcomm NPU | — | planned (PARK-027) |
 | TI TIDL | — | TI hardware | — | planned (PARK-028) |
 | AMD Vitis | — | AMD hardware | — | planned (PARK-030) |

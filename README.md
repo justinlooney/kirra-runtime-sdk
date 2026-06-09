@@ -148,6 +148,14 @@ Kirra is designed in alignment with ISO 26262 ASIL-D requirements and IEC 61508 
 | ADR-0003 | Two-tier KIRRA architecture — base + optional D1 | Accepted |
 | ADR-0004 | Independent Safety Channel — D1–D3 settlement | Superseded by ADR-0003 |
 
+The **cert-target platform** decision and its prototype bring-up plan live under
+[`docs/adr/`](docs/adr/): `ADR-0001-governor-deployment-platform.md` (KIRRA
+governor on QNX Hypervisor 8.0 for Safety; the Autoware/ROS 2 doer as an isolated
+guest VM; a Ferrocene `no_std` verdict core as the certified artifact), with
+companions `KIRRA_PLATFORM_DEPLOYMENT_STRATEGY.md`, `KIRRA_BRINGUP_RUNBOOK.md`,
+and `KIRRA_QNX_CROSSCOMPILE.md`. (That file's `ADR-0001` prefix is independent of
+the numbered ODD-cap ADRs in the table above — a known naming overlap.)
+
 See [docs/safety/](docs/safety/) for the complete safety case foundation,
 [docs/safety/SAFETY_CASE_INDEX.md](docs/safety/SAFETY_CASE_INDEX.md) for the
 full document registry, and [docs/safety/ROADMAP_TO_ASIL_D.md](docs/safety/ROADMAP_TO_ASIL_D.md)
@@ -226,6 +234,7 @@ Modern robotic and autonomous deployments increasingly rely on AI models to gene
 - **Deterministic test harness** — `ScenarioRunner` with virtual clock injection for temporal integration tests
 - **MC/DC pair-completing tests** — coverage evidence per KIRRA-OCCY-MCDC-001
 - **CARLA integration** — `kirra_carla_client` binary for AV simulator connectivity
+- **Two-box prototype tools** — `kirra-governor-service` (UDP governor wrapping the verdict core), `kirra-proposal-bench` (proposal-sweep harness), and the shared `kirra-wire-client` mirror; pure-Rust, runs the governed-car demo before the QNX cert factoring (ADR-0001, `docs/adr/KIRRA_BRINGUP_RUNBOOK.md`)
 - **Auto-generated traceability matrix** — `// SAFETY:` tag scanner produces `docs/safety/TRACEABILITY_MATRIX.md`
 
 ---
@@ -271,7 +280,7 @@ src/
     └── kirra_carla_client.rs     — CARLA AV simulator integration
 
 crates/
-└── kirra-ros2-adapter/           — Occy #131 Option-B per-trajectory wiring
+├── kirra-ros2-adapter/           — Occy #131 Option-B per-trajectory wiring (ros2 feature)
     ├── src/
     │   ├── lib.rs                — public surface + re-exports
     │   ├── config.rs             — VehicleConfig (envelope params, FTTI budgets)
@@ -290,6 +299,18 @@ crates/
     │   │                           subscription-staleness watchdog (ros2 feature)
     │   └── bin/                  — verifier service binary (ros2 feature)
     └── tests/                    — slow / fast loop unit + integration tests
+├── kirra-governor-service/       — minimal over-the-wire (UDP) governor wrapping the
+│                                   EXISTING verdict core verbatim (serde + bincode + std
+│                                   only — no ROS/async); two-box prototype demonstrator,
+│                                   QNX cert-target path per ADR-0001
+├── kirra-wire-client/            — single shared client-side mirror of the governor's UDP
+│                                   wire schema (dev/test; reused by the bench + future car
+│                                   bridge so the wire types are defined once)
+├── kirra-proposal-bench/         — dev/test UDP bench: sweeps proposals at a running
+│                                   kirra-governor-service and prints a CASE/REASON/VERDICT table
+├── kirra-capture-schema/         — governor-free capture-record wire schema, shared verbatim
+│                                   with the offline collector
+└── kirra-collector/              — offline capture / replay collector (db3 + mcap readers)
 ```
 
 The `kirra-ros2-adapter` crate is feature-gated on `ros2` (default build
@@ -314,7 +335,9 @@ Layout mirrors `kirra-ros2-adapter`:
   unit tests).
 - `ros2` feature → r2r 0.9.5 + the node binary.
 - `onnx-backend` feature → parko-onnx OrtBackend (production inference;
-  requires `ORT_DYLIB_PATH`).
+  requires `ORT_DYLIB_PATH`). CPU by default; parko-onnx's `cuda` feature
+  selects the NVIDIA CUDA execution provider (fail-closed — a missing
+  GPU/driver/provider errors out, never a silent CPU fallback).
 
 Fail-closed paths: sensor staleness → stopped twist (MRC);
 `InferenceLoop::tick` error → stopped twist; comparator divergence
