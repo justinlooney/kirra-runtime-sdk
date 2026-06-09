@@ -207,16 +207,34 @@ pub fn apply_enforcement(
     cmd: &ProposedVehicleCommand,
     contract: &VehicleKinematicsContract,
 ) -> Option<ProposedVehicleCommand> {
-    match validate_vehicle_command(cmd, contract) {
+    apply_enforce_action(cmd, &validate_vehicle_command(cmd, contract))
+}
+
+/// Apply an ALREADY-COMPUTED [`EnforceAction`] to a command, producing the
+/// enforced (post-clamp) command, or `None` on `DenyBreach`.
+///
+/// This is the single clamp-application implementation (the contract-driven
+/// [`apply_enforcement`] delegates to it). Callers that already hold a verdict
+/// — e.g. the fabric command handler, which gets an `EnforceAction` from
+/// `FabricRouter::route_command` and must apply the SAME verdict rather than
+/// re-deriving one against a different contract — use this directly so the
+/// returned command carries the SAFE values and is within envelope even if the
+/// caller ignores the action label. Lives here (NOT in `kinematics_contract`,
+/// which only COMPUTES the verdict) so the verdict computation stays untouched.
+pub fn apply_enforce_action(
+    cmd: &ProposedVehicleCommand,
+    action: &EnforceAction,
+) -> Option<ProposedVehicleCommand> {
+    match action {
         EnforceAction::Allow => Some(cmd.clone()),
 
         EnforceAction::ClampLinear(safe_v) => Some(ProposedVehicleCommand {
-            linear_velocity_mps: safe_v,
+            linear_velocity_mps: *safe_v,
             ..cmd.clone()
         }),
 
         EnforceAction::ClampSteering(safe_delta) => Some(ProposedVehicleCommand {
-            steering_angle_deg: safe_delta,
+            steering_angle_deg: *safe_delta,
             ..cmd.clone()
         }),
 
@@ -525,6 +543,52 @@ mod kinematics_sim_tests {
             current_steering_angle_deg: 0.0,
         };
         assert!(apply_enforcement(&c, &contract).is_none(), "DenyBreach must return None");
+    }
+
+    // --- apply_enforce_action: applying an ALREADY-COMPUTED verdict (#86) ---
+
+    fn sample_cmd() -> ProposedVehicleCommand {
+        ProposedVehicleCommand {
+            linear_velocity_mps: 40.0,
+            current_velocity_mps: 34.0,
+            delta_time_s: DT,
+            steering_angle_deg: 7.0,
+            current_steering_angle_deg: 6.0,
+        }
+    }
+
+    #[test]
+    fn test_apply_action_allow_is_unchanged() {
+        let c = sample_cmd();
+        let out = apply_enforce_action(&c, &EnforceAction::Allow).expect("Allow yields a command");
+        assert_eq!(out.linear_velocity_mps, c.linear_velocity_mps);
+        assert_eq!(out.steering_angle_deg, c.steering_angle_deg);
+    }
+
+    #[test]
+    fn test_apply_action_clamp_linear_substitutes_safe_velocity() {
+        let c = sample_cmd();
+        let out = apply_enforce_action(&c, &EnforceAction::ClampLinear(12.5)).expect("clamp yields a command");
+        assert_eq!(out.linear_velocity_mps, 12.5, "enforced command carries the SAFE velocity");
+        assert!(out.linear_velocity_mps < c.linear_velocity_mps, "within envelope (below the proposal)");
+        assert_eq!(out.steering_angle_deg, c.steering_angle_deg, "steering untouched on a linear clamp");
+    }
+
+    #[test]
+    fn test_apply_action_clamp_steering_substitutes_safe_angle() {
+        let c = sample_cmd();
+        let out = apply_enforce_action(&c, &EnforceAction::ClampSteering(1.5)).expect("clamp yields a command");
+        assert_eq!(out.steering_angle_deg, 1.5, "enforced command carries the SAFE steering");
+        assert_eq!(out.linear_velocity_mps, c.linear_velocity_mps, "linear untouched on a steering clamp");
+    }
+
+    #[test]
+    fn test_apply_action_deny_is_none() {
+        let c = sample_cmd();
+        assert!(
+            apply_enforce_action(&c, &EnforceAction::DenyBreach(crate::gateway::kinematics_contract::DenyCode::NanInfLinearVelocity)).is_none(),
+            "DenyBreach yields no enforced command (caller fail-closes)"
+        );
     }
 
     #[test]
