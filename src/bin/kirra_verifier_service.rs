@@ -1774,39 +1774,102 @@ async fn handle_fabric_command(
     );
     match svc.fabric_router.route_command(&asset_id, &cmd, perception_cap) {
         Ok(action) => {
+            use kirra_runtime_sdk::gateway::kinematics_contract::EnforceAction;
             let action_str = format!("{:?}", action);
-            let allowed = !matches!(action, kirra_runtime_sdk::gateway::kinematics_contract::EnforceAction::DenyBreach(_));
-
             let now = now_ms();
-            if !allowed {
-                // `DenyCode -> &'static str` keeps this path alloc-free; the previous
-                // `r.clone()` of a `String` allocated per denial (S3 / #115).
-                let denial_reason: &'static str = match action {
-                    kirra_runtime_sdk::gateway::kinematics_contract::EnforceAction::DenyBreach(c) => c.reason(),
-                    _ => "",
-                };
-                svc.fabric_causal_log.record(
-                    &asset_id,
-                    "COMMAND_DENIED",
-                    &json!({"reason": denial_reason, "command": serde_json::to_value(&cmd).unwrap_or_default()}).to_string(),
-                    vec![],
-                    vec![],
-                    svc.fabric_router.fabric_state().fabric_generation,
-                );
-                if let Ok(mut store) = svc.app.store.lock() {
-                    let _ = store.save_posture_event_chained(
-                        &asset_id, "FABRIC_COMMAND_DENIED",
-                        &json!({"asset_id": asset_id, "action": action_str}).to_string(),
-                        None, now,
+            let fabric_generation = svc.fabric_router.fabric_state().fabric_generation;
+            let clamp_occurred =
+                matches!(action, EnforceAction::ClampLinear(_) | EnforceAction::ClampSteering(_));
+
+            // #86: APPLY the verdict server-side and return the ENFORCED command.
+            // `apply_enforce_action` substitutes the safe clamp value(s); a clamp
+            // therefore lands in the response's `command` field, so a client using
+            // it is within envelope even if it ignores the `action` label.
+            //
+            // FAIL-CLOSED: deny when no enforced command can be produced —
+            // `DenyBreach`, OR (defensively) a clamp whose enforced value is
+            // non-finite. We NEVER return the unclamped command.
+            let enforced = kirra_runtime_sdk::kinematics_sim::apply_enforce_action(&cmd, &action)
+                .filter(|c| c.linear_velocity_mps.is_finite() && c.steering_angle_deg.is_finite());
+
+            match enforced {
+                None => {
+                    // `DenyCode -> &'static str` keeps this path alloc-free; the previous
+                    // `r.clone()` of a `String` allocated per denial (S3 / #115).
+                    let denial_reason: &'static str = match &action {
+                        EnforceAction::DenyBreach(c) => c.reason(),
+                        // Clamp produced a non-finite enforced value (contract bug):
+                        // fail closed rather than forward an invalid command.
+                        _ => "ENFORCED_COMMAND_UNPRODUCIBLE",
+                    };
+                    svc.fabric_causal_log.record(
+                        &asset_id,
+                        "COMMAND_DENIED",
+                        &json!({"reason": denial_reason, "command": serde_json::to_value(&cmd).unwrap_or_default()}).to_string(),
+                        vec![],
+                        vec![],
+                        fabric_generation,
                     );
+                    if let Ok(mut store) = svc.app.store.lock() {
+                        let _ = store.save_posture_event_chained(
+                            &asset_id, "FABRIC_COMMAND_DENIED",
+                            &json!({"asset_id": asset_id, "action": action_str}).to_string(),
+                            None, now,
+                        );
+                    }
+                    Json(json!({
+                        "asset_id": asset_id,
+                        "action": action_str,
+                        "allowed": false,
+                        "clamp_occurred": false,
+                        "denial_reason": denial_reason,
+                    })).into_response()
+                }
+                Some(enforced_cmd) => {
+                    // A clamp is safety ENFORCEMENT, not a silent pass: record it
+                    // (causal log + tamper-evident audit) with the original-vs-enforced
+                    // values, mirroring the deny path and the actuator-handler pattern.
+                    if clamp_occurred {
+                        let enforcement = json!({
+                            "asset_id": asset_id,
+                            "action": action_str,
+                            "clamp_occurred": true,
+                            "original_linear_velocity_mps": cmd.linear_velocity_mps,
+                            "original_steering_angle_deg": cmd.steering_angle_deg,
+                            "enforced_linear_velocity_mps": enforced_cmd.linear_velocity_mps,
+                            "enforced_steering_angle_deg": enforced_cmd.steering_angle_deg,
+                        });
+                        svc.fabric_causal_log.record(
+                            &asset_id,
+                            "COMMAND_CLAMPED",
+                            &enforcement.to_string(),
+                            vec![],
+                            vec![],
+                            fabric_generation,
+                        );
+                        if let Ok(mut store) = svc.app.store.lock() {
+                            let _ = store.save_posture_event_chained(
+                                &asset_id, "FABRIC_COMMAND_CLAMPED",
+                                &enforcement.to_string(),
+                                None, now,
+                            );
+                        }
+                    }
+
+                    Json(json!({
+                        "asset_id": asset_id,
+                        "action": action_str,
+                        "allowed": true,
+                        "clamp_occurred": clamp_occurred,
+                        "original_linear_velocity_mps": cmd.linear_velocity_mps,
+                        "original_steering_angle_deg": cmd.steering_angle_deg,
+                        "enforced_linear_velocity_mps": enforced_cmd.linear_velocity_mps,
+                        "enforced_steering_angle_deg": enforced_cmd.steering_angle_deg,
+                        // AUTHORITATIVE output: the enforced (post-clamp) command.
+                        "command": enforced_cmd,
+                    })).into_response()
                 }
             }
-
-            Json(json!({
-                "asset_id": asset_id,
-                "action": action_str,
-                "allowed": allowed,
-            })).into_response()
         }
         Err(e) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))).into_response()
@@ -2887,5 +2950,132 @@ mod fabric_posture_feed_tests {
             vec!["VERIFIER_FLEET_POSTURE_LOCKED_OUT".to_string()],
             "LockedOut feed must tag the reason for operators"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #86 — the fabric command endpoint is AUTHORITATIVE: it applies the clamp
+// server-side and returns the ENFORCED command (closing the prior fail-open
+// where a clamp was reported but not applied). These tests drive the handler
+// directly (no auth/router), asserting the response `command` carries the safe
+// values, that a clamp is reported, Allow is unchanged, and Deny is denied.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod fabric_command_authoritative_tests {
+    use super::handle_fabric_command;
+
+    use std::sync::Arc;
+
+    use axum::body::to_bytes;
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use axum::Json;
+
+    use kirra_runtime_sdk::fabric::asset::{
+        AssetPosture, AssetType, FabricAsset, KinematicProfileType,
+    };
+    use kirra_runtime_sdk::fabric::router::FabricRouter;
+    use kirra_runtime_sdk::gateway::kinematics_contract::ProposedVehicleCommand;
+    use kirra_runtime_sdk::posture_cache::{ServiceState, SharedPostureCache};
+    use kirra_runtime_sdk::verifier::{AppState, FleetPosture, VerifierOperationMode};
+    use kirra_runtime_sdk::verifier_store::VerifierStore;
+
+    const ASSET: &str = "av-01";
+
+    fn svc_with_asset(posture: FleetPosture) -> Arc<ServiceState> {
+        let store = VerifierStore::new(":memory:").expect("in-memory store");
+        let app = Arc::new(AppState::new(store, VerifierOperationMode::Active));
+        let posture_cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(None));
+        let fabric_router = Arc::new(FabricRouter::new());
+
+        let asset = FabricAsset {
+            asset_id: ASSET.to_string(),
+            asset_type: AssetType::AutonomousVehicle,
+            display_name: ASSET.to_string(),
+            kinematic_profile: KinematicProfileType::AutomotiveNominal,
+            registered_at_ms: 0,
+            last_seen_ms: 0,
+            metadata: Default::default(),
+        };
+        fabric_router.register_asset(&asset);
+        // route_command reads the asset's fabric posture; set the one under test.
+        fabric_router.update_asset_posture(
+            ASSET,
+            AssetPosture {
+                asset_id: ASSET.to_string(),
+                posture,
+                generation: 1,
+                computed_at_ms: 0,
+                contributing_nodes: vec![],
+                blocked_by: vec![],
+            },
+        );
+
+        Arc::new(ServiceState {
+            app,
+            posture_cache,
+            audit_verifying_key: None,
+            fabric_router,
+            fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
+            fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new_in_memory(None)),
+            posture_engine_tx: std::sync::OnceLock::new(),
+            perception_cap: kirra_runtime_sdk::gateway::perception_monitor::empty_perception_cap(),
+            perception_monitor_enabled: false,
+        })
+    }
+
+    async fn post_command(svc: Arc<ServiceState>, cmd: ProposedVehicleCommand) -> serde_json::Value {
+        let resp = handle_fabric_command(State(svc), Path(ASSET.to_string()), Ok(Json(cmd)))
+            .await
+            .into_response();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    fn cmd(linear: f64, current: f64, steering: f64) -> ProposedVehicleCommand {
+        ProposedVehicleCommand {
+            linear_velocity_mps: linear,
+            current_velocity_mps: current,
+            delta_time_s: 0.1,
+            steering_angle_deg: steering,
+            current_steering_angle_deg: steering,
+        }
+    }
+
+    #[tokio::test]
+    async fn clamped_command_response_carries_enforced_values_within_envelope() {
+        // 40 m/s exceeds the AutomotiveNominal envelope → ClampLinear.
+        let v = post_command(svc_with_asset(FleetPosture::Nominal), cmd(40.0, 34.0, 0.0)).await;
+
+        assert_eq!(v["allowed"], true);
+        assert_eq!(v["clamp_occurred"], true, "a clamp must be reported as enforcement");
+        assert_eq!(v["original_linear_velocity_mps"], 40.0);
+
+        let enforced = v["enforced_linear_velocity_mps"].as_f64().expect("enforced velocity");
+        assert!(enforced < 40.0, "enforced velocity must be clamped below the proposal (within envelope)");
+
+        // THE KEY ASSERTION: the authoritative `command` carries the SAFE value,
+        // so a client applying it is within envelope even ignoring `action`.
+        let cmd_v = v["command"]["linear_velocity_mps"].as_f64().expect("command.linear");
+        assert_eq!(cmd_v, enforced, "response.command must carry the enforced (clamped) velocity");
+        assert!(cmd_v < 40.0, "the returned command is NOT the unclamped 40.0");
+    }
+
+    #[tokio::test]
+    async fn allow_returns_command_unchanged() {
+        // current == proposed → no rate-of-change clamp; within envelope → Allow.
+        let v = post_command(svc_with_asset(FleetPosture::Nominal), cmd(10.0, 10.0, 1.0)).await;
+        assert_eq!(v["allowed"], true);
+        assert_eq!(v["clamp_occurred"], false);
+        assert_eq!(v["command"]["linear_velocity_mps"].as_f64().unwrap(), 10.0);
+        assert_eq!(v["command"]["steering_angle_deg"].as_f64().unwrap(), 1.0);
+    }
+
+    #[tokio::test]
+    async fn lockedout_denies_and_omits_command() {
+        let v = post_command(svc_with_asset(FleetPosture::LockedOut), cmd(10.0, 10.0, 0.0)).await;
+        assert_eq!(v["allowed"], false, "LockedOut denies the command");
+        assert!(v.get("command").is_none(), "a denied command carries no enforced command");
+        assert!(v["denial_reason"].is_string(), "denial is recorded with a reason");
     }
 }
