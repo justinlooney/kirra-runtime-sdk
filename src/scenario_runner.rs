@@ -518,7 +518,6 @@ async fn evaluate_assertion(
 #[cfg(test)]
 mod scenario_runner_tests {
     use super::*;
-    use std::sync::Arc;
     use crate::posture_cache::CachedFleetPosture;
     use crate::verifier::FleetPosture;
     use crate::clock::VirtualClock;
