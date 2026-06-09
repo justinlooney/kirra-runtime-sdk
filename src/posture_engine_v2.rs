@@ -103,6 +103,24 @@ pub fn resolve_posture_with_reason(
     }
 }
 
+/// Post-promotion posture-freshness gate (#83).
+///
+/// A standby that has just promoted to Active MUST hold a non-stale posture
+/// before it serves commands. This is a thin, named application of
+/// [`resolve_posture_with_reason`] at `POSTURE_CACHE_TTL_MS` — the SINGLE TTL
+/// authority — so the staleness window is never duplicated. `perform_promotion`
+/// calls it AFTER its initial recalculation: a fresh cache resolves to the real
+/// posture (the node serves normally); a still-stale / empty / poisoned cache
+/// resolves to `LockedOut(<reason>)` and the node fails closed (the mutation
+/// gate independently blocks on the same stale cache, so no command is served
+/// against a stale posture). It does NOT change `resolve_posture_with_reason`
+/// semantics — it only fixes the TTL to the production constant.
+pub fn resolve_post_promotion_posture(
+    cache: &SharedPostureCache,
+) -> (FleetPosture, Option<LockoutReason>) {
+    resolve_posture_with_reason(cache, crate::posture_cache::POSTURE_CACHE_TTL_MS)
+}
+
 // ============================================================================
 // SECTION 2: Generation persistence across restarts
 // ============================================================================
