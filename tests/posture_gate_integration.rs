@@ -9,17 +9,21 @@
 //! an assembled axum app, not yet another unit test of the pure functions
 //! (the unit tests are exactly what masked the gap).
 //!
-//! TEST-SCOPE NOTE: the binary `src/bin/kirra_verifier_service.rs`
-//! assembles its router inline in `main()` and references many local
-//! handler functions; extracting `pub fn build_app` would require either
-//! migrating all handlers to the library crate (large refactor) or
-//! exposing the binary as a library. Both are out of scope for this
-//! safety-gate wiring. Instead this test builds a REPRESENTATIVE router
+//! TEST-SCOPE NOTE: this out-of-crate integration test cannot see the
+//! binary's inline router assembly, so it builds a REPRESENTATIVE router
 //! using stub handlers at the same paths the production binary mounts
 //! (`/fleet/posture`, `/actuator/motion/command`, `/health`, ...) and
 //! applies the same `enforce_posture_routing` middleware as outermost
 //! layer with the same `Arc<ServiceState>` shape. The middleware behavior
 //! is what's safety-critical here — and that IS what this test exercises.
+//!
+//! The complementary assertion that the gate is mounted on the ACTUAL
+//! assembled production router lives binary-internal (issue #72): the
+//! `posture_gate_real_router_tests` module in
+//! `src/bin/kirra_verifier_service.rs` drives requests through the
+//! extracted `build_app()` — the exact router `main()` serves. That test
+//! must stay binary-internal because `build_app` is not exported from the
+//! binary crate and is not callable from here.
 
 use std::sync::Arc;
 

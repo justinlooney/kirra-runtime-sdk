@@ -2014,6 +2014,73 @@ async fn main() {
         );
     }
 
+    // Assemble the production router. Extracted into `build_app` (issue #72)
+    // so the EXACT assembled router — identical routes, middleware layer
+    // order, and state wiring — is what the binary-internal posture-gate
+    // test exercises, rather than a representative stand-in.
+    let app = build_app(Arc::clone(&svc_state));
+
+    // SG-008 (ASIL D): fail closed BEFORE binding the listener. Build the boot
+    // facts and evaluate the startup-invariant predicate; on any violation, log
+    // and abort so no request can reach a half-initialized service. Bind is
+    // strictly AFTER this check, so "the listener never binds before invariants
+    // pass" holds by construction.
+    let startup_ctx = StartupContext {
+        admin_token_present: std::env::var("KIRRA_ADMIN_TOKEN")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false),
+        sqlite_wal: svc_state.app.store.lock().unwrap().is_wal_mode(),
+        mode_active: svc_state.app.is_active(),
+        watchdog_spawned,
+        posture_engine_running: svc_state.posture_engine_tx.get().is_some(),
+    };
+    if let Err(violation) = check_startup_invariants(&startup_ctx) {
+        tracing::error!(
+            invariant = %violation,
+            "SG-008: startup invariant violated — aborting before listener bind (fail-closed)"
+        );
+        std::process::exit(1);
+    }
+    tracing::info!("SG-008: startup invariants satisfied; binding listener");
+
+    println!("Kirra Verifier Service listening on {listen_addr} (db: {db_path})");
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await
+        .expect("failed to bind listener");
+
+    // #74: on safe-stop / shutdown, force a durable checkpoint so the audit chain
+    // (and any NORMAL-connection writes) are fsync'd to disk — durable at the
+    // moment that matters most (the incident preceding the stop). The HA epoch
+    // and federation nonce burns are already FULL-synced per-commit.
+    let shutdown_state = Arc::clone(&svc_state.app);
+    let shutdown = async move {
+        shutdown_signal().await;
+        match shutdown_state.store.lock() {
+            Ok(store) => match store.durable_checkpoint() {
+                Ok(()) => tracing::info!("audit: durable checkpoint flushed on shutdown"),
+                Err(e) => tracing::error!(error = %e, "audit: durable checkpoint FAILED on shutdown"),
+            },
+            Err(_) => tracing::error!("audit: durable checkpoint skipped — store lock poisoned at shutdown"),
+        }
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .expect("server error");
+}
+
+/// Assembles the complete production router from a fully-initialized
+/// `ServiceState`. Extracted verbatim from `main()` (issue #72) so the EXACT
+/// assembled router can be exercised by the binary-internal posture-gate test
+/// below — not a representative stand-in.
+///
+/// SECURITY-CRITICAL: the route groups, the per-group auth/envelope layers, and
+/// especially the OUTERMOST `enforce_posture_routing` gate must remain in this
+/// exact order. The posture gate is the last `.layer(...)` so it runs FIRST on
+/// every request (before auth and the actuator envelope); the identity/admin/
+/// actuator-posture layering inside each group is the fail-closed security
+/// boundary. Do not reorder, drop, or rewire any of this.
+fn build_app(svc_state: Arc<ServiceState>) -> Router {
     let identity_gated_routes = Router::new()
         .route("/system/posture/stream", get(system_posture_stream))
         .route("/federation/reports/submit", post(submit_federated_report))
@@ -2075,7 +2142,7 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = Router::new()
+    Router::new()
         .merge(probe_routes)
         .merge(identity_gated_routes)
         .merge(admin_routes)
@@ -2093,55 +2160,7 @@ async fn main() {
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&svc_state),
             enforce_posture_routing,
-        ));
-
-    // SG-008 (ASIL D): fail closed BEFORE binding the listener. Build the boot
-    // facts and evaluate the startup-invariant predicate; on any violation, log
-    // and abort so no request can reach a half-initialized service. Bind is
-    // strictly AFTER this check, so "the listener never binds before invariants
-    // pass" holds by construction.
-    let startup_ctx = StartupContext {
-        admin_token_present: std::env::var("KIRRA_ADMIN_TOKEN")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false),
-        sqlite_wal: svc_state.app.store.lock().unwrap().is_wal_mode(),
-        mode_active: svc_state.app.is_active(),
-        watchdog_spawned,
-        posture_engine_running: svc_state.posture_engine_tx.get().is_some(),
-    };
-    if let Err(violation) = check_startup_invariants(&startup_ctx) {
-        tracing::error!(
-            invariant = %violation,
-            "SG-008: startup invariant violated — aborting before listener bind (fail-closed)"
-        );
-        std::process::exit(1);
-    }
-    tracing::info!("SG-008: startup invariants satisfied; binding listener");
-
-    println!("Kirra Verifier Service listening on {listen_addr} (db: {db_path})");
-    let listener = tokio::net::TcpListener::bind(&listen_addr).await
-        .expect("failed to bind listener");
-
-    // #74: on safe-stop / shutdown, force a durable checkpoint so the audit chain
-    // (and any NORMAL-connection writes) are fsync'd to disk — durable at the
-    // moment that matters most (the incident preceding the stop). The HA epoch
-    // and federation nonce burns are already FULL-synced per-commit.
-    let shutdown_state = Arc::clone(&svc_state.app);
-    let shutdown = async move {
-        shutdown_signal().await;
-        match shutdown_state.store.lock() {
-            Ok(store) => match store.durable_checkpoint() {
-                Ok(()) => tracing::info!("audit: durable checkpoint flushed on shutdown"),
-                Err(e) => tracing::error!(error = %e, "audit: durable checkpoint FAILED on shutdown"),
-            },
-            Err(_) => tracing::error!("audit: durable checkpoint skipped — store lock poisoned at shutdown"),
-        }
-    };
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .expect("server error");
+        ))
 }
 
 /// Resolves on SIGINT (Ctrl-C) or SIGTERM — the safe-stop / shutdown signals.
@@ -2297,6 +2316,131 @@ mod sg_008_cert_tests {
             check_startup_invariants(&ctx),
             Err(StartupInvariant::AdminTokenMissing),
             "SG-008: the admin-token invariant must be reported first when several are violated"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #72 — posture gate is wired on the REAL assembled router.
+//
+// The external `tests/posture_gate_integration.rs` builds a *representative*
+// router (stub handlers at the production paths) precisely because, as an
+// out-of-crate integration test, it cannot see the binary's inline assembly.
+// That left a residual gap: nothing asserted the gate is mounted on the
+// router `main()` actually serves. These tests close it by driving requests
+// through `build_app()` — the exact production assembly — and proving the
+// posture gate (and its exemptions) are in force on it.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod posture_gate_real_router_tests {
+    use super::build_app;
+
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt; // for `oneshot`
+
+    use kirra_runtime_sdk::posture_cache::{
+        CachedFleetPosture, ServiceState, SharedPostureCache,
+    };
+    use kirra_runtime_sdk::verifier::{AppState, FleetPosture, VerifierOperationMode};
+    use kirra_runtime_sdk::verifier_store::VerifierStore;
+
+    /// Builds an Active `ServiceState` with the given seeded posture (or a
+    /// cold cache when `None`), mirroring the production field set.
+    fn build_state(initial: Option<CachedFleetPosture>) -> Arc<ServiceState> {
+        let store = VerifierStore::new(":memory:").expect("in-memory store");
+        let app = Arc::new(AppState::new(store, VerifierOperationMode::Active));
+        let posture_cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(initial));
+        Arc::new(ServiceState {
+            app,
+            posture_cache,
+            audit_verifying_key: None,
+            fabric_router: Arc::new(kirra_runtime_sdk::fabric::router::FabricRouter::new()),
+            fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
+            fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
+            posture_engine_tx: std::sync::OnceLock::new(),
+            perception_cap: kirra_runtime_sdk::gateway::perception_monitor::empty_perception_cap(),
+            perception_monitor_enabled: false,
+        })
+    }
+
+    fn state_with(posture: FleetPosture) -> Arc<ServiceState> {
+        build_state(Some(CachedFleetPosture::new(posture)))
+    }
+
+    /// Drives one request through the REAL assembled app and returns its status.
+    /// A fresh app per call because `oneshot` consumes the router.
+    async fn status_through_real_app(svc: Arc<ServiceState>, method: &str, path: &str) -> StatusCode {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .expect("build request");
+        build_app(svc)
+            .oneshot(req)
+            .await
+            .expect("router service should not panic")
+            .status()
+    }
+
+    /// LockedOut blocks a functional READ on the production router — proving
+    /// the gate is mounted on the real assembly, not just the test stand-in.
+    #[tokio::test]
+    async fn lockedout_blocks_read_on_real_router() {
+        let status =
+            status_through_real_app(state_with(FleetPosture::LockedOut), "GET", "/fleet/posture").await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the real assembled router must deny GET /fleet/posture under LockedOut; got {status}"
+        );
+    }
+
+    /// Posture-dependence on the SAME route + real handler: under Nominal the
+    /// gate steps aside and the production `get_fleet_posture` handler returns
+    /// 200 (empty fleet). The LockedOut→503 / Nominal→200 contrast is what
+    /// proves it is the posture gate — not a blanket 503 — that is wired in.
+    #[tokio::test]
+    async fn nominal_passes_read_through_to_real_handler() {
+        let status =
+            status_through_real_app(state_with(FleetPosture::Nominal), "GET", "/fleet/posture").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the real router must let GET /fleet/posture reach the handler under Nominal; got {status}"
+        );
+    }
+
+    /// The safety-critical actuator WRITE is denied under LockedOut on the real
+    /// router. The posture gate is the outermost layer, so it returns 503
+    /// before the admin-token / envelope layers ever run.
+    #[tokio::test]
+    async fn lockedout_blocks_actuator_write_on_real_router() {
+        let status = status_through_real_app(
+            state_with(FleetPosture::LockedOut),
+            "POST",
+            "/actuator/motion/command",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the real router must deny POST /actuator/motion/command under LockedOut; got {status}"
+        );
+    }
+
+    /// Exemption wiring on the real assembly: `/health` stays reachable under
+    /// LockedOut (liveness is allowlisted by `is_posture_exempt`).
+    #[tokio::test]
+    async fn health_exempt_under_lockedout_on_real_router() {
+        let status =
+            status_through_real_app(state_with(FleetPosture::LockedOut), "GET", "/health").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "/health must remain reachable under LockedOut on the real router (exempt); got {status}"
         );
     }
 }
