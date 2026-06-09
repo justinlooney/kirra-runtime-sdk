@@ -83,3 +83,86 @@ fn test_ort_backend_capabilities() {
         "capabilities must match documented CPU ONNX baseline"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CUDA execution provider tests — behind the `cuda` feature
+// ---------------------------------------------------------------------------
+//
+// These are NOT run by the default CI (it does not pass `--features cuda`). They
+// run in a dedicated GPU CI job (`cargo test -p parko-onnx --features cuda` on
+// NVIDIA silicon with a CUDA-enabled ONNX Runtime) — same gating spirit as the
+// ORT-dylib / TensorRT GPU gating (#144). The cross-check self-skips (does not
+// fail) when no CUDA provider/GPU is present, so `--features cuda` on a non-GPU
+// box is clean.
+
+#[cfg(feature = "cuda")]
+mod cuda_ep {
+    use super::*;
+    use parko_onnx::CudaConfig;
+
+    /// GPU-FREE: the default CUDA config is fail-closed (no silent CPU fallback),
+    /// device 0. Runs anywhere `--features cuda` builds — constructs no session.
+    #[test]
+    fn cuda_config_default_is_fail_closed() {
+        let cfg = CudaConfig::default();
+        assert!(!cfg.allow_cpu_fallback,
+            "CUDA must default to fail-closed — no silent CPU fallback");
+        assert_eq!(cfg.device_id, 0, "default CUDA device is 0");
+    }
+
+    /// GPU-GATED: a constructed CUDA backend reports the `Cuda` descriptor and
+    /// its MNIST output matches the CPU backend within tolerance. Self-skips
+    /// (no failure) when CUDA is unavailable — `new_cuda` fail-closes there.
+    #[test]
+    fn cuda_descriptor_and_mnist_matches_cpu() {
+        let model_path = "tests/data/mnist-12.onnx";
+
+        // Construct the CUDA backend fail-closed. If CUDA isn't available
+        // (no GPU / driver / CUDA-enabled ORT lib) this returns Err — skip.
+        let cuda = match OrtBackend::new_cuda(model_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("SKIP: CUDA EP unavailable (no GPU / CUDA ORT provider) — {e:?}. \
+                           This test runs only in the GPU CI job.");
+                return;
+            }
+        };
+        assert_eq!(cuda.descriptor(), BackendDescriptor::Cuda,
+            "the CUDA backend must report the Cuda descriptor");
+
+        let cpu = OrtBackend::new(model_path).expect("CPU backend");
+
+        // Same MNIST input through both EPs.
+        let model_cpu = cpu.load_model(model_path).expect("cpu load");
+        let model_cuda = cuda.load_model(model_path).expect("cuda load");
+
+        let input_name = "Input3";
+        let output_name = "Plus214_Output_0";
+        let total: usize = model_cpu.input_shapes.get(input_name).unwrap().iter().product();
+        let img = vec![0.0f32; total];
+
+        let batch = |img: &'static [f32]| {
+            let mut m = HashMap::new();
+            m.insert(input_name.to_string(), TensorStorage::Borrowed(img));
+            TensorBatch { named_tensors: m, metadata: HashMap::new() }
+        };
+        // Leak a stable slice for the 'static Borrowed lifetime (test-only).
+        let img: &'static [f32] = Box::leak(img.into_boxed_slice());
+
+        let out_cpu = cpu.run(&model_cpu, &batch(img)).expect("cpu run");
+        let out_cuda = cuda.run(&model_cuda, &batch(img)).expect("cuda run");
+
+        let a = out_cpu.named_tensors.get(output_name).unwrap().as_slice();
+        let b = out_cuda.named_tensors.get(output_name).unwrap().as_slice();
+        assert_eq!(a.len(), b.len(), "output length must match across EPs");
+
+        // GPU vs CPU is NOT bitwise identical — compare within tolerance.
+        const TOL: f32 = 1e-3;
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(y.is_finite(), "non-finite CUDA score at {i}: {y}");
+            assert!((x - y).abs() <= TOL,
+                "CUDA vs CPU mismatch at class {i}: cpu={x}, cuda={y}, |Δ|>{TOL}");
+        }
+        println!("CUDA matches CPU within {TOL}. cpu={a:?} cuda={b:?}");
+    }
+}

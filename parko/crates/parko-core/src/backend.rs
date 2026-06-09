@@ -89,6 +89,9 @@ pub struct TensorBatch<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BackendDescriptor {
     Cpu,
+    /// NVIDIA GPU via the ONNX Runtime **CUDA** execution provider
+    /// (parko-onnx `OrtBackend::new_cuda`, behind the `cuda` feature).
+    Cuda,
     TensorRT,
     QualcommQnn,
     TiTidl,

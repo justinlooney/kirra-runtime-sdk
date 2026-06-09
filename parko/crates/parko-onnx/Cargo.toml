@@ -5,6 +5,16 @@ edition = "2021"
 description = "ONNX Runtime backend for parko-core via ort"
 license = "Apache-2.0"
 
+[features]
+# CUDA execution provider (NVIDIA GPU). Enables ort's `cuda` feature, which
+# compiles in the CUDA EP bindings. The DEFAULT build is CPU-only and pulls NO
+# CUDA libraries: `ort/cuda` -> `ort-sys/cuda` is an empty marker feature, and
+# `load-dynamic` (always on) sets `ort-sys/disable-linking`, so nothing CUDA is
+# LINKED at build time — `cargo build --features cuda` compiles with no CUDA/GPU
+# present. Real CUDA inference needs a CUDA-enabled ONNX Runtime + GPU at RUNTIME
+# (the gated tests run only in a dedicated GPU CI job — see tests/, #144 pattern).
+cuda = ["ort/cuda"]
+
 [dependencies]
 parko-core = { path = "../parko-core" }
 # ort 2.0.0-rc.11 (ONNX Runtime 1.23.2, ORT_API_VERSION = 23). Downgraded

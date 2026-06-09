@@ -65,6 +65,7 @@ fn capabilities_precision(caps: &BackendCapabilities) -> PrecisionMode {
 fn descriptor_vendor(d: &BackendDescriptor) -> &'static str {
     match d {
         BackendDescriptor::Cpu => "ort-cpu",
+        BackendDescriptor::Cuda => "cuda",
         BackendDescriptor::TensorRT => "tensorrt",
         BackendDescriptor::QualcommQnn => "qnn",
         BackendDescriptor::TiTidl => "ti-tidl",
