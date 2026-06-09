@@ -71,6 +71,89 @@ pub fn canonical_anchor_head_payload(sequence: u64, record_hash: &str) -> String
     format!("kirra-audit-head:v1:{sequence}:{record_hash}")
 }
 
+// --- Fabric causal-log forensic chain primitives (issue #87) ---------------
+//
+// The fabric causal log is a hash-chained, signed, persisted forensic ledger
+// that MIRRORS the audit chain machinery above, but is domain-separated so a
+// causal signature/hash can never be confused with an audit one. The KEY WIN
+// over the prior in-memory log is that the record hash binds the CAUSALITY
+// EDGES (`caused_by`, `affects_assets`, `fabric_generation`) plus `previous_hash`
+// and `sequence` — tampering an edge changes the record hash and is DETECTED.
+
+/// Causal record hash (issue #87). SHA-256 over a domain-separated,
+/// length-prefixed encoding that BINDS the causality edges.
+///
+/// Domain tag `KIRRA-CAUSAL-V1` (distinct from `KIRRA-AUDIT-V2`). Every
+/// variable-length scalar field is preceded by its 8-byte LE length; each edge
+/// VECTOR is preceded by its element count (8-byte LE) and every element by its
+/// own 8-byte LE length. Fixed-width integers (`timestamp_ms`,
+/// `fabric_generation`, `sequence`) are appended as LE bytes. Length-prefixing
+/// closes field-splicing ambiguities (`"AB"+"C"` vs `"A"+"BC"`) so neither a
+/// scalar nor an edge element can be silently relabeled or moved between fields.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_causal_record_hash(
+    previous_hash: &str,
+    entry_id: &str,
+    asset_id: &str,
+    event_type: &str,
+    payload: &str,
+    caused_by: &[String],
+    affects_assets: &[String],
+    timestamp_ms: u64,
+    fabric_generation: u64,
+    sequence: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"KIRRA-CAUSAL-V1");
+    for field in [
+        previous_hash.as_bytes(),
+        entry_id.as_bytes(),
+        asset_id.as_bytes(),
+        event_type.as_bytes(),
+        payload.as_bytes(),
+    ] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    // Edge vectors: count-prefixed, each element length-prefixed. This is what
+    // binds the causality edges into the record hash.
+    for vec in [caused_by, affects_assets] {
+        hasher.update((vec.len() as u64).to_le_bytes());
+        for elem in vec {
+            hasher.update((elem.len() as u64).to_le_bytes());
+            hasher.update(elem.as_bytes());
+        }
+    }
+    hasher.update(timestamp_ms.to_le_bytes());
+    hasher.update(fabric_generation.to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Canonical signing payload for a causal-log row (issue #87).
+///
+/// The Ed25519 signature is over `record_hash`, which TRANSITIVELY binds the
+/// causality edges (because `compute_causal_record_hash` binds them into
+/// `record_hash`). `previous_hash` and `sequence` also appear explicitly so the
+/// row's chain position is signed directly. Domain prefix `kirra-causal:v1`
+/// keeps it distinct from the audit row payload.
+pub fn canonical_causal_signing_payload(
+    previous_hash: &str,
+    record_hash: &str,
+    event_type: &str,
+    timestamp_ms: u64,
+    sequence: u64,
+) -> String {
+    format!("kirra-causal:v1:{previous_hash}:{record_hash}:{event_type}:{timestamp_ms}:{sequence}")
+}
+
+/// Canonical signing payload for the causal anchor-HEAD high-water mark (#87).
+/// Domain-separated (`kirra-causal-head:v1`) from BOTH the audit head and the
+/// causal row payload, so no signature can be replayed across the three roles.
+pub fn canonical_causal_anchor_head_payload(sequence: u64, record_hash: &str) -> String {
+    format!("kirra-causal-head:v1:{sequence}:{record_hash}")
+}
+
 pub struct AuditChainLinker;
 
 /// Content-addressed key id for an audit signing key: hex SHA-256 of the
@@ -545,6 +628,91 @@ mod audit_signing_tests {
             assert_eq!(recomputed, record, "v2 record hash should match");
             expected_prev = record;
         }
+    }
+
+    // --- Causal-log primitive tests (issue #87) ---------------------------
+
+    #[test]
+    fn test_causal_record_hash_is_deterministic() {
+        let h1 = compute_causal_record_hash(
+            &"0".repeat(64), "entry1", "asset1", "FAULT", "{}",
+            &["c1".to_string()], &["a1".to_string()], 1000, 5, 0,
+        );
+        let h2 = compute_causal_record_hash(
+            &"0".repeat(64), "entry1", "asset1", "FAULT", "{}",
+            &["c1".to_string()], &["a1".to_string()], 1000, 5, 0,
+        );
+        assert_eq!(h1, h2, "causal record hash must be deterministic");
+    }
+
+    #[test]
+    fn test_causal_record_hash_binds_caused_by_edge() {
+        let base = compute_causal_record_hash(
+            &"0".repeat(64), "e", "a", "T", "{}",
+            &["c1".to_string()], &["x".to_string()], 1, 1, 0,
+        );
+        let tampered = compute_causal_record_hash(
+            &"0".repeat(64), "e", "a", "T", "{}",
+            &["c2".to_string()], &["x".to_string()], 1, 1, 0,
+        );
+        assert_ne!(base, tampered, "changing caused_by MUST change the record hash");
+    }
+
+    #[test]
+    fn test_causal_record_hash_binds_affects_assets_edge() {
+        let base = compute_causal_record_hash(
+            &"0".repeat(64), "e", "a", "T", "{}",
+            &[], &["x".to_string()], 1, 1, 0,
+        );
+        let tampered = compute_causal_record_hash(
+            &"0".repeat(64), "e", "a", "T", "{}",
+            &[], &["y".to_string()], 1, 1, 0,
+        );
+        assert_ne!(base, tampered, "changing affects_assets MUST change the record hash");
+    }
+
+    #[test]
+    fn test_causal_record_hash_binds_fabric_generation_edge() {
+        let base = compute_causal_record_hash(
+            &"0".repeat(64), "e", "a", "T", "{}", &[], &[], 1, 5, 0,
+        );
+        let tampered = compute_causal_record_hash(
+            &"0".repeat(64), "e", "a", "T", "{}", &[], &[], 1, 6, 0,
+        );
+        assert_ne!(base, tampered, "changing fabric_generation MUST change the record hash");
+    }
+
+    #[test]
+    fn test_causal_record_hash_length_prefix_prevents_splicing() {
+        // ("AB","C") vs ("A","BC") in the edge vectors must differ.
+        let a = compute_causal_record_hash(
+            &"0".repeat(64), "e", "a", "T", "{}",
+            &["AB".to_string(), "C".to_string()], &[], 1, 1, 0,
+        );
+        let b = compute_causal_record_hash(
+            &"0".repeat(64), "e", "a", "T", "{}",
+            &["A".to_string(), "BC".to_string()], &[], 1, 1, 0,
+        );
+        assert_ne!(a, b, "length-prefixing must defeat edge field-splicing");
+    }
+
+    #[test]
+    fn test_causal_signing_payload_format_is_stable() {
+        let p = canonical_causal_signing_payload(
+            &"0".repeat(64), &"a".repeat(64), "EVT", 1234, 7,
+        );
+        assert_eq!(
+            p,
+            format!("kirra-causal:v1:{}:{}:EVT:1234:7", "0".repeat(64), "a".repeat(64)),
+        );
+    }
+
+    #[test]
+    fn test_causal_anchor_head_payload_is_domain_separated() {
+        let head = canonical_causal_anchor_head_payload(3, "deadbeef");
+        assert_eq!(head, "kirra-causal-head:v1:3:deadbeef");
+        // Distinct from the audit head domain.
+        assert_ne!(head, canonical_anchor_head_payload(3, "deadbeef"));
     }
 
     #[test]

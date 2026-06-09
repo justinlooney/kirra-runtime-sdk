@@ -1688,6 +1688,8 @@ async fn handle_fabric_command(
 struct CausalLogQuery {
     from_ms: Option<u64>,
     to_ms: Option<u64>,
+    limit: Option<u32>,
+    offset: Option<u32>,
 }
 
 async fn handle_fabric_causal_log(
@@ -1696,9 +1698,46 @@ async fn handle_fabric_causal_log(
 ) -> impl IntoResponse {
     let from = q.from_ms.unwrap_or(0);
     let to = q.to_ms.unwrap_or(u64::MAX);
-    let entries = svc.fabric_causal_log.export(from, to);
+    // #87: bounded + paginated. `limit` is clamped to CAUSAL_EXPORT_MAX_PAGE
+    // inside export_page so a forensic export is never unbounded.
+    let limit = q
+        .limit
+        .unwrap_or(kirra_runtime_sdk::fabric::causal_log::CAUSAL_EXPORT_MAX_PAGE);
+    let offset = q.offset.unwrap_or(0);
+    let entries = svc.fabric_causal_log.export_page(from, to, limit, offset);
     let total = entries.len();
-    Json(json!({"entries": entries, "total": total})).into_response()
+    Json(json!({"entries": entries, "total": total, "limit": limit, "offset": offset})).into_response()
+}
+
+/// #87: admin-gated verification of the causal-log forensic chain. Mirrors
+/// `/system/audit/verify`. Mounted at `/system/audit/causal/verify` (NOT under
+/// `/fabric/causal-log/...`, to avoid colliding with the `{entry_id}` wildcard).
+async fn verify_causal_chain(
+    State(svc): State<Arc<ServiceState>>,
+) -> impl IntoResponse {
+    let vk = svc.audit_verifying_key.as_ref();
+    match svc.app.store.lock() {
+        Ok(store) => match store.verify_causal_chain_integrity(vk) {
+            Ok(r) => Json(json!({
+                "chain_intact": r.chain_intact,
+                "total_entries": r.total_entries,
+                "latest_hash": r.latest_hash,
+                "signing_enabled": r.signing_enabled,
+                "signed_entries": r.signed_entries,
+                "unsigned_entries": r.unsigned_entries,
+                "signature_valid": r.signature_valid,
+                "first_signed_at_ms": r.first_signed_at_ms,
+                "public_key_b64": r.public_key_b64,
+                "head_verified": r.head_verified,
+                "head_status": r.head_status,
+                "verified": r.chain_intact && r.signature_valid && r.head_verified,
+            })).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "error": "causal chain query failed" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
 }
 
 async fn handle_fabric_causal_chain(
@@ -1831,13 +1870,16 @@ async fn main() {
     }
 
     let signing_key = audit_signing_key.clone();
+    // #87: the causal log persists to the SAME store the rest of the service
+    // uses, so forensic causal rows land in the production DB and chain there.
+    let causal_store = Arc::clone(&app_state.store);
     let svc_state = Arc::new(ServiceState {
         app: app_state,
         posture_cache: Arc::new(std::sync::RwLock::new(None)),
         audit_verifying_key,
         fabric_router: Arc::new(FabricRouter::new()),
         fabric_telemetry: Arc::new(FabricTelemetry::new()),
-        fabric_causal_log: Arc::new(FabricCausalLog::new(signing_key)),
+        fabric_causal_log: Arc::new(FabricCausalLog::new(causal_store, signing_key)),
         posture_engine_tx: std::sync::OnceLock::new(),
         // KIRRA-OCCY-PMON-002: perception-derate composition. DEFAULT OFF —
         // pure no-op (state 1) until #126 wires a real perception ingest and a
@@ -2221,6 +2263,7 @@ fn build_app(svc_state: Arc<ServiceState>) -> Router {
         .route("/fleet/assets/register", post(handle_register_av_asset))
         .route("/system/backup/export", post(export_backup))
         .route("/system/audit/verify", get(verify_audit_chain))
+        .route("/system/audit/causal/verify", get(verify_causal_chain))
         .route("/system/audit/export", get(handle_audit_export))
         .route("/system/audit/rotate-signing-key", post(handle_audit_rotate_key))
         .route("/federation/controllers/register", post(register_federation_controller))
@@ -2481,7 +2524,7 @@ mod posture_gate_real_router_tests {
             audit_verifying_key: None,
             fabric_router: Arc::new(kirra_runtime_sdk::fabric::router::FabricRouter::new()),
             fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
-            fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new(None)),
+            fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new_in_memory(None)),
             posture_engine_tx: std::sync::OnceLock::new(),
             perception_cap: kirra_runtime_sdk::gateway::perception_monitor::empty_perception_cap(),
             perception_monitor_enabled: false,
