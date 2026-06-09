@@ -40,8 +40,9 @@ use kirra_runtime_sdk::gateway::kinematics_contract::{
 use kirra_runtime_sdk::verifier::FleetPosture;
 
 use parko_core::commands::ControlCommand;
+use parko_core::rss::{lateral_safe_distance, longitudinal_safe_distance};
 use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
-use parko_core::RssState;
+use parko_core::{AgentScene, RssParams, RssState, MAX_RSS_AGENTS};
 
 pub mod angular_bound;
 pub mod comparator;
@@ -120,6 +121,103 @@ fn degraded_channel_violation(current: f64, proposed: f64, eps: f64) -> Option<&
 /// improvement over the H1 placeholders is real (reasoning + defensible
 /// values where there were none), but treating these numbers as a
 /// validated safety claim requires sign-off.
+
+/// CHECKER-OVER-DOER pairwise RSS evaluation (issue #92).
+///
+/// The trusted checker (this crate) computes the worst-case RSS verdict over
+/// the agent set ITSELF, via the vetted parko-core safe-distance primitives —
+/// it never trusts a `safe: bool` pushed by an upstream doer. For each agent it
+/// computes the required longitudinal AND lateral safe-distance and compares to
+/// the agent's ACTUAL measured gap / separation; the pair is unsafe if actual <
+/// required on either axis. The scene verdict is the WORST case: `safe` only if
+/// every pair is safe.
+///
+/// Fail-closed handling:
+///   - `Absent` (no perception update) → UNSAFE. "No agents" is not "clear".
+///   - `KnownEmpty` (perception ran, clear) → safe.
+///   - more than `MAX_RSS_AGENTS`, or an empty `Agents` vector → UNSAFE.
+///   - A non-finite agent is NOT skipped: the parko-core primitive returns
+///     `RSS_FAILSAFE_DISTANCE_M` (1e6 m, an unreachable separation), so
+///     `actual < required` holds and the pair is unsafe. A non-finite ACTUAL
+///     gap likewise makes the `>=` comparison false → unsafe.
+///
+/// Margins on the returned [`RssState`] are the worst (minimum actual−required)
+/// across all pairs; `KnownEmpty` reports `f64::MAX` margins (the no-threat
+/// convention used by `KirraGovernor::new`).
+pub fn compute_scene_rss(scene: &AgentScene, params: &RssParams) -> RssState {
+    // Fail-closed verdict reused for Absent / over-cap / empty-set.
+    let unsafe_state = || RssState {
+        safe: false,
+        longitudinal_margin: 0.0,
+        lateral_margin: 0.0,
+    };
+
+    let agents = match scene {
+        AgentScene::Absent => return unsafe_state(),
+        AgentScene::KnownEmpty => {
+            return RssState {
+                safe: true,
+                longitudinal_margin: f64::MAX,
+                lateral_margin: f64::MAX,
+            }
+        }
+        AgentScene::Agents(agents) => agents,
+    };
+
+    // Bounded WCET: a scene larger than the cap is fail-closed, not truncated.
+    // An empty `Agents` vector is ambiguous vs `KnownEmpty` → fail-closed.
+    if agents.is_empty() || agents.len() > MAX_RSS_AGENTS {
+        return unsafe_state();
+    }
+
+    let mut all_safe = true;
+    let mut min_long_margin = f64::INFINITY;
+    let mut min_lat_margin = f64::INFINITY;
+
+    for a in agents {
+        let required_long = longitudinal_safe_distance(
+            a.ego_vel,
+            a.lead_vel,
+            params.reaction_time,
+            params.accel_max,
+            params.brake_min,
+            params.brake_max,
+        );
+        let required_lat = lateral_safe_distance(
+            a.ego_lat_vel,
+            a.obj_lat_vel,
+            params.lat_accel_max,
+            params.reaction_time,
+        );
+
+        // NaN-safe: a non-finite ACTUAL gap makes `>=` false (NaN comparisons
+        // are false); a non-finite agent VELOCITY drove `required_*` to the
+        // 1e6 failsafe, so a realistic finite actual gap is `< required` → the
+        // pair is unsafe. Either way the agent is evaluated, never skipped.
+        let pair_safe = a.actual_longitudinal_gap_m >= required_long
+            && a.actual_lateral_separation_m >= required_lat;
+        if !pair_safe {
+            all_safe = false;
+        }
+
+        let long_margin = a.actual_longitudinal_gap_m - required_long;
+        let lat_margin = a.actual_lateral_separation_m - required_lat;
+        // `min` propagates NaN-safely here: a NaN margin (from a NaN actual)
+        // is replaced by the running minimum, but `all_safe` is already false.
+        if long_margin < min_long_margin {
+            min_long_margin = long_margin;
+        }
+        if lat_margin < min_lat_margin {
+            min_lat_margin = lat_margin;
+        }
+    }
+
+    RssState {
+        safe: all_safe,
+        longitudinal_margin: min_long_margin,
+        lateral_margin: min_lat_margin,
+    }
+}
 
 /// A safety governor backed by the Kirra runtime SDK's vehicle kinematics
 /// contract.
@@ -364,13 +462,18 @@ impl KirraGovernor {
     }
 }
 
-impl SafetyGovernor for KirraGovernor {
-    fn evaluate(
+impl KirraGovernor {
+    /// The three-tier gate (LockedOut → RSS → kinematic, PARK-016),
+    /// parameterized on the RSS-safe verdict so the SAME logic serves both the
+    /// pushed-state path (`evaluate`, used by the comparator/shadow + tests) and
+    /// the authoritative pairwise path (`evaluate_scene`).
+    fn gate(
         &self,
         proposed: &ControlCommand,
         previous: Option<&ControlCommand>,
         delta_time_s: f64,
         posture: SafetyPosture,
+        rss_safe: bool,
     ) -> EnforcementAction {
         // LockedOut check first — hard stop takes absolute priority.
         if posture == SafetyPosture::LockedOut {
@@ -382,7 +485,7 @@ impl SafetyGovernor for KirraGovernor {
         // RSS gate second — unsafe state applies Degraded semantics
         // (decel-to-stop-and-HOLD, Issue #70). Per ADL-001: a sensor gap is
         // recoverable; hard stop (0.0) is not.
-        if !self.rss_state.safe {
+        if !rss_safe {
             return self.apply_mrc_profile(proposed, previous);
         }
 
@@ -437,6 +540,41 @@ impl SafetyGovernor for KirraGovernor {
                 }
             }
         }
+    }
+
+    /// AUTHORITATIVE pairwise RSS path (issue #92).
+    ///
+    /// The governor COMPUTES the RSS verdict from the agent scene it sees
+    /// (`compute_scene_rss`, checker-over-doer) and runs the three-tier gate on
+    /// THAT computed verdict — it never trusts a caller-pushed `safe: bool`.
+    /// `update_rss_state` remains for the comparator/shadow + tests, but the
+    /// production verdict path is this method.
+    pub fn evaluate_scene(
+        &self,
+        proposed: &ControlCommand,
+        previous: Option<&ControlCommand>,
+        delta_time_s: f64,
+        posture: SafetyPosture,
+        scene: &AgentScene,
+        params: &RssParams,
+    ) -> EnforcementAction {
+        let computed = compute_scene_rss(scene, params);
+        self.gate(proposed, previous, delta_time_s, posture, computed.safe)
+    }
+}
+
+impl SafetyGovernor for KirraGovernor {
+    fn evaluate(
+        &self,
+        proposed: &ControlCommand,
+        previous: Option<&ControlCommand>,
+        delta_time_s: f64,
+        posture: SafetyPosture,
+    ) -> EnforcementAction {
+        // Pushed-state path (comparator/shadow + tests): the gate runs on the
+        // RSS verdict last set via `update_rss_state`. The production verdict
+        // comes from `evaluate_scene`, which computes RSS pairwise.
+        self.gate(proposed, previous, delta_time_s, posture, self.rss_state.safe)
     }
 }
 
@@ -1047,5 +1185,163 @@ mod tests {
             matches!(action, EnforcementAction::Allow),
             "Degraded must admit holding at a standstill; got {action:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #92 — pairwise RSS (checker-over-doer) tests.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod scene_rss_tests {
+    use super::{compute_scene_rss, KirraGovernor};
+    use parko_core::commands::ControlCommand;
+    use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
+    use parko_core::{AgentScene, RssAgent, RssParams, RssState, MAX_RSS_AGENTS};
+
+    fn params() -> RssParams {
+        RssParams {
+            reaction_time: 0.5,
+            accel_max: 2.0,
+            brake_min: 6.0,
+            brake_max: 6.0,
+            lat_accel_max: 2.0,
+        }
+    }
+
+    /// Huge actual separations on both axes → comfortably safe at these speeds.
+    fn safe_agent() -> RssAgent {
+        RssAgent {
+            ego_vel: 10.0,
+            lead_vel: 10.0,
+            actual_longitudinal_gap_m: 1000.0,
+            ego_lat_vel: 0.5,
+            obj_lat_vel: 0.5,
+            actual_lateral_separation_m: 1000.0,
+        }
+    }
+
+    fn long_unsafe_agent() -> RssAgent {
+        RssAgent { actual_longitudinal_gap_m: 0.1, ..safe_agent() }
+    }
+
+    fn lat_unsafe_agent() -> RssAgent {
+        RssAgent {
+            ego_lat_vel: 2.0,
+            obj_lat_vel: 2.0,
+            actual_lateral_separation_m: 0.0,
+            ..safe_agent()
+        }
+    }
+
+    fn cmd(linear: f64) -> ControlCommand {
+        ControlCommand { linear_velocity: linear, angular_velocity: 0.0, timestamp_ms: 0 }
+    }
+
+    // --- compute_scene_rss: scene semantics ---
+
+    #[test]
+    fn known_empty_is_safe() {
+        assert!(compute_scene_rss(&AgentScene::KnownEmpty, &params()).safe);
+    }
+
+    #[test]
+    fn absent_is_fail_closed_unsafe() {
+        assert!(!compute_scene_rss(&AgentScene::Absent, &params()).safe,
+            "no perception data must be fail-closed unsafe (absent != clear)");
+    }
+
+    #[test]
+    fn empty_agents_vector_is_fail_closed() {
+        assert!(!compute_scene_rss(&AgentScene::Agents(vec![]), &params()).safe,
+            "an empty Agents vector is ambiguous vs KnownEmpty → fail-closed");
+    }
+
+    #[test]
+    fn all_safe_scene_is_safe() {
+        let scene = AgentScene::Agents(vec![safe_agent(), safe_agent(), safe_agent()]);
+        assert!(compute_scene_rss(&scene, &params()).safe);
+    }
+
+    #[test]
+    fn one_unsafe_among_safe_is_worst_case_unsafe() {
+        let scene = AgentScene::Agents(vec![safe_agent(), long_unsafe_agent(), safe_agent()]);
+        assert!(!compute_scene_rss(&scene, &params()).safe,
+            "a single unsafe agent makes the whole-scene verdict unsafe (worst case)");
+    }
+
+    // --- both axes evaluated per pair ---
+
+    #[test]
+    fn longitudinal_axis_is_evaluated() {
+        let scene = AgentScene::Agents(vec![long_unsafe_agent()]);
+        assert!(!compute_scene_rss(&scene, &params()).safe, "longitudinal violation must be caught");
+    }
+
+    #[test]
+    fn lateral_axis_is_evaluated() {
+        let scene = AgentScene::Agents(vec![lat_unsafe_agent()]);
+        assert!(!compute_scene_rss(&scene, &params()).safe, "lateral violation must be caught");
+    }
+
+    // --- NaN / non-finite → failsafe → unsafe (agent evaluated, not skipped) ---
+
+    #[test]
+    fn nan_velocity_agent_is_failsafe_unsafe() {
+        // ego_vel NaN → longitudinal_safe_distance returns RSS_FAILSAFE_DISTANCE_M
+        // (1e6 m); the agent's realistic 1000 m gap is < 1e6 → unsafe.
+        let agent = RssAgent { ego_vel: f64::NAN, ..safe_agent() };
+        assert!(!compute_scene_rss(&AgentScene::Agents(vec![agent]), &params()).safe);
+    }
+
+    #[test]
+    fn nan_actual_gap_agent_is_unsafe() {
+        // A NaN actual gap makes `actual >= required` false → unsafe.
+        let agent = RssAgent { actual_longitudinal_gap_m: f64::NAN, ..safe_agent() };
+        assert!(!compute_scene_rss(&AgentScene::Agents(vec![agent]), &params()).safe);
+    }
+
+    // --- bounded WCET ---
+
+    #[test]
+    fn over_max_agents_is_fail_closed() {
+        let over = AgentScene::Agents(vec![safe_agent(); MAX_RSS_AGENTS + 1]);
+        assert!(!compute_scene_rss(&over, &params()).safe, "more than MAX_RSS_AGENTS → fail-closed");
+        let at_cap = AgentScene::Agents(vec![safe_agent(); MAX_RSS_AGENTS]);
+        assert!(compute_scene_rss(&at_cap, &params()).safe, "exactly MAX_RSS_AGENTS is still evaluated");
+    }
+
+    // --- THE KEY TEST: checker overrides doer ---
+
+    #[test]
+    fn checker_over_doer_pairwise_overrides_pushed_safe_bool() {
+        let mut gov = KirraGovernor::new();
+        // The doer PUSHES safe:true via the old trusted path.
+        gov.update_rss_state(RssState { safe: true, longitudinal_margin: f64::MAX, lateral_margin: f64::MAX });
+
+        // 8 m/s steady: within the Nominal envelope (max 35) but above the MRC
+        // ceiling (5) — so a Nominal-safe verdict is `Allow`, while an RSS-unsafe
+        // verdict applies the MRC profile (NOT `Allow`).
+        let proposed = cmd(8.0);
+        let prev = cmd(8.0);
+        let unsafe_scene = AgentScene::Agents(vec![long_unsafe_agent()]);
+
+        // The doer's pushed safe:true → trusts the bool → Nominal Allow.
+        let doer_pushed = gov.evaluate(&proposed, Some(&prev), 0.05, SafetyPosture::Nominal);
+        assert!(matches!(doer_pushed, EnforcementAction::Allow),
+            "pushed safe:true yields Nominal Allow, got {doer_pushed:?}");
+
+        // SAME pushed state, but evaluate_scene COMPUTES the verdict from the
+        // scene. A clear scene agrees (Allow); the unsafe scene OVERRIDES the
+        // pushed bool and applies the MRC profile (not Allow).
+        let computed_clear = gov.evaluate_scene(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal, &AgentScene::KnownEmpty, &params());
+        assert!(matches!(computed_clear, EnforcementAction::Allow),
+            "clear computed scene matches the safe verdict, got {computed_clear:?}");
+
+        let computed_unsafe = gov.evaluate_scene(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal, &unsafe_scene, &params());
+        assert!(!matches!(computed_unsafe, EnforcementAction::Allow),
+            "the governor's OWN pairwise computation must override the doer's safe:true \
+             and apply the RSS-unsafe MRC profile, got {computed_unsafe:?}");
     }
 }
