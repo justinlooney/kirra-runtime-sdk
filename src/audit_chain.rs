@@ -90,43 +90,46 @@ pub fn canonical_anchor_head_payload(sequence: u64, record_hash: &str) -> String
 /// `fabric_generation`, `sequence`) are appended as LE bytes. Length-prefixing
 /// closes field-splicing ambiguities (`"AB"+"C"` vs `"A"+"BC"`) so neither a
 /// scalar nor an edge element can be silently relabeled or moved between fields.
-#[allow(clippy::too_many_arguments)]
-pub fn compute_causal_record_hash(
-    previous_hash: &str,
-    entry_id: &str,
-    asset_id: &str,
-    event_type: &str,
-    payload: &str,
-    caused_by: &[String],
-    affects_assets: &[String],
-    timestamp_ms: u64,
-    fabric_generation: u64,
-    sequence: u64,
-) -> String {
+/// Bundled inputs for [`compute_causal_record_hash`].
+#[derive(Debug, Clone)]
+pub struct CausalRecordHashInput<'a> {
+    pub previous_hash: &'a str,
+    pub entry_id: &'a str,
+    pub asset_id: &'a str,
+    pub event_type: &'a str,
+    pub payload: &'a str,
+    pub caused_by: &'a [String],
+    pub affects_assets: &'a [String],
+    pub timestamp_ms: u64,
+    pub fabric_generation: u64,
+    pub sequence: u64,
+}
+
+pub fn compute_causal_record_hash(input: &CausalRecordHashInput<'_>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"KIRRA-CAUSAL-V1");
     for field in [
-        previous_hash.as_bytes(),
-        entry_id.as_bytes(),
-        asset_id.as_bytes(),
-        event_type.as_bytes(),
-        payload.as_bytes(),
+        input.previous_hash.as_bytes(),
+        input.entry_id.as_bytes(),
+        input.asset_id.as_bytes(),
+        input.event_type.as_bytes(),
+        input.payload.as_bytes(),
     ] {
         hasher.update((field.len() as u64).to_le_bytes());
         hasher.update(field);
     }
     // Edge vectors: count-prefixed, each element length-prefixed. This is what
     // binds the causality edges into the record hash.
-    for vec in [caused_by, affects_assets] {
+    for vec in [input.caused_by, input.affects_assets] {
         hasher.update((vec.len() as u64).to_le_bytes());
         for elem in vec {
             hasher.update((elem.len() as u64).to_le_bytes());
             hasher.update(elem.as_bytes());
         }
     }
-    hasher.update(timestamp_ms.to_le_bytes());
-    hasher.update(fabric_generation.to_le_bytes());
-    hasher.update(sequence.to_le_bytes());
+    hasher.update(input.timestamp_ms.to_le_bytes());
+    hasher.update(input.fabric_generation.to_le_bytes());
+    hasher.update(input.sequence.to_le_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -634,65 +637,85 @@ mod audit_signing_tests {
 
     #[test]
     fn test_causal_record_hash_is_deterministic() {
-        let h1 = compute_causal_record_hash(
-            &"0".repeat(64), "entry1", "asset1", "FAULT", "{}",
-            &["c1".to_string()], &["a1".to_string()], 1000, 5, 0,
-        );
-        let h2 = compute_causal_record_hash(
-            &"0".repeat(64), "entry1", "asset1", "FAULT", "{}",
-            &["c1".to_string()], &["a1".to_string()], 1000, 5, 0,
-        );
+        let h1 = compute_causal_record_hash(&CausalRecordHashInput {
+            previous_hash: &"0".repeat(64), entry_id: "entry1", asset_id: "asset1",
+            event_type: "FAULT", payload: "{}",
+            caused_by: &["c1".to_string()], affects_assets: &["a1".to_string()],
+            timestamp_ms: 1000, fabric_generation: 5, sequence: 0,
+        });
+        let h2 = compute_causal_record_hash(&CausalRecordHashInput {
+            previous_hash: &"0".repeat(64), entry_id: "entry1", asset_id: "asset1",
+            event_type: "FAULT", payload: "{}",
+            caused_by: &["c1".to_string()], affects_assets: &["a1".to_string()],
+            timestamp_ms: 1000, fabric_generation: 5, sequence: 0,
+        });
         assert_eq!(h1, h2, "causal record hash must be deterministic");
     }
 
     #[test]
     fn test_causal_record_hash_binds_caused_by_edge() {
-        let base = compute_causal_record_hash(
-            &"0".repeat(64), "e", "a", "T", "{}",
-            &["c1".to_string()], &["x".to_string()], 1, 1, 0,
-        );
-        let tampered = compute_causal_record_hash(
-            &"0".repeat(64), "e", "a", "T", "{}",
-            &["c2".to_string()], &["x".to_string()], 1, 1, 0,
-        );
+        let base = compute_causal_record_hash(&CausalRecordHashInput {
+            previous_hash: &"0".repeat(64), entry_id: "e", asset_id: "a",
+            event_type: "T", payload: "{}",
+            caused_by: &["c1".to_string()], affects_assets: &["x".to_string()],
+            timestamp_ms: 1, fabric_generation: 1, sequence: 0,
+        });
+        let tampered = compute_causal_record_hash(&CausalRecordHashInput {
+            previous_hash: &"0".repeat(64), entry_id: "e", asset_id: "a",
+            event_type: "T", payload: "{}",
+            caused_by: &["c2".to_string()], affects_assets: &["x".to_string()],
+            timestamp_ms: 1, fabric_generation: 1, sequence: 0,
+        });
         assert_ne!(base, tampered, "changing caused_by MUST change the record hash");
     }
 
     #[test]
     fn test_causal_record_hash_binds_affects_assets_edge() {
-        let base = compute_causal_record_hash(
-            &"0".repeat(64), "e", "a", "T", "{}",
-            &[], &["x".to_string()], 1, 1, 0,
-        );
-        let tampered = compute_causal_record_hash(
-            &"0".repeat(64), "e", "a", "T", "{}",
-            &[], &["y".to_string()], 1, 1, 0,
-        );
+        let base = compute_causal_record_hash(&CausalRecordHashInput {
+            previous_hash: &"0".repeat(64), entry_id: "e", asset_id: "a",
+            event_type: "T", payload: "{}",
+            caused_by: &[], affects_assets: &["x".to_string()],
+            timestamp_ms: 1, fabric_generation: 1, sequence: 0,
+        });
+        let tampered = compute_causal_record_hash(&CausalRecordHashInput {
+            previous_hash: &"0".repeat(64), entry_id: "e", asset_id: "a",
+            event_type: "T", payload: "{}",
+            caused_by: &[], affects_assets: &["y".to_string()],
+            timestamp_ms: 1, fabric_generation: 1, sequence: 0,
+        });
         assert_ne!(base, tampered, "changing affects_assets MUST change the record hash");
     }
 
     #[test]
     fn test_causal_record_hash_binds_fabric_generation_edge() {
-        let base = compute_causal_record_hash(
-            &"0".repeat(64), "e", "a", "T", "{}", &[], &[], 1, 5, 0,
-        );
-        let tampered = compute_causal_record_hash(
-            &"0".repeat(64), "e", "a", "T", "{}", &[], &[], 1, 6, 0,
-        );
+        let base = compute_causal_record_hash(&CausalRecordHashInput {
+            previous_hash: &"0".repeat(64), entry_id: "e", asset_id: "a",
+            event_type: "T", payload: "{}", caused_by: &[], affects_assets: &[],
+            timestamp_ms: 1, fabric_generation: 5, sequence: 0,
+        });
+        let tampered = compute_causal_record_hash(&CausalRecordHashInput {
+            previous_hash: &"0".repeat(64), entry_id: "e", asset_id: "a",
+            event_type: "T", payload: "{}", caused_by: &[], affects_assets: &[],
+            timestamp_ms: 1, fabric_generation: 6, sequence: 0,
+        });
         assert_ne!(base, tampered, "changing fabric_generation MUST change the record hash");
     }
 
     #[test]
     fn test_causal_record_hash_length_prefix_prevents_splicing() {
         // ("AB","C") vs ("A","BC") in the edge vectors must differ.
-        let a = compute_causal_record_hash(
-            &"0".repeat(64), "e", "a", "T", "{}",
-            &["AB".to_string(), "C".to_string()], &[], 1, 1, 0,
-        );
-        let b = compute_causal_record_hash(
-            &"0".repeat(64), "e", "a", "T", "{}",
-            &["A".to_string(), "BC".to_string()], &[], 1, 1, 0,
-        );
+        let a = compute_causal_record_hash(&CausalRecordHashInput {
+            previous_hash: &"0".repeat(64), entry_id: "e", asset_id: "a",
+            event_type: "T", payload: "{}",
+            caused_by: &["AB".to_string(), "C".to_string()], affects_assets: &[],
+            timestamp_ms: 1, fabric_generation: 1, sequence: 0,
+        });
+        let b = compute_causal_record_hash(&CausalRecordHashInput {
+            previous_hash: &"0".repeat(64), entry_id: "e", asset_id: "a",
+            event_type: "T", payload: "{}",
+            caused_by: &["A".to_string(), "BC".to_string()], affects_assets: &[],
+            timestamp_ms: 1, fabric_generation: 1, sequence: 0,
+        });
         assert_ne!(a, b, "length-prefixing must defeat edge field-splicing");
     }
 

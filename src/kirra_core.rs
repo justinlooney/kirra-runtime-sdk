@@ -238,12 +238,26 @@ impl Default for CausalFlightRecorder {
     }
 }
 
+/// Bundled parameters for [`CausalFlightRecorder::log`].
+#[derive(Debug, Clone)]
+pub struct JournalLogEntry<'a> {
+    pub ts: u64,
+    pub actor: &'a str,
+    pub token: &'a str,
+    pub action: &'a str,
+    pub res: &'a str,
+    pub state: GlobalSystemState,
+    pub mode: TrustMode,
+    pub score: u32,
+    pub narrative: String,
+}
+
 impl CausalFlightRecorder {
     pub fn new() -> Self { Self { journal: std::collections::VecDeque::new() } }
-    pub fn log(&mut self, ts: u64, actor: &str, token: &str, action: &str, res: &str, state: GlobalSystemState, mode: TrustMode, score: u32, narrative: String) {
+    pub fn log(&mut self, entry: JournalLogEntry<'_>) {
         self.journal.push_back(JournalEntry {
-            timestamp_ms: ts, actor: actor.to_string(), token: token.to_string(), action: action.to_string(), resolution: res.to_string(),
-            score, system_state: state, trust_mode: mode, operator_narrative: narrative,
+            timestamp_ms: entry.ts, actor: entry.actor.to_string(), token: entry.token.to_string(), action: entry.action.to_string(), resolution: entry.res.to_string(),
+            score: entry.score, system_state: entry.state, trust_mode: entry.mode, operator_narrative: entry.narrative,
         });
         if self.journal.len() > 100 { self.journal.pop_front(); }
     }

@@ -20,6 +20,19 @@ pub struct StructuredLogEvent {
     pub event_narrative: String,
 }
 
+/// Bundled parameters for [`EnterpriseTelemetryGateway::emit_structured_event`].
+#[derive(Debug, Clone)]
+pub struct StructuredEventInput<'a> {
+    pub severity: &'a str,
+    pub tx_id: u16,
+    pub offset: u16,
+    pub raw: f64,
+    pub sanitized: f64,
+    pub score: u32,
+    pub mode: &'a str,
+    pub narrative: &'a str,
+}
+
 pub struct EnterpriseTelemetryGateway { node_identifier: String }
 
 impl EnterpriseTelemetryGateway {
@@ -31,13 +44,13 @@ impl EnterpriseTelemetryGateway {
         format!("KIRRA-NODE-{}-{:04X}-SEQ-{}", self.node_identifier, tx_id, seq)
     }
 
-    pub fn emit_structured_event(&self, severity: &str, tx_id: u16, offset: u16, raw: f64, sanitized: f64, score: u32, mode: &str, narrative: &str) -> String {
+    pub fn emit_structured_event(&self, input: &StructuredEventInput<'_>) -> String {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let event = StructuredLogEvent {
-            timestamp_epoch_secs: now, severity: severity.to_string(), node_id: self.node_identifier.clone(),
-            correlation_id: self.generate_correlation_id(tx_id), transaction_id: tx_id, register_offset: offset,
-            raw_demand: raw, sanitized_output: sanitized, trust_score: score, trust_mode: mode.to_string(),
-            event_narrative: narrative.to_string(),
+            timestamp_epoch_secs: now, severity: input.severity.to_string(), node_id: self.node_identifier.clone(),
+            correlation_id: self.generate_correlation_id(input.tx_id), transaction_id: input.tx_id, register_offset: input.offset,
+            raw_demand: input.raw, sanitized_output: input.sanitized, trust_score: input.score, trust_mode: input.mode.to_string(),
+            event_narrative: input.narrative.to_string(),
         };
         serde_json::to_string(&event).unwrap_or_else(|_| r#"{"error":"TELEMETRY_SERIALIZATION_FAILED"}"#.to_string())
     }

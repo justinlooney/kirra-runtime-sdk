@@ -92,14 +92,16 @@ impl FabricCausalLog {
         match self.store.lock() {
             Ok(mut store) => {
                 if let Err(e) = store.append_causal_event(
-                    &entry_id,
-                    asset_id,
-                    event_type,
-                    payload,
-                    &caused_by,
-                    &affects_assets,
-                    fabric_generation,
-                    timestamp_ms,
+                    &crate::verifier_store::CausalEventInput {
+                        entry_id: &entry_id,
+                        asset_id,
+                        event_type,
+                        payload,
+                        caused_by: &caused_by,
+                        affects_assets: &affects_assets,
+                        fabric_generation,
+                        timestamp_ms,
+                    },
                     self.signing_key.as_ref(),
                 ) {
                     tracing::error!(
