@@ -246,7 +246,7 @@ impl AuditChainLinker {
 mod audit_signing_tests {
     use super::*;
     use rusqlite::Connection;
-    use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Verifier, Signature};
+    use ed25519_dalek::{SigningKey, Verifier, Signature};
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
