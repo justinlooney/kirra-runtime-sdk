@@ -29,6 +29,27 @@ pub struct AuditChainVerifyResult {
     pub head_status: String,
 }
 
+/// Verification verdict for the fabric causal-log forensic chain (#87).
+/// Same shape as [`AuditChainVerifyResult`]: `chain_intact` covers in-place
+/// row edits (recomputed record hash mismatch, broken prev-linkage, sequence
+/// gaps); `head_verified` covers tail truncation/deletion via the signed
+/// anchor-head high-water mark. Together they cover edit + truncation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CausalChainVerifyResult {
+    pub chain_intact: bool,
+    pub total_entries: u64,
+    pub latest_hash: String,
+    pub signing_enabled: bool,
+    pub signed_entries: u64,
+    pub unsigned_entries: u64,
+    pub signature_valid: bool,
+    pub first_invalid_signature_index: Option<u64>,
+    pub first_signed_at_ms: Option<u64>,
+    pub public_key_b64: Option<String>,
+    pub head_verified: bool,
+    pub head_status: String,
+}
+
 #[derive(serde::Serialize)]
 pub struct AuditExportEntry {
     pub id: i64,
@@ -420,16 +441,39 @@ impl VerifierStore {
                 metadata_json     TEXT NOT NULL DEFAULT '{}'
             );
 
+            -- #87: forensic, tamper-evident, hash-chained, signed causal ledger.
+            -- Mirrors audit_log_chain: `previous_hash_hex`/`record_hash_hex`
+            -- chain the rows; `sequence` is the monotone position; the record
+            -- hash BINDS the causality edges (caused_by, affects_assets,
+            -- fabric_generation) so tampering an edge is detected. `entry_id`
+            -- remains the causal reference id (caused_by references entry_ids).
             CREATE TABLE IF NOT EXISTS fabric_causal_log (
-                entry_id          TEXT PRIMARY KEY,
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id          TEXT NOT NULL,
+                sequence          INTEGER NOT NULL,
                 timestamp_ms      INTEGER NOT NULL,
                 asset_id          TEXT NOT NULL,
                 event_type        TEXT NOT NULL,
                 payload           TEXT NOT NULL,
-                caused_by_json    TEXT NOT NULL DEFAULT '[]',
-                affects_json      TEXT NOT NULL DEFAULT '[]',
+                caused_by         TEXT NOT NULL,        -- JSON array of entry_id strings
+                affects_assets    TEXT NOT NULL,        -- JSON array of strings
                 fabric_generation INTEGER NOT NULL,
-                signature_b64     TEXT
+                previous_hash_hex TEXT NOT NULL,
+                record_hash_hex   TEXT NOT NULL,
+                signature_b64     TEXT,
+                key_id            TEXT
+            );
+
+            -- #87: signed anchor-HEAD high-water mark for the causal chain.
+            -- Singleton (id = 1); advanced in the SAME transaction as each
+            -- append so it shares the chain tail's durability exactly. A tail
+            -- behind the head ⇒ truncation; bad head signature ⇒ tamper.
+            CREATE TABLE IF NOT EXISTS fabric_causal_anchor_head (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                sequence        INTEGER NOT NULL,
+                record_hash_hex TEXT NOT NULL,
+                signature_b64   TEXT,
+                key_id          TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_causal_log_asset
@@ -2236,24 +2280,444 @@ impl VerifierStore {
         Ok(assets)
     }
 
-    pub fn save_causal_log_entry(&self, entry: &crate::fabric::causal_log::CausalLogEntry) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO fabric_causal_log
-             (entry_id, timestamp_ms, asset_id, event_type, payload, caused_by_json, affects_json, fabric_generation, signature_b64)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![
-                entry.entry_id,
-                entry.timestamp_ms as i64,
-                entry.asset_id,
-                entry.event_type,
-                entry.payload,
-                serde_json::to_string(&entry.caused_by).unwrap_or_else(|_| "[]".to_string()),
-                serde_json::to_string(&entry.affects_assets).unwrap_or_else(|_| "[]".to_string()),
-                entry.fabric_generation as i64,
-                entry.signature_b64.as_deref(),
+    // --- #87: forensic causal-log forensic chain ---------------------------
+
+    /// Append a causal-log event to the hash-chained, signed, persisted ledger.
+    ///
+    /// Mirrors [`crate::audit_chain::AuditChainLinker::append_audit_event_tx`]:
+    /// reads the prev `(record_hash, sequence)` (fail-closed on real read
+    /// errors; only `QueryReturnedNoRows` is genesis), computes the record hash
+    /// (binding the causality edges), signs the canonical causal payload, records
+    /// the content-addressed `key_id`, INSERTs the row, and advances the signed
+    /// causal anchor-head in the SAME transaction. Returns the fully-populated
+    /// `CausalLogEntry`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_causal_event(
+        &mut self,
+        entry_id: &str,
+        asset_id: &str,
+        event_type: &str,
+        payload: &str,
+        caused_by: &[String],
+        affects_assets: &[String],
+        fabric_generation: u64,
+        timestamp_ms: u64,
+        signing_key: Option<&ed25519_dalek::SigningKey>,
+    ) -> Result<crate::fabric::causal_log::CausalLogEntry> {
+        use crate::audit_chain::{
+            canonical_causal_anchor_head_payload, canonical_causal_signing_payload,
+            compute_causal_record_hash, verifying_key_id,
+        };
+        use ed25519_dalek::Signer;
+
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Read previous (record_hash, sequence). FAIL CLOSED on real read errors;
+        // only an empty table is legitimate genesis.
+        let prev = tx.query_row(
+            "SELECT record_hash_hex, sequence FROM fabric_causal_log \
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        );
+        let (previous_hash, prev_seq) = match prev {
+            Ok((h, seq)) => (h, seq),
+            Err(rusqlite::Error::QueryReturnedNoRows) => ("0".repeat(64), -1),
+            Err(e) => return Err(e), // FAIL CLOSED — never fork-to-genesis on read error
+        };
+        let sequence: u64 = (prev_seq + 1) as u64;
+
+        let record_hash = compute_causal_record_hash(
+            &previous_hash,
+            entry_id,
+            asset_id,
+            event_type,
+            payload,
+            caused_by,
+            affects_assets,
+            timestamp_ms,
+            fabric_generation,
+            sequence,
+        );
+
+        let signature_b64: Option<String> = signing_key.map(|k| {
+            let payload_str = canonical_causal_signing_payload(
+                &previous_hash, &record_hash, event_type, timestamp_ms, sequence,
+            );
+            b64e.encode(k.sign(payload_str.as_bytes()).to_bytes())
+        });
+        let key_id: Option<String> =
+            signing_key.map(|k| verifying_key_id(&k.verifying_key()));
+
+        let caused_by_json = serde_json::to_string(caused_by).unwrap_or_else(|_| "[]".to_string());
+        let affects_json =
+            serde_json::to_string(affects_assets).unwrap_or_else(|_| "[]".to_string());
+
+        tx.execute(
+            "INSERT INTO fabric_causal_log
+             (entry_id, sequence, timestamp_ms, asset_id, event_type, payload,
+              caused_by, affects_assets, fabric_generation,
+              previous_hash_hex, record_hash_hex, signature_b64, key_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                entry_id,
+                sequence as i64,
+                timestamp_ms as i64,
+                asset_id,
+                event_type,
+                payload,
+                caused_by_json,
+                affects_json,
+                fabric_generation as i64,
+                previous_hash,
+                record_hash,
+                signature_b64,
+                key_id,
             ],
         )?;
-        Ok(())
+
+        // Advance the signed anchor-HEAD high-water mark in the SAME tx.
+        let head_sig: Option<String> = signing_key.map(|k| {
+            let payload_str = canonical_causal_anchor_head_payload(sequence, &record_hash);
+            b64e.encode(k.sign(payload_str.as_bytes()).to_bytes())
+        });
+        tx.execute(
+            "INSERT INTO fabric_causal_anchor_head (id, sequence, record_hash_hex, signature_b64, key_id)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 sequence        = excluded.sequence,
+                 record_hash_hex = excluded.record_hash_hex,
+                 signature_b64   = excluded.signature_b64,
+                 key_id          = excluded.key_id",
+            params![sequence as i64, record_hash, head_sig, key_id],
+        )?;
+
+        tx.commit()?;
+
+        Ok(crate::fabric::causal_log::CausalLogEntry {
+            entry_id: entry_id.to_string(),
+            sequence,
+            timestamp_ms,
+            asset_id: asset_id.to_string(),
+            event_type: event_type.to_string(),
+            payload: payload.to_string(),
+            caused_by: caused_by.to_vec(),
+            affects_assets: affects_assets.to_vec(),
+            fabric_generation,
+            previous_hash,
+            record_hash,
+            signature_b64,
+            key_id,
+        })
+    }
+
+    /// Decode one `fabric_causal_log` row from a query row. Column order must
+    /// match the SELECT in the loaders below.
+    fn causal_entry_from_row(
+        row: &rusqlite::Row,
+    ) -> Result<crate::fabric::causal_log::CausalLogEntry> {
+        let entry_id: String = row.get(0)?;
+        let sequence: i64 = row.get(1)?;
+        let timestamp_ms: i64 = row.get(2)?;
+        let asset_id: String = row.get(3)?;
+        let event_type: String = row.get(4)?;
+        let payload: String = row.get(5)?;
+        let caused_by_json: String = row.get(6)?;
+        let affects_json: String = row.get(7)?;
+        let fabric_generation: i64 = row.get(8)?;
+        let previous_hash: String = row.get(9)?;
+        let record_hash: String = row.get(10)?;
+        let signature_b64: Option<String> = row.get(11)?;
+        let key_id: Option<String> = row.get(12)?;
+        Ok(crate::fabric::causal_log::CausalLogEntry {
+            entry_id,
+            sequence: sequence.max(0) as u64,
+            timestamp_ms: timestamp_ms.max(0) as u64,
+            asset_id,
+            event_type,
+            payload,
+            caused_by: serde_json::from_str(&caused_by_json).unwrap_or_default(),
+            affects_assets: serde_json::from_str(&affects_json).unwrap_or_default(),
+            fabric_generation: fabric_generation.max(0) as u64,
+            previous_hash,
+            record_hash,
+            signature_b64,
+            key_id,
+        })
+    }
+
+    /// Load every causal-log entry in chain (id ASC) order.
+    pub fn load_causal_entries(&self) -> Result<Vec<crate::fabric::causal_log::CausalLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entry_id, sequence, timestamp_ms, asset_id, event_type, payload, \
+             caused_by, affects_assets, fabric_generation, previous_hash_hex, \
+             record_hash_hex, signature_b64, key_id \
+             FROM fabric_causal_log ORDER BY id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(Self::causal_entry_from_row(row)?);
+        }
+        Ok(out)
+    }
+
+    /// Load causal-log entries whose timestamp falls in `[from_ms, to_ms]`,
+    /// in chain order, bounded by `limit`/`offset`.
+    pub fn load_causal_entries_in_range(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<crate::fabric::causal_log::CausalLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entry_id, sequence, timestamp_ms, asset_id, event_type, payload, \
+             caused_by, affects_assets, fabric_generation, previous_hash_hex, \
+             record_hash_hex, signature_b64, key_id \
+             FROM fabric_causal_log \
+             WHERE timestamp_ms BETWEEN ?1 AND ?2 \
+             ORDER BY id ASC LIMIT ?3 OFFSET ?4",
+        )?;
+        let mut rows = stmt.query(params![
+            from_ms as i64,
+            to_ms.min(i64::MAX as u64) as i64,
+            limit as i64,
+            offset as i64,
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(Self::causal_entry_from_row(row)?);
+        }
+        Ok(out)
+    }
+
+    /// Count of causal-log entries.
+    pub fn count_causal_entries(&self) -> Result<u64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM fabric_causal_log", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|n| n as u64)
+    }
+
+    /// Verify the causal-log forensic chain (#87). Mirrors
+    /// [`Self::verify_audit_chain_full`]: walks the rows checking prev-linkage,
+    /// recomputed record hash (which binds the edges), and sequence monotonicity;
+    /// verifies each row's signature under the key its `key_id` names (selected
+    /// from the SHARED audit keyring — causal rows are signed by the same audit
+    /// key and rotations live in the audit chain); then checks the signed
+    /// anchor-head high-water mark for tail truncation/tamper.
+    pub fn verify_causal_chain_integrity(
+        &self,
+        verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> Result<CausalChainVerifyResult> {
+        use crate::audit_chain::{
+            canonical_causal_anchor_head_payload, canonical_causal_signing_payload,
+            compute_causal_record_hash,
+        };
+
+        // REUSE the #76 audit keyring (genesis from durable anchor + verified
+        // rotations). Causal rows are signed by the SAME audit key. If no
+        // verifying key is supplied, skip signature verification (like audit).
+        let (keyring, genesis_id) = self.audit_keyring_seed(verifying_key)?;
+        let keyring = match verifying_key {
+            Some(g) => self.build_audit_keyring(g)?,
+            None => keyring,
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT entry_id, sequence, timestamp_ms, asset_id, event_type, payload, \
+             caused_by, affects_assets, fabric_generation, previous_hash_hex, \
+             record_hash_hex, signature_b64, key_id \
+             FROM fabric_causal_log ORDER BY id ASC",
+        )?;
+
+        let mut chain_intact = true;
+        let mut total_entries: u64 = 0;
+        let mut latest_hash = "0".repeat(64);
+        let mut expected_previous_hash = "0".repeat(64);
+        let mut signed_entries: u64 = 0;
+        let mut unsigned_entries: u64 = 0;
+        let mut signature_valid = true;
+        let mut first_invalid_signature_index: Option<u64> = None;
+        let mut first_signed_at_ms: Option<u64> = None;
+        let mut prev_seq: Option<i64> = None;
+        let mut last_sequence: Option<i64> = None;
+
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let entry_id: String = row.get(0)?;
+            let sequence: i64 = row.get(1)?;
+            let timestamp_ms: i64 = row.get(2)?;
+            let asset_id: String = row.get(3)?;
+            let event_type: String = row.get(4)?;
+            let payload: String = row.get(5)?;
+            let caused_by_json: String = row.get(6)?;
+            let affects_json: String = row.get(7)?;
+            let fabric_generation: i64 = row.get(8)?;
+            let previous_hash_hex: String = row.get(9)?;
+            let record_hash_hex: String = row.get(10)?;
+            let sig_b64: Option<String> = row.get(11)?;
+            let key_id_opt: Option<String> = row.get(12)?;
+
+            // Prev-linkage.
+            if previous_hash_hex != expected_previous_hash {
+                chain_intact = false;
+            }
+            // Sequence monotonicity: first row 0, each next prev+1.
+            match prev_seq {
+                None => {
+                    if sequence != 0 {
+                        chain_intact = false;
+                    }
+                }
+                Some(p) => {
+                    if sequence != p + 1 {
+                        chain_intact = false;
+                    }
+                }
+            }
+            prev_seq = Some(sequence);
+
+            let caused_by: Vec<String> = serde_json::from_str(&caused_by_json).unwrap_or_default();
+            let affects_assets: Vec<String> =
+                serde_json::from_str(&affects_json).unwrap_or_default();
+            let recalc = compute_causal_record_hash(
+                &previous_hash_hex,
+                &entry_id,
+                &asset_id,
+                &event_type,
+                &payload,
+                &caused_by,
+                &affects_assets,
+                timestamp_ms.max(0) as u64,
+                fabric_generation.max(0) as u64,
+                sequence.max(0) as u64,
+            );
+            if recalc != record_hash_hex {
+                chain_intact = false;
+            }
+            expected_previous_hash = record_hash_hex.clone();
+            latest_hash = record_hash_hex.clone();
+            last_sequence = Some(sequence);
+
+            match &sig_b64 {
+                None => unsigned_entries += 1,
+                Some(s) => {
+                    signed_entries += 1;
+                    if first_signed_at_ms.is_none() {
+                        first_signed_at_ms = Some(timestamp_ms.max(0) as u64);
+                    }
+                    if verifying_key.is_some() {
+                        let signer_id = key_id_opt
+                            .clone()
+                            .or_else(|| genesis_id.clone())
+                            .unwrap_or_default();
+                        let ok = match keyring.get(&signer_id) {
+                            Some(vk) => {
+                                let payload_str = canonical_causal_signing_payload(
+                                    &previous_hash_hex,
+                                    &record_hash_hex,
+                                    &event_type,
+                                    timestamp_ms.max(0) as u64,
+                                    sequence.max(0) as u64,
+                                );
+                                audit_verify_sig(vk, &payload_str, s)
+                            }
+                            None => false, // unknown key_id → FAIL-CLOSED
+                        };
+                        if !ok && first_invalid_signature_index.is_none() {
+                            first_invalid_signature_index = Some(total_entries);
+                            signature_valid = false;
+                        }
+                    }
+                }
+            }
+
+            total_entries += 1;
+        }
+
+        let signing_enabled = verifying_key.is_some();
+        let public_key_b64 = verifying_key.map(|vk| b64e.encode(vk.as_bytes()));
+
+        // Anchor-HEAD high-water check — detects tail truncation/deletion.
+        let (head_verified, head_status): (bool, String) = if total_entries == 0 {
+            (true, "EMPTY_CHAIN".to_string())
+        } else {
+            let head = self.conn.query_row(
+                "SELECT sequence, record_hash_hex, signature_b64, key_id \
+                 FROM fabric_causal_anchor_head WHERE id = 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            );
+            match head {
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    (false, "HEAD_ABSENT".to_string())
+                }
+                Err(e) => return Err(e),
+                Ok((h_seq, h_hash, h_sig, h_key_id)) => {
+                    if Some(h_seq) != last_sequence || h_hash != latest_hash {
+                        let truncated = match last_sequence {
+                            Some(t) => t < h_seq,
+                            None => true,
+                        };
+                        let status = if truncated {
+                            "TRUNCATION_DETECTED"
+                        } else {
+                            "HEAD_TAIL_MISMATCH"
+                        };
+                        (false, status.to_string())
+                    } else if signing_enabled {
+                        match h_sig {
+                            None => (false, "HEAD_UNSIGNED".to_string()),
+                            Some(sig) => {
+                                let signer_id =
+                                    h_key_id.or_else(|| genesis_id.clone()).unwrap_or_default();
+                                match keyring.get(&signer_id) {
+                                    None => (false, "HEAD_KEY_UNKNOWN".to_string()),
+                                    Some(vk) => {
+                                        let payload_str = canonical_causal_anchor_head_payload(
+                                            h_seq.max(0) as u64,
+                                            &h_hash,
+                                        );
+                                        if audit_verify_sig(vk, &payload_str, &sig) {
+                                            (true, "OK".to_string())
+                                        } else {
+                                            (false, "HEAD_SIGNATURE_INVALID".to_string())
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        (true, "OK_UNSIGNED".to_string())
+                    }
+                }
+            }
+        };
+
+        Ok(CausalChainVerifyResult {
+            chain_intact,
+            total_entries,
+            latest_hash,
+            signing_enabled,
+            signed_entries,
+            unsigned_entries,
+            signature_valid,
+            first_invalid_signature_index,
+            first_signed_at_ms,
+            public_key_b64,
+            head_verified,
+            head_status,
+        })
     }
 }
 
@@ -3940,5 +4404,163 @@ mod audit_anchor_head_77_tests {
         // Idempotent: a second call is a no-op and stays clean.
         s.ensure_audit_anchor_head(1000).unwrap();
         assert!(s.verify_audit_chain_full(Some(&vk)).unwrap().head_verified);
+    }
+}
+
+// --- #87: fabric causal-log forensic chain tests ---------------------------
+//
+// The KEY WIN over the prior in-memory log: the record hash binds the causality
+// edges, so tampering an edge (caused_by / affects_assets / fabric_generation)
+// is DETECTED by `verify_causal_chain_integrity`. These tests mutate the chain
+// out-of-band via the `raw_conn` seam (what a tamperer with disk access does).
+#[cfg(test)]
+mod causal_chain_87_tests {
+    use super::*;
+    use rusqlite::params;
+    use ed25519_dalek::SigningKey;
+
+    fn signed_store() -> (VerifierStore, ed25519_dalek::VerifyingKey) {
+        let mut s = VerifierStore::new(":memory:").expect("store");
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let vk = sk.verifying_key();
+        s.set_signing_key(sk);
+        (s, vk)
+    }
+
+    /// Append three causal events signed by the store's key.
+    fn append3_causal(s: &mut VerifierStore) {
+        let sk = s.signing_key.clone();
+        let id1 = "entry-1".to_string();
+        s.append_causal_event("entry-1", "leader", "FAULT", "{}",
+            &[], &["follower".to_string()], 1, 100, sk.as_ref()).unwrap();
+        s.append_causal_event("entry-2", "follower", "DEGRADE", "{}",
+            &[id1.clone()], &[], 1, 200, sk.as_ref()).unwrap();
+        s.append_causal_event("entry-3", "follower", "STOP", "{}",
+            &[id1], &["leader".to_string()], 2, 300, sk.as_ref()).unwrap();
+    }
+
+    #[test]
+    fn clean_signed_causal_chain_verifies() {
+        let (mut s, vk) = signed_store();
+        append3_causal(&mut s);
+        let r = s.verify_causal_chain_integrity(Some(&vk)).unwrap();
+        assert!(r.chain_intact, "chain must be intact");
+        assert!(r.signature_valid, "all sigs must verify");
+        assert!(r.head_verified, "head must verify: {}", r.head_status);
+        assert_eq!(r.head_status, "OK");
+        assert_eq!(r.total_entries, 3);
+        assert_eq!(r.signed_entries, 3);
+    }
+
+    /// KEY WIN: tampering `caused_by` breaks the recomputed record hash.
+    #[test]
+    fn tampering_caused_by_edge_is_detected() {
+        let (mut s, vk) = signed_store();
+        append3_causal(&mut s);
+        // Precondition: clean.
+        assert!(s.verify_causal_chain_integrity(Some(&vk)).unwrap().chain_intact);
+        // Rewrite the caused_by edge of the middle row.
+        s.raw_conn().execute(
+            "UPDATE fabric_causal_log SET caused_by = ?1 WHERE entry_id = 'entry-2'",
+            params![r#"["forged-cause"]"#],
+        ).unwrap();
+        let r = s.verify_causal_chain_integrity(Some(&vk)).unwrap();
+        assert!(!r.chain_intact, "tampered caused_by edge MUST break chain_intact");
+    }
+
+    /// KEY WIN: tampering `affects_assets` breaks the recomputed record hash.
+    #[test]
+    fn tampering_affects_assets_edge_is_detected() {
+        let (mut s, vk) = signed_store();
+        append3_causal(&mut s);
+        assert!(s.verify_causal_chain_integrity(Some(&vk)).unwrap().chain_intact);
+        s.raw_conn().execute(
+            "UPDATE fabric_causal_log SET affects_assets = ?1 WHERE entry_id = 'entry-1'",
+            params![r#"["forged-asset"]"#],
+        ).unwrap();
+        let r = s.verify_causal_chain_integrity(Some(&vk)).unwrap();
+        assert!(!r.chain_intact, "tampered affects_assets edge MUST break chain_intact");
+    }
+
+    /// KEY WIN: tampering `fabric_generation` breaks the recomputed record hash.
+    #[test]
+    fn tampering_fabric_generation_edge_is_detected() {
+        let (mut s, vk) = signed_store();
+        append3_causal(&mut s);
+        assert!(s.verify_causal_chain_integrity(Some(&vk)).unwrap().chain_intact);
+        s.raw_conn().execute(
+            "UPDATE fabric_causal_log SET fabric_generation = 99 WHERE entry_id = 'entry-3'",
+            [],
+        ).unwrap();
+        let r = s.verify_causal_chain_integrity(Some(&vk)).unwrap();
+        assert!(!r.chain_intact, "tampered fabric_generation edge MUST break chain_intact");
+    }
+
+    /// TRUNCATION: delete the tail row; the surviving prefix is internally
+    /// consistent but the signed head still points past it → detected.
+    #[test]
+    fn truncation_of_causal_tail_is_detected() {
+        let (mut s, vk) = signed_store();
+        append3_causal(&mut s);
+        s.raw_conn().execute(
+            "DELETE FROM fabric_causal_log WHERE id = (SELECT MAX(id) FROM fabric_causal_log)",
+            [],
+        ).unwrap();
+        let r = s.verify_causal_chain_integrity(Some(&vk)).unwrap();
+        assert!(r.chain_intact, "surviving 2-row prefix is still hash-consistent");
+        assert!(!r.head_verified, "the signed head must detect the deleted tail");
+        assert_eq!(r.head_status, "TRUNCATION_DETECTED");
+    }
+
+    /// HEAD SIGNATURE TAMPER: a well-formed but wrong head signature fails closed.
+    #[test]
+    fn causal_head_signature_tamper_is_detected() {
+        let (mut s, vk) = signed_store();
+        append3_causal(&mut s);
+        let bogus = b64e.encode([0u8; 64]);
+        s.raw_conn().execute(
+            "UPDATE fabric_causal_anchor_head SET signature_b64 = ?1 WHERE id = 1",
+            params![bogus],
+        ).unwrap();
+        let r = s.verify_causal_chain_integrity(Some(&vk)).unwrap();
+        assert!(!r.head_verified);
+        assert_eq!(r.head_status, "HEAD_SIGNATURE_INVALID");
+    }
+
+    /// PERSISTENCE ROUND-TRIP: append on a temp-file DB, drop, reopen, reload.
+    #[test]
+    fn causal_entries_persist_across_reopen() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("kirra_causal_test_{}.sqlite", std::process::id()));
+        let path_str = path.to_str().unwrap().to_string();
+        // Clean any prior artifact.
+        let _ = std::fs::remove_file(&path);
+
+        let entry_id;
+        {
+            let mut s = VerifierStore::new(&path_str).expect("file store");
+            let e = s.append_causal_event("persist-1", "a", "EVT", "{}",
+                &[], &["x".to_string()], 3, 1000, None).unwrap();
+            entry_id = e.entry_id.clone();
+            s.append_causal_event("persist-2", "b", "EVT2", "{}",
+                &[entry_id.clone()], &[], 3, 2000, None).unwrap();
+        } // drop closes the connection
+
+        {
+            let s = VerifierStore::new(&path_str).expect("reopen file store");
+            let rows = s.load_causal_entries().unwrap();
+            assert_eq!(rows.len(), 2, "rows must survive reopen");
+            assert_eq!(rows[0].entry_id, "persist-1");
+            assert_eq!(rows[0].affects_assets, vec!["x".to_string()]);
+            assert_eq!(rows[1].caused_by, vec![entry_id]);
+            // Chain still verifies after reopen.
+            let r = s.verify_causal_chain_integrity(None).unwrap();
+            assert!(r.chain_intact && r.head_verified, "reopened chain must verify");
+        }
+
+        let _ = std::fs::remove_file(&path);
+        // WAL sidecar files.
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 }

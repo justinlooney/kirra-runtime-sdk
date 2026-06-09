@@ -76,7 +76,7 @@ fn test_safety_goal_sg_007_causal_log_records_propagation_event() {
     router.update_asset_posture("follower01", posture("follower01", FleetPosture::Nominal, 1));
     router.update_asset_posture("leader01", posture("leader01", FleetPosture::LockedOut, 2));
 
-    let log = FabricCausalLog::new(None);
+    let log = FabricCausalLog::new_in_memory(None);
     let fabric_generation = router.fabric_state().fabric_generation;
     let changes = router.propagate_and_record(&log, fabric_generation);
 
