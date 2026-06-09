@@ -588,6 +588,12 @@ async fn verify_audit_chain(
                 "signature_valid": r.signature_valid,
                 "first_signed_at_ms": r.first_signed_at_ms,
                 "public_key_b64": r.public_key_b64,
+                // #77 anchor-head high-water mark: detects tail truncation/deletion.
+                "head_verified": r.head_verified,
+                "head_status": r.head_status,
+                // Overall verdict folds in the head check so a truncated chain
+                // (rows internally consistent but tail deleted) reads as not-verified.
+                "verified": r.chain_intact && r.signature_valid && r.head_verified,
             })).into_response(),
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
                        Json(json!({ "error": "audit chain query failed" }))).into_response(),
@@ -1944,6 +1950,23 @@ async fn main() {
             },
             Err(_) => tracing::error!(
                 "audit: key-id backfill migration skipped — store lock poisoned at startup"
+            ),
+        }
+        // Anchor-head backfill (#77): a chain written by a pre-#77 binary has no
+        // signed head; sign one from the current tail so an upgraded store
+        // presents a head BEFORE serving /system/audit/verify (no false
+        // HEAD_ABSENT). Idempotent. Log-and-continue: a missing head is itself
+        // caught fail-closed at verify time (head_verified = false).
+        match svc_state.app.store.lock() {
+            Ok(mut store) => match store.ensure_audit_anchor_head(now_ms()) {
+                Ok(()) => tracing::info!("audit: anchor-head high-water mark ensured"),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "audit: anchor-head high-water mark FAILED at startup"
+                ),
+            },
+            Err(_) => tracing::error!(
+                "audit: anchor-head high-water mark skipped — store lock poisoned at startup"
             ),
         }
     } else {

@@ -17,6 +17,16 @@ pub struct AuditChainVerifyResult {
     pub first_invalid_signature_index: Option<u64>,
     pub first_signed_at_ms: Option<u64>,
     pub public_key_b64: Option<String>,
+    /// #77 anchor-HEAD high-water check. `true` when the signed head matches the
+    /// chain tail (or the chain is empty); `false` is fail-closed — the tail is
+    /// behind the head (truncation/deletion), the head signature is invalid
+    /// (tamper), or a non-empty chain has no head. Independent of `chain_intact`
+    /// (which catches in-place row edits); together they cover edit + truncation.
+    pub head_verified: bool,
+    /// Machine-readable reason for `head_verified` (e.g. `OK`, `EMPTY_CHAIN`,
+    /// `HEAD_ABSENT`, `TRUNCATION_DETECTED`, `HEAD_SIGNATURE_INVALID`,
+    /// `HEAD_TAIL_MISMATCH`, `HEAD_KEY_UNKNOWN`, `HEAD_UNSIGNED`, `OK_UNSIGNED`).
+    pub head_status: String,
 }
 
 #[derive(serde::Serialize)]
@@ -376,6 +386,23 @@ impl VerifierStore {
                 pubkey_b64     TEXT    NOT NULL,
                 signature_b64  TEXT    NOT NULL,   -- self-signature by this key ('' for forensic 'backfill')
                 created_at_ms  INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        // #77: signed anchor-HEAD high-water mark. A singleton (id = 1) row
+        // recording the highest committed chain position (sequence, record_hash),
+        // signed over `canonical_anchor_head_payload`. It is advanced in the SAME
+        // transaction as each audit append (see `append_audit_event_tx`), so it
+        // shares the chain's NORMAL durability exactly — never more durable (#74).
+        // Verification compares the chain tail to this head: tail behind the head
+        // ⇒ tail rows were truncated/deleted; bad head signature ⇒ tamper.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS audit_anchor_head (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                sequence        INTEGER NOT NULL,
+                record_hash_hex TEXT    NOT NULL,
+                signature_b64   TEXT,
+                key_id          TEXT
             )",
             [],
         )?;
@@ -1346,6 +1373,8 @@ impl VerifierStore {
         let mut first_signed_at_ms: Option<u64> = None;
         // Last-seen v2 sequence; v2 rows must monotonically increment by 1.
         let mut prev_v2_seq: Option<i64> = None;
+        // #77: the last row's sequence (chain tail), for the anchor-head check.
+        let mut last_sequence: Option<i64> = None;
 
         let mut rows = stmt.query([])?;
 
@@ -1407,6 +1436,7 @@ impl VerifierStore {
             }
             expected_previous_hash = record_hash_hex.clone();
             latest_hash = record_hash_hex.clone();
+            last_sequence = sequence_opt; // #77: track the chain tail's sequence
 
             // Signature verification — select the verifying key PER ROW by its
             // key_id from the keyring (#76). Old rows verify under their ORIGINAL
@@ -1457,6 +1487,82 @@ impl VerifierStore {
             b64e.encode(vk.as_bytes())
         });
 
+        // #77: anchor-HEAD high-water check — detects tail TRUNCATION/DELETION
+        // (which the per-row chain walk above cannot see: deleting the last rows
+        // leaves the surviving prefix internally consistent). Compare the signed
+        // head to the chain tail. Fail-closed (`head_verified = false`) on: head
+        // absent on a non-empty chain; tail behind the head (truncation); head
+        // signature invalid / unknown key (tamper). Kept SEPARATE from
+        // `chain_intact` so an unanchored legacy chain (rows present, no head)
+        // does not retroactively flip the row-walk verdict.
+        let (head_verified, head_status): (bool, String) = if total_entries == 0 {
+            // Empty chain → no head required.
+            (true, "EMPTY_CHAIN".to_string())
+        } else {
+            let head = self.conn.query_row(
+                "SELECT sequence, record_hash_hex, signature_b64, key_id \
+                 FROM audit_anchor_head WHERE id = 1",
+                [],
+                |r| Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                )),
+            );
+            match head {
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    // A properly-opened store backfills the head at startup
+                    // (`ensure_audit_anchor_head`); its absence on a non-empty
+                    // chain is fail-closed (deleted head or un-migrated store).
+                    (false, "HEAD_ABSENT".to_string())
+                }
+                Err(e) => return Err(e),
+                Ok((h_seq, h_hash, h_sig, h_key_id)) => {
+                    if Some(h_seq) != last_sequence || h_hash != latest_hash {
+                        // Position mismatch. Tail strictly behind the head is the
+                        // truncation/deletion case; anything else is a head/tail
+                        // divergence (forged rows past the head, reorder, etc.).
+                        let truncated = match last_sequence {
+                            Some(t) => t < h_seq,
+                            None => true,
+                        };
+                        let status = if truncated { "TRUNCATION_DETECTED" } else { "HEAD_TAIL_MISMATCH" };
+                        (false, status.to_string())
+                    } else if signing_enabled {
+                        // Signed chain ⇒ the head must carry a valid signature
+                        // under a known key (same #76 keyring as the rows).
+                        match h_sig {
+                            None => (false, "HEAD_UNSIGNED".to_string()),
+                            Some(sig) => {
+                                let signer_id = h_key_id
+                                    .or_else(|| genesis_id.clone())
+                                    .unwrap_or_default();
+                                match keyring.get(&signer_id) {
+                                    None => (false, "HEAD_KEY_UNKNOWN".to_string()),
+                                    Some(vk) => {
+                                        let payload = crate::audit_chain::canonical_anchor_head_payload(
+                                            h_seq.max(0) as u64,
+                                            &h_hash,
+                                        );
+                                        if audit_verify_sig(vk, &payload, &sig) {
+                                            (true, "OK".to_string())
+                                        } else {
+                                            (false, "HEAD_SIGNATURE_INVALID".to_string())
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Unsigned chain (no verifying key supplied): the head
+                        // position matches the tail; there is no signature to check.
+                        (true, "OK_UNSIGNED".to_string())
+                    }
+                }
+            }
+        };
+
         Ok(AuditChainVerifyResult {
             chain_intact,
             total_entries,
@@ -1468,6 +1574,8 @@ impl VerifierStore {
             first_invalid_signature_index,
             first_signed_at_ms,
             public_key_b64,
+            head_verified,
+            head_status,
         })
     }
 
@@ -2321,6 +2429,66 @@ impl VerifierStore {
             self.signing_key.as_ref(),
         )?;
         tx.commit()
+    }
+
+    /// #77 backfill: ensure the signed anchor-HEAD exists for an already-populated
+    /// chain — e.g. a chain written by a pre-#77 binary and opened after upgrade,
+    /// whose rows predate head maintenance. If the chain is non-empty and no head
+    /// row exists, sign the current tail's `(sequence, record_hash)` with the
+    /// loaded signing key and write the head. Idempotent: a no-op once the head
+    /// exists or while the chain is empty. Runs at startup AFTER the signing key
+    /// is admitted (same point as `ensure_hash_v2_migration_anchor`), so the
+    /// backfilled head is signed — and so a legitimately-upgraded store presents a
+    /// head BEFORE it serves `/system/audit/verify` (no false `HEAD_ABSENT`).
+    /// `_now_ms` is accepted only for call-site symmetry with the other `ensure_*`
+    /// migrations (the head payload binds sequence+hash, not a timestamp).
+    pub fn ensure_audit_anchor_head(&mut self, _now_ms: u64) -> rusqlite::Result<()> {
+        let head_exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit_anchor_head WHERE id = 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        if head_exists {
+            return Ok(());
+        }
+        // Current tail (highest id). Empty chain → nothing to anchor.
+        let tail = self.conn.query_row(
+            "SELECT record_hash_hex, sequence FROM audit_log_chain ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+        );
+        let (record_hash, seq_opt) = match tail {
+            Ok(t) => t,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()), // empty chain
+            Err(e) => return Err(e),
+        };
+        // Only anchor a v2 tail (sequence present); a v1-only tail predates the
+        // sequence/head model and is anchored once the hash-v2 migration appends.
+        let Some(seq) = seq_opt else { return Ok(()) };
+        let seq = seq.max(0) as u64;
+
+        let (signature_b64, key_id): (Option<String>, Option<String>) =
+            match self.signing_key.as_ref() {
+                Some(key) => {
+                    use ed25519_dalek::Signer;
+                    let payload = crate::audit_chain::canonical_anchor_head_payload(seq, &record_hash);
+                    let sig = b64e.encode(key.sign(payload.as_bytes()).to_bytes());
+                    let kid = crate::audit_chain::verifying_key_id(&key.verifying_key());
+                    (Some(sig), Some(kid))
+                }
+                None => (None, None),
+            };
+        self.conn.execute(
+            "INSERT INTO audit_anchor_head (id, sequence, record_hash_hex, signature_b64, key_id)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 sequence        = excluded.sequence,
+                 record_hash_hex = excluded.record_hash_hex,
+                 signature_b64   = excluded.signature_b64,
+                 key_id          = excluded.key_id",
+            params![seq as i64, record_hash, signature_b64, key_id],
+        )?;
+        Ok(())
     }
 
     /// TEST-ONLY: drop `audit_log_chain` so the next
@@ -3569,5 +3737,208 @@ mod epoch_fence_79_tests {
             a.verifying_key(),
             "fenced rotation must NOT swap the in-memory signing key"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #77 — signed anchor-HEAD high-water mark: tail-truncation / deletion + head
+// tamper detection, and the #74 power-loss interaction.
+//
+// The per-row chain walk cannot see a TRUNCATED tail: deleting the last k rows
+// leaves the surviving prefix internally hash-consistent. The signed head closes
+// that gap by recording the highest committed (sequence, record_hash). These
+// tests mutate the chain/head out-of-band via the `raw_conn` seam (the same
+// thing a tamperer with disk access would do).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod audit_anchor_head_77_tests {
+    use super::*;
+    use rusqlite::params;
+    use ed25519_dalek::SigningKey;
+    use base64::{engine::general_purpose::STANDARD as b64e, Engine as _};
+
+    fn signed_store() -> (VerifierStore, ed25519_dalek::VerifyingKey) {
+        let mut s = VerifierStore::new(":memory:").expect("store");
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let vk = sk.verifying_key();
+        s.set_signing_key(sk);
+        (s, vk)
+    }
+
+    fn append3(s: &mut VerifierStore) {
+        s.save_posture_event_chained("n", "E1", "{}", None, 100).unwrap();
+        s.save_posture_event_chained("n", "E2", "{}", None, 200).unwrap();
+        s.save_posture_event_chained("n", "E3", "{}", None, 300).unwrap();
+    }
+
+    fn read_head(s: &mut VerifierStore) -> (i64, String, Option<String>, Option<String>) {
+        s.raw_conn()
+            .query_row(
+                "SELECT sequence, record_hash_hex, signature_b64, key_id \
+                 FROM audit_anchor_head WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    /// LEGITIMATE: a freshly-written signed chain verifies clean AND the head
+    /// matches the tail.
+    #[test]
+    fn clean_chain_head_verifies() {
+        let (mut s, vk) = signed_store();
+        append3(&mut s);
+        let r = s.verify_audit_chain_full(Some(&vk)).unwrap();
+        assert!(r.chain_intact && r.signature_valid, "control: chain itself is intact");
+        assert!(r.head_verified, "head must match the tail on a clean chain");
+        assert_eq!(r.head_status, "OK");
+        assert_eq!(r.total_entries, 3);
+    }
+
+    /// EMPTY chain → no head required, clean.
+    #[test]
+    fn empty_chain_needs_no_head() {
+        let (s, vk) = signed_store();
+        let r = s.verify_audit_chain_full(Some(&vk)).unwrap();
+        assert_eq!(r.total_entries, 0);
+        assert!(r.head_verified);
+        assert_eq!(r.head_status, "EMPTY_CHAIN");
+    }
+
+    /// TAIL TRUNCATION: delete the last row out-of-band, leaving the head
+    /// pointing past the surviving tail → DETECTED. The surviving prefix is still
+    /// internally consistent (`chain_intact == true`), which is exactly the gap
+    /// the head closes.
+    #[test]
+    fn tail_truncation_is_detected() {
+        let (mut s, vk) = signed_store();
+        append3(&mut s);
+        // Delete the last row (E3, sequence 2) but NOT the head (still seq 2).
+        s.raw_conn()
+            .execute(
+                "DELETE FROM audit_log_chain \
+                 WHERE id = (SELECT MAX(id) FROM audit_log_chain)",
+                [],
+            )
+            .unwrap();
+
+        let r = s.verify_audit_chain_full(Some(&vk)).unwrap();
+        assert!(
+            r.chain_intact,
+            "the surviving 2-row prefix is still hash-consistent — the walk alone cannot see the truncation"
+        );
+        assert!(!r.head_verified, "the head high-water mark must detect the deleted tail");
+        assert_eq!(r.head_status, "TRUNCATION_DETECTED");
+        assert_eq!(r.total_entries, 2, "only the prefix survived");
+    }
+
+    /// Deleting MORE than one tail row is still caught.
+    #[test]
+    fn multi_row_truncation_is_detected() {
+        let (mut s, vk) = signed_store();
+        append3(&mut s);
+        s.raw_conn()
+            .execute(
+                "DELETE FROM audit_log_chain WHERE id IN \
+                 (SELECT id FROM audit_log_chain ORDER BY id DESC LIMIT 2)",
+                [],
+            )
+            .unwrap();
+        let r = s.verify_audit_chain_full(Some(&vk)).unwrap();
+        assert!(!r.head_verified);
+        assert_eq!(r.head_status, "TRUNCATION_DETECTED");
+        assert_eq!(r.total_entries, 1);
+    }
+
+    /// HEAD TAMPER: corrupt the head signature → verify fails closed.
+    #[test]
+    fn head_signature_tamper_is_detected() {
+        let (mut s, vk) = signed_store();
+        append3(&mut s);
+        // A well-formed but WRONG signature (64 zero bytes) — decodes, never verifies.
+        let bogus = b64e.encode([0u8; 64]);
+        s.raw_conn()
+            .execute(
+                "UPDATE audit_anchor_head SET signature_b64 = ?1 WHERE id = 1",
+                params![bogus],
+            )
+            .unwrap();
+        let r = s.verify_audit_chain_full(Some(&vk)).unwrap();
+        assert!(!r.head_verified, "a tampered head signature must fail closed");
+        assert_eq!(r.head_status, "HEAD_SIGNATURE_INVALID");
+    }
+
+    /// HEAD ABSENT on a non-empty chain → fail closed (deleted head / unmigrated).
+    #[test]
+    fn absent_head_on_nonempty_chain_fails_closed() {
+        let (mut s, vk) = signed_store();
+        append3(&mut s);
+        s.raw_conn().execute("DELETE FROM audit_anchor_head", []).unwrap();
+        let r = s.verify_audit_chain_full(Some(&vk)).unwrap();
+        assert!(!r.head_verified);
+        assert_eq!(r.head_status, "HEAD_ABSENT");
+    }
+
+    /// #74 POWER-LOSS interaction: the last commit (row + its head update) is lost
+    /// TOGETHER on an ungraceful cut. Simulate by dropping the last row AND
+    /// restoring the head to its prior (committed) value. Verify must PASS — head
+    /// stays consistent with the recovered tail → NO false truncation alarm.
+    #[test]
+    fn power_loss_of_last_commit_does_not_false_alarm() {
+        let (mut s, vk) = signed_store();
+        s.save_posture_event_chained("n", "E1", "{}", None, 100).unwrap();
+        s.save_posture_event_chained("n", "E2", "{}", None, 200).unwrap();
+        // Head as committed after E2 (the state the head reverts to on rollback).
+        let head_after_e2 = read_head(&mut s);
+        // E3 commits: row + head→E3 atomically.
+        s.save_posture_event_chained("n", "E3", "{}", None, 300).unwrap();
+
+        // Ungraceful power loss of E3's single commit: row AND head update vanish
+        // together (same NORMAL transaction). Recover to the post-E2 state.
+        {
+            let c = s.raw_conn();
+            c.execute(
+                "DELETE FROM audit_log_chain WHERE id = (SELECT MAX(id) FROM audit_log_chain)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE audit_anchor_head \
+                 SET sequence = ?1, record_hash_hex = ?2, signature_b64 = ?3, key_id = ?4 \
+                 WHERE id = 1",
+                params![head_after_e2.0, head_after_e2.1, head_after_e2.2, head_after_e2.3],
+            )
+            .unwrap();
+        }
+
+        let r = s.verify_audit_chain_full(Some(&vk)).unwrap();
+        assert!(r.chain_intact, "recovered 2-row prefix is intact");
+        assert!(
+            r.head_verified,
+            "head and tail lost the SAME commit together → consistent → NO false alarm (#74)"
+        );
+        assert_eq!(r.head_status, "OK");
+        assert_eq!(r.total_entries, 2);
+    }
+
+    /// BACKFILL: a chain that has rows but no head (a pre-#77 on-disk chain) gets
+    /// a signed head from `ensure_audit_anchor_head`, after which it verifies clean.
+    #[test]
+    fn ensure_audit_anchor_head_backfills_legacy_chain() {
+        let (mut s, vk) = signed_store();
+        append3(&mut s);
+        // Model a pre-#77 chain: rows present, head missing.
+        s.raw_conn().execute("DELETE FROM audit_anchor_head", []).unwrap();
+        assert!(!s.verify_audit_chain_full(Some(&vk)).unwrap().head_verified,
+            "precondition: no head → fail closed");
+
+        s.ensure_audit_anchor_head(999).unwrap();
+
+        let r = s.verify_audit_chain_full(Some(&vk)).unwrap();
+        assert!(r.head_verified, "backfilled signed head must verify");
+        assert_eq!(r.head_status, "OK");
+        // Idempotent: a second call is a no-op and stays clean.
+        s.ensure_audit_anchor_head(1000).unwrap();
+        assert!(s.verify_audit_chain_full(Some(&vk)).unwrap().head_verified);
     }
 }
