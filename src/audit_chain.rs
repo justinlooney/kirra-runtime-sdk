@@ -62,6 +62,15 @@ pub fn canonical_signing_payload_v2(
     )
 }
 
+/// Canonical signing payload for the audit anchor-HEAD high-water mark (#77).
+///
+/// Binds the highest committed chain position `(sequence, record_hash)`.
+/// Domain-separated (`kirra-audit-head:v1` prefix) so a head signature can never
+/// be replayed as a row signature — or vice versa — under the same key.
+pub fn canonical_anchor_head_payload(sequence: u64, record_hash: &str) -> String {
+    format!("kirra-audit-head:v1:{sequence}:{record_hash}")
+}
+
 pub struct AuditChainLinker;
 
 /// Content-addressed key id for an audit signing key: hex SHA-256 of the
@@ -238,6 +247,30 @@ impl AuditChainLinker {
             ],
         )?;
 
+        // #77: advance the signed anchor-HEAD high-water mark to this new tail,
+        // IN THE SAME TRANSACTION as the row above. This is the whole point: the
+        // head and the row it points to commit atomically on the same connection,
+        // so the head can never be more (or less) durable than the chain tail.
+        // #74 INTERACTION: the chain is synchronous=NORMAL and its last rows may
+        // be lost on an ungraceful power cut — but because the head update rides
+        // the SAME commit as each row, a lost tail row takes its head update with
+        // it, leaving head == the recovered tail. No false truncation alarm.
+        let head_sig: Option<String> = signing_key.map(|key| {
+            use ed25519_dalek::Signer;
+            let payload = canonical_anchor_head_payload(sequence, &record_hash);
+            b64e.encode(key.sign(payload.as_bytes()).to_bytes())
+        });
+        tx.execute(
+            "INSERT INTO audit_anchor_head (id, sequence, record_hash_hex, signature_b64, key_id)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 sequence        = excluded.sequence,
+                 record_hash_hex = excluded.record_hash_hex,
+                 signature_b64   = excluded.signature_b64,
+                 key_id          = excluded.key_id",
+            params![sequence as i64, record_hash, head_sig, key_id],
+        )?;
+
         Ok(())
     }
 }
@@ -261,6 +294,14 @@ mod audit_signing_tests {
                 signature_b64 TEXT,
                 hash_version INTEGER NOT NULL DEFAULT 1,
                 sequence INTEGER,
+                key_id TEXT
+            );
+            -- #77: append_audit_event_tx advances the anchor-head in the same tx.
+            CREATE TABLE IF NOT EXISTS audit_anchor_head (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                sequence INTEGER NOT NULL,
+                record_hash_hex TEXT NOT NULL,
+                signature_b64 TEXT,
                 key_id TEXT
             );"
         ).unwrap();
