@@ -2322,6 +2322,45 @@ impl VerifierStore {
         )?;
         tx.commit()
     }
+
+    /// TEST-ONLY: drop `audit_log_chain` so the next
+    /// `ensure_hash_v2_migration_anchor` (and any chained audit write) fails —
+    /// used to exercise the fail-closed promotion-abort path (#78). Never
+    /// compiled into production builds.
+    #[cfg(test)]
+    pub fn break_audit_chain_table_for_test(&self) {
+        self.conn
+            .execute("DROP TABLE IF EXISTS audit_log_chain", [])
+            .expect("test seam: drop audit_log_chain");
+    }
+
+    /// TEST-ONLY: seed one legacy `hash_version = 1` row so a subsequent
+    /// `ensure_hash_v2_migration_anchor` actually WRITES the `HASH_V2_MIGRATION`
+    /// marker (on a clean chain `v1_total == 0`, so the anchor is a no-op). Lets
+    /// a test prove the anchor was ensured during promotion (#78).
+    #[cfg(test)]
+    pub fn seed_legacy_v1_audit_row_for_test(&self) {
+        self.conn
+            .execute(
+                "INSERT INTO audit_log_chain \
+                 (event_type, event_json, previous_hash_hex, record_hash_hex, created_at_ms, hash_version) \
+                 VALUES ('LEGACY_V1', '{}', '', 'deadbeef', 1, 1)",
+                [],
+            )
+            .expect("test seam: seed legacy v1 audit row");
+    }
+
+    /// TEST-ONLY: count `audit_log_chain` rows of a given `event_type`.
+    #[cfg(test)]
+    pub fn count_audit_events_for_test(&self, event_type: &str) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log_chain WHERE event_type = ?1",
+                params![event_type],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
 }
 
 /// Regression suite for the audit-chain bypass fix.

@@ -55,6 +55,7 @@ use tokio::time::{interval, Duration};
 use crate::verifier::AppState;
 use crate::posture_cache::{SharedPostureCache, now_ms};
 use crate::posture_engine::recalculate_and_broadcast;
+use crate::posture_engine_v2::resolve_post_promotion_posture;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -416,6 +417,41 @@ async fn perform_promotion(
         }
     };
 
+    // Step 1b (#78): ensure the hash-v2 audit-chain migration anchor BEFORE this
+    // node writes any audit record as Active. The Step 4 promotion event is the
+    // first such write, so the anchor must be durable first.
+    //
+    // FAIL-CLOSED — ABORT (not just log) on failure: leave `mode_active` false,
+    // write no promotion record, stay PassiveStandby (same posture as a lost
+    // epoch claim). This differs deliberately from the STARTUP anchor path
+    // (kirra_verifier_service.rs), which logs-and-continues: startup runs the
+    // anchor BEFORE the listener binds and before any Active write, so a
+    // transient failure there is retried on the next boot with no Active writer
+    // in between. Here we are mid-promotion — the only alternative to aborting is
+    // becoming a NEW Active writer that appends to an UNANCHORED v2 chain, whose
+    // v1→v2 migration boundary was never durably anchored. That is strictly worse
+    // than staying PassiveStandby (another instance, or a later retry once the
+    // store is healthy, promotes instead). A newly-Active writer on an unanchored
+    // chain is the worse state, so we fail closed to standby.
+    match app.store.lock() {
+        Ok(mut store) => {
+            if let Err(e) = store.ensure_hash_v2_migration_anchor(ts) {
+                tracing::error!(
+                    error = %e, instance_id = %id, epoch = new_epoch, reason = %reason,
+                    "promotion ABORTED — cannot ensure hash-v2 audit anchor; staying PassiveStandby (fail-closed, mode_active stays false, no promotion record)"
+                );
+                return;
+            }
+        }
+        Err(_) => {
+            tracing::error!(
+                instance_id = %id, epoch = new_epoch, reason = %reason,
+                "promotion ABORTED — store lock poisoned ensuring hash-v2 audit anchor; staying PassiveStandby (fail-closed)"
+            );
+            return;
+        }
+    }
+
     // Step 2: Cache the won epoch in memory so the mutation gate can
     // compare it against the DB epoch on every write. If a later
     // promotion fences us, gate-level checks will detect held != db and
@@ -484,11 +520,29 @@ async fn perform_promotion(
     // to the cache and emit broadcasts instead of returning early.
     recalculate_and_broadcast(app, cache);
 
-    tracing::info!(
-        instance_id = %id,
-        epoch       = new_epoch,
-        "Promotion complete — posture cache populated, SSE broadcast active"
-    );
+    // Step 6 (#83): posture-freshness gate. A freshly-promoted Active node must
+    // hold a NON-stale posture before it serves commands. Reuse the single TTL
+    // authority (`resolve_post_promotion_posture` → `resolve_posture_with_reason`
+    // at POSTURE_CACHE_TTL_MS); do NOT duplicate the staleness logic. If the
+    // Step 5 recalc did not yield a fresh posture, the resolution is
+    // LockedOut(<reason>) and the node fails closed — the mutation gate
+    // independently blocks on the same stale cache, so no command is served
+    // against a stale posture. (Promotion is one-way: we do not revert the
+    // epoch claim here; the node simply does not serve until posture recovers.)
+    match resolve_post_promotion_posture(cache) {
+        (posture, None) => tracing::info!(
+            instance_id = %id,
+            epoch       = new_epoch,
+            posture     = ?posture,
+            "Promotion complete — posture cache fresh, serving (SSE broadcast active)"
+        ),
+        (_, Some(stale_reason)) => tracing::error!(
+            instance_id = %id,
+            epoch       = new_epoch,
+            reason      = %stale_reason,
+            "Promotion recalc did NOT yield a fresh posture — node FAIL-CLOSED (non-serving) until posture recovers; the mutation gate blocks commands on the stale cache"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -884,5 +938,131 @@ mod sg_009_promotion_act_tests {
             .verify_audit_chain_full(None).unwrap();
         assert!(audit.total_entries >= 1,
             "promotion must append a STANDBY_PROMOTED_TO_ACTIVE audit event");
+    }
+
+    /// Drives the real async promotion on a deterministic current-thread runtime.
+    fn run_promotion(app: &Arc<AppState>, cache: &SharedPostureCache, id: &str, reason: &str) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(perform_promotion(app, cache, id, reason));
+    }
+
+    // -----------------------------------------------------------------------
+    // #78 — hash-v2 audit anchor is ENSURED before any Active write, and its
+    // failure FAILS CLOSED (promotion aborts, no Active state written).
+    // -----------------------------------------------------------------------
+
+    /// Happy path: a store carrying legacy v1 audit rows has its
+    /// `HASH_V2_MIGRATION` anchor ensured DURING promotion (proof the anchor
+    /// step runs before the first Active audit write), and promotion completes.
+    #[test]
+    fn test_promotion_ensures_hash_v2_anchor_on_happy_path() {
+        let store = VerifierStore::new(":memory:").expect("store");
+        // A legacy v1 row makes the anchor write its marker (on a clean chain
+        // v1_total == 0, so the anchor is a no-op and writes nothing).
+        store.seed_legacy_v1_audit_row_for_test();
+        let app = Arc::new(AppState::new(store, VerifierOperationMode::PassiveStandby));
+        let cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(None));
+
+        assert_eq!(
+            app.store.lock().unwrap().count_audit_events_for_test("HASH_V2_MIGRATION"),
+            0,
+            "precondition: no anchor marker before promotion"
+        );
+
+        run_promotion(&app, &cache, "standby-anchor", "HEARTBEAT_TIMEOUT");
+
+        assert!(app.is_active(), "healthy promotion must complete (Active)");
+        assert_eq!(
+            app.store.lock().unwrap().count_audit_events_for_test("HASH_V2_MIGRATION"),
+            1,
+            "promotion must ensure the hash-v2 anchor before writing as Active"
+        );
+    }
+
+    /// Fail-closed: if the anchor cannot be ensured (audit table broken),
+    /// promotion ABORTS — `mode_active` stays false, the in-memory epoch is not
+    /// cached, no promotion record is written, and the posture cache stays
+    /// empty. Without the #78 gate the broken table would only fail the
+    /// (ignored) audit write and the node would still flip Active — so this also
+    /// proves the gate is wired into the promotion sequence.
+    #[test]
+    fn test_promotion_aborts_when_anchor_cannot_be_ensured() {
+        let store = VerifierStore::new(":memory:").expect("store");
+        store.break_audit_chain_table_for_test();
+        let app = Arc::new(AppState::new(store, VerifierOperationMode::PassiveStandby));
+        let cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(None));
+
+        run_promotion(&app, &cache, "standby-broken", "HEARTBEAT_TIMEOUT");
+
+        assert!(
+            !app.is_active(),
+            "anchor failure must ABORT promotion — mode_active stays false (fail-closed)"
+        );
+        assert_eq!(
+            app.held_epoch.load(Ordering::SeqCst),
+            0,
+            "abort must occur before the in-memory epoch is cached (Step 2 not reached)"
+        );
+        let record = app.store.lock().unwrap().load_engine_state(PROMOTION_RECORD_KEY).unwrap();
+        assert_eq!(record, None, "aborted promotion must NOT write a promotion record");
+        assert!(
+            cache.read().unwrap().is_none(),
+            "aborted promotion must NOT recalculate / populate the cache"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #83 — post-promotion posture-freshness gate.
+    // -----------------------------------------------------------------------
+
+    /// Serves on a FRESH posture: after a healthy promotion the Step 5 recalc
+    /// populates the cache, so the freshness gate resolves to a real posture
+    /// with no stale reason (the node serves normally).
+    #[test]
+    fn test_post_promotion_freshness_gate_serves_on_fresh_cache() {
+        use crate::posture_engine_v2::LockoutReason;
+        let store = VerifierStore::new(":memory:").expect("store");
+        let app = Arc::new(AppState::new(store, VerifierOperationMode::PassiveStandby));
+        let cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(None));
+
+        run_promotion(&app, &cache, "standby-fresh", "HEARTBEAT_TIMEOUT");
+
+        let (_posture, reason) = resolve_post_promotion_posture(&cache);
+        assert_eq!(
+            reason, None,
+            "a freshly-promoted node's recalc must leave a non-stale posture (serving)"
+        );
+        assert_ne!(reason, Some(LockoutReason::PostureCacheStale));
+    }
+
+    /// FAILS CLOSED on a stale posture: an entry older than
+    /// `POSTURE_CACHE_TTL_MS` resolves to `LockedOut(PostureCacheStale)` — the
+    /// node is non-serving until posture recovers. Reuses the single TTL
+    /// authority (`resolve_posture_with_reason`); no TTL logic is duplicated.
+    #[test]
+    fn test_post_promotion_freshness_gate_locks_out_on_stale_cache() {
+        use crate::posture_cache::{CachedFleetPosture, POSTURE_CACHE_TTL_MS};
+        use crate::posture_engine_v2::LockoutReason;
+        use crate::verifier::FleetPosture;
+
+        let stale_ts = now_ms().saturating_sub(POSTURE_CACHE_TTL_MS + 1);
+        let stale = CachedFleetPosture {
+            posture: FleetPosture::Nominal,
+            generated_at_ms: stale_ts,
+            ttl_ms: POSTURE_CACHE_TTL_MS,
+            generation: 1,
+        };
+        let cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(Some(stale)));
+
+        let (posture, reason) = resolve_post_promotion_posture(&cache);
+        assert_eq!(
+            posture,
+            FleetPosture::LockedOut,
+            "a stale posture after promotion must fail closed to LockedOut (non-serving)"
+        );
+        assert_eq!(reason, Some(LockoutReason::PostureCacheStale));
     }
 }
