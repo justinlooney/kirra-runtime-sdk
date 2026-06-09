@@ -1,5 +1,8 @@
 // src/adapters/canopen.rs
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 use crate::gateway::policy::OperationalCommand;
 
@@ -79,6 +82,131 @@ impl CanOpenAdapter {
             emergency_code,
             triggers_recalculation,
         }
+    }
+}
+
+/// Env var carrying the CANopen-node-id → fleet-node-id map (#84).
+/// Format: comma-separated `canid:fleet_node_id` pairs, e.g.
+/// `5:robot-01,6:robot-02`. The map is CONFIG-sourced — there is no
+/// hardcoded table; an unset/empty var yields an empty map (every offline
+/// is then unattributed, handled fail-closed by the caller).
+pub const CANOPEN_NODE_MAP_ENV: &str = "KIRRA_CANOPEN_NODE_MAP";
+
+/// CANopen bus-address (`u8` node-id) → fleet-node-id (`String`) resolver.
+///
+/// The fleet-node-id is the key into the verifier's node registry
+/// (`AppState::nodes`) and DAG — resolving it is what lets an NMT-offline
+/// event mark the CORRECT asset so the posture recalc is effectful.
+#[derive(Debug, Clone, Default)]
+pub struct CanOpenNodeMap {
+    map: HashMap<u8, String>,
+}
+
+impl CanOpenNodeMap {
+    /// Parse the `canid:fleet_node` comma-separated config spec. Malformed
+    /// or out-of-range entries are skipped with a warning (never panic);
+    /// a later duplicate canid overrides an earlier one.
+    pub fn from_spec(spec: &str) -> Self {
+        let mut map = HashMap::new();
+        for raw in spec.split(',') {
+            let entry = raw.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let Some((id_str, node)) = entry.split_once(':') else {
+                tracing::warn!(entry, "CANopen node-map: skipping malformed entry (expected `canid:fleet_node`)");
+                continue;
+            };
+            let node = node.trim();
+            match id_str.trim().parse::<u8>() {
+                Ok(id) if !node.is_empty() => {
+                    map.insert(id, node.to_string());
+                }
+                _ => {
+                    tracing::warn!(entry, "CANopen node-map: skipping entry with invalid node-id (0-255) or empty fleet-node");
+                }
+            }
+        }
+        Self { map }
+    }
+
+    /// Resolve a CANopen node-id to its fleet-node-id, if mapped.
+    pub fn resolve(&self, node_id: u8) -> Option<&str> {
+        self.map.get(&node_id).map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+/// Process-wide CANopen node map, initialized once at startup from the
+/// environment. Kept out of `ServiceState`/`AppState` so this adapter-layer
+/// fix needs no change to their (many) construction sites.
+static GLOBAL_NODE_MAP: OnceLock<CanOpenNodeMap> = OnceLock::new();
+
+/// Initialize the global CANopen node map from `KIRRA_CANOPEN_NODE_MAP`.
+/// Idempotent — a second call is a no-op. Call once during startup.
+pub fn init_node_map_from_env() {
+    let spec = std::env::var(CANOPEN_NODE_MAP_ENV).unwrap_or_default();
+    let map = CanOpenNodeMap::from_spec(&spec);
+    let count = map.len();
+    if GLOBAL_NODE_MAP.set(map).is_ok() {
+        tracing::info!(entries = count, "CANopen node map initialized from env");
+    }
+}
+
+/// Resolve a CANopen node-id against the global map. Returns `None` when the
+/// map is uninitialized or has no entry for the id (fail-closed: the caller
+/// treats `None` as an unattributed offline, never a silent no-op).
+pub fn global_resolve(node_id: u8) -> Option<String> {
+    GLOBAL_NODE_MAP
+        .get()
+        .and_then(|m| m.resolve(node_id))
+        .map(str::to_string)
+}
+
+/// Why an NMT-offline could not be attributed to a fleet node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnattributedReason {
+    /// No CANopen→fleet mapping exists for this bus node-id.
+    NoMapping,
+    /// The mapping exists but names a node not in the verifier registry.
+    NodeNotRegistered,
+}
+
+/// Disposition of an NMT node-offline event after fleet-node resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NmtOfflineOutcome {
+    /// Resolved to a registered fleet node — mark it offline (effectful recalc).
+    Attributed { fleet_node_id: String },
+    /// Could not be attributed — handle fail-closed (surface, never drop).
+    Unattributed { canopen_node_id: u8, reason: UnattributedReason },
+}
+
+/// Classify an NMT-offline event given the resolved fleet node (if any) and
+/// whether that node is registered in the verifier. Pure + total: a node-id
+/// that resolves to a registered node is `Attributed`; everything else is
+/// `Unattributed` with a reason — there is no silent-drop path.
+pub fn classify_nmt_offline(
+    canopen_node_id: u8,
+    resolved: Option<String>,
+    node_registered: bool,
+) -> NmtOfflineOutcome {
+    match resolved {
+        Some(fleet_node_id) if node_registered => NmtOfflineOutcome::Attributed { fleet_node_id },
+        Some(_) => NmtOfflineOutcome::Unattributed {
+            canopen_node_id,
+            reason: UnattributedReason::NodeNotRegistered,
+        },
+        None => NmtOfflineOutcome::Unattributed {
+            canopen_node_id,
+            reason: UnattributedReason::NoMapping,
+        },
     }
 }
 
@@ -196,5 +324,59 @@ mod tests {
         let m = CanOpenMessage { node_id: 127, function_code: 0xE, data: vec![], source_node: "n".to_string() };
         let e = CanOpenAdapter::evaluate(&m);
         assert_eq!(e.node_id, 127);
+    }
+
+    // --- #84: CANopen-node-id → fleet-node mapping + fail-closed classification ---
+
+    #[test]
+    fn test_node_map_parses_spec_and_resolves() {
+        let m = CanOpenNodeMap::from_spec("5:robot-01, 6 : robot-02 ,127:drone-09");
+        assert_eq!(m.len(), 3);
+        assert_eq!(m.resolve(5), Some("robot-01"));
+        assert_eq!(m.resolve(6), Some("robot-02"));
+        assert_eq!(m.resolve(127), Some("drone-09"));
+        assert_eq!(m.resolve(9), None, "unmapped id resolves to None");
+    }
+
+    #[test]
+    fn test_node_map_skips_malformed_entries_without_panicking() {
+        // missing colon, non-numeric id, out-of-range id, empty node, blanks
+        let m = CanOpenNodeMap::from_spec("garbage,xx:n,300:n,7:,, 8:robot-08 ,");
+        assert_eq!(m.resolve(8), Some("robot-08"));
+        assert_eq!(m.len(), 1, "only the one well-formed entry survives");
+    }
+
+    #[test]
+    fn test_empty_spec_is_empty_map() {
+        assert!(CanOpenNodeMap::from_spec("").is_empty());
+        assert!(CanOpenNodeMap::from_spec("   ").is_empty());
+    }
+
+    #[test]
+    fn test_classify_mapped_registered_is_attributed() {
+        let out = classify_nmt_offline(5, Some("robot-01".to_string()), true);
+        assert_eq!(out, NmtOfflineOutcome::Attributed { fleet_node_id: "robot-01".to_string() });
+    }
+
+    #[test]
+    fn test_classify_unmapped_is_unattributed_no_mapping() {
+        // FAIL-CLOSED: an unmapped offline is never dropped — it is classified
+        // Unattributed(NoMapping) for the caller to surface.
+        let out = classify_nmt_offline(99, None, false);
+        assert_eq!(
+            out,
+            NmtOfflineOutcome::Unattributed { canopen_node_id: 99, reason: UnattributedReason::NoMapping }
+        );
+    }
+
+    #[test]
+    fn test_classify_mapped_but_unregistered_is_unattributed() {
+        // A mapping that points at a node the verifier doesn't know is also
+        // fail-closed — we cannot attribute the offline to a real asset.
+        let out = classify_nmt_offline(5, Some("ghost".to_string()), false);
+        assert_eq!(
+            out,
+            NmtOfflineOutcome::Unattributed { canopen_node_id: 5, reason: UnattributedReason::NodeNotRegistered }
+        );
     }
 }
