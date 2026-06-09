@@ -86,6 +86,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Runtime-isolation guard (#146)
+        working-directory: parko
+        run: ci/check-runtime-isolation.sh
       - name: parko safety-critical tests
         # `parko/` is a separate workspace and the root `cargo test
         # --workspace` does NOT descend into it. Without this job the
@@ -96,20 +99,25 @@ jobs:
         # regression to e.g. the H1 angular cap would land on main with
         # CI green.
         #
-        # `--exclude parko-onnx --exclude parko-openvino` keeps this job
-        # runtime-free: BOTH backend crates dlopen a native inference runtime
-        # at OvBackend/OrtBackend::new (libopenvino_c.so / libonnxruntime.so)
-        # and panic without it, so their tests belong to the dedicated
-        # parko-onnx / parko-openvino jobs that install those runtimes. This
-        # job must gate purely on the runtime-free safety logic — without the
-        # parko-openvino exclude it ran the OpenVINO backend tests here and
-        # failed on "Unable to find the openvino_c library" (the crate was
-        # added in e4df0fa without updating this exclude). Future parko crates
-        # added to the sub-workspace are picked up automatically by
-        # `--workspace`; add an `--exclude` here only for runtime-dependent
-        # backends.
+        # This lane stays runtime-free by EXCLUDING every crate that dlopens a
+        # native inference runtime at backend `::new` (libopenvino_c.so /
+        # libonnxruntime.so) and panics without it — those tests belong to the
+        # dedicated parko-onnx / parko-openvino jobs that install the runtimes.
+        # The runtime-dependent backends are enumerated ONCE in
+        # `ci/runtime-dependent-crates.txt` (the single source of truth) and the
+        # `--exclude` flags below are derived from it. The preceding
+        # "Runtime-isolation guard" step (#146, `ci/check-runtime-isolation.sh`)
+        # FAILS this lane if a new ort/openvino/r2r-linked crate is added
+        # without being listed — closing the drift hole that previously let
+        # parko-openvino (added in e4df0fa) and parko-tensorrt run here
+        # runtime-free without an exclude. Future runtime-FREE parko crates are
+        # still picked up automatically by `--workspace`.
         working-directory: parko
-        run: cargo test --workspace --exclude parko-onnx --exclude parko-openvino
+        run: |
+          EXCLUDES=$(grep -vE '^[[:space:]]*(#|$)' ci/runtime-dependent-crates.txt \
+            | sed 's/^/--exclude /' | tr '\n' ' ')
+          echo "Excluding runtime-dependent backends: $EXCLUDES"
+          cargo test --workspace $EXCLUDES
 
   parko-onnx:
     name: Parko ONNX Backend Tests (ORT v1.23.2)
