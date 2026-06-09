@@ -29,31 +29,68 @@ pub fn map_industrial_event_to_claim(event: &IndustrialEvent) -> Result<ActionCl
         return Err("MISSING_ASSET_ID");
     }
 
-    let mapped_action_type = match (event.protocol.clone(), event.operation.as_str()) {
-        (IndustrialProtocol::Modbus, "write_register")
-        | (IndustrialProtocol::Modbus, "coil_write") => "cmd_vel",
-        (IndustrialProtocol::Modbus, "read_register") => "read_telemetry",
-        (IndustrialProtocol::OpcUa, "write_node")
-        | (IndustrialProtocol::OpcUa, "call_method") => "cmd_vel",
-        (IndustrialProtocol::OpcUa, "read_node") => "read_telemetry",
+    // Operations fall into three classes:
+    //   * `CmdVelSetpoint` — a register/node WRITE whose `value` IS the
+    //     faithfully-decodable commanded setpoint. We pass it through verbatim.
+    //   * `ReadTelemetry`  — a register/node READ.
+    //   * UNMAPPABLE       — a motion-implying operation with NO decodable
+    //     magnitude (a Modbus coil is a single boolean bit; an OPC-UA
+    //     `call_method` is a generic RPC). We REFUSE to translate it rather than
+    //     fabricate a magnitude — input-integrity fix (#85). Returning an error
+    //     here makes `evaluate_industrial_event` fail closed
+    //     (`ADAPTER_TRANSLATION_FAILURE`) in every posture, so the governor
+    //     never evaluates an invented velocity as if it were real.
+    enum Mapped {
+        CmdVelSetpoint,
+        ReadTelemetry,
+    }
+    let mapped = match (event.protocol.clone(), event.operation.as_str()) {
+        (IndustrialProtocol::Modbus, "write_register") => Mapped::CmdVelSetpoint,
+        (IndustrialProtocol::Modbus, "read_register") => Mapped::ReadTelemetry,
+        (IndustrialProtocol::OpcUa, "write_node") => Mapped::CmdVelSetpoint,
+        (IndustrialProtocol::OpcUa, "read_node") => Mapped::ReadTelemetry,
+        // Motion-implying, but no faithfully-decodable velocity magnitude.
+        (IndustrialProtocol::Modbus, "coil_write")
+        | (IndustrialProtocol::OpcUa, "call_method") => {
+            return Err("UNMAPPABLE_TO_KINEMATIC_CLAIM");
+        }
         _ => return Err("UNSUPPORTED_INDUSTRIAL_OPERATION"),
     };
 
-    let payload = serde_json::json!({
-        "linear_x": if mapped_action_type == "cmd_vel" && event.value != 0 { 0.25 } else { 0.0 },
-        "linear_y": 0.0,
-        "linear_z": 0.0,
-        "angular_x": 0.0,
-        "angular_y": 0.0,
-        "angular_z": if mapped_action_type == "cmd_vel" && event.value > 1 { 0.4 } else { 0.0 },
-        "industrial_context": {
-            "address": event.address,
-            "raw_value": event.value,
+    let (action_type, payload) = match mapped {
+        Mapped::ReadTelemetry => (
+            "read_telemetry",
+            serde_json::json!({
+                "industrial_context": { "address": event.address, "raw_value": event.value }
+            }),
+        ),
+        Mapped::CmdVelSetpoint => {
+            // FAITHFUL DECODE: the written register/node value IS the commanded
+            // linear setpoint — carry it through verbatim. No synthesized 0.25
+            // crawl, no invented scaling. The governor evaluates the REAL
+            // magnitude: a value beyond the envelope is denied, zero is a stop.
+            //
+            // `angular_z` is 0.0: the event carries a single scalar `value` with
+            // no faithful angular source (the prior `0.4` was fabricated). A
+            // turn-rate command would need a separate, decodable angular field.
+            let linear_x = event.value as f64;
+            (
+                "cmd_vel",
+                serde_json::json!({
+                    "linear_x": linear_x,
+                    "linear_y": 0.0,
+                    "linear_z": 0.0,
+                    "angular_x": 0.0,
+                    "angular_y": 0.0,
+                    "angular_z": 0.0,
+                    "industrial_context": { "address": event.address, "raw_value": event.value }
+                }),
+            )
         }
-    });
+    };
 
     Ok(ActionClaim {
-        action_type: mapped_action_type.to_string(),
+        action_type: action_type.to_string(),
         target_node: event.asset_id.clone(),
         risk_class: event.risk_class.clone(),
         payload,
@@ -233,6 +270,88 @@ pub fn command_allowed_for_posture_pub(
             },
             FleetPosture::LockedOut => (false, Some("FLEET_LOCKEDOUT_ABSOLUTE_DENIAL".to_string())),
         },
+    }
+}
+
+#[cfg(test)]
+mod no_fabricated_velocity_tests {
+    use super::*;
+
+    fn modbus_event(operation: &str, value: i64) -> IndustrialEvent {
+        IndustrialEvent {
+            protocol: IndustrialProtocol::Modbus,
+            asset_id: "asset-1".to_string(),
+            operation: operation.to_string(),
+            address: "40001".to_string(),
+            value,
+            risk_class: "kinetic_write".to_string(),
+        }
+    }
+
+    // A register write carries a faithfully-decodable setpoint: the claim must
+    // carry the REAL value, not the old fabricated 0.25 crawl / 0.4 turn.
+    #[test]
+    fn write_register_decodes_real_value_not_fabricated() {
+        let claim = map_industrial_event_to_claim(&modbus_event("write_register", 5))
+            .expect("a register write is decodable");
+        assert_eq!(claim.action_type, "cmd_vel");
+        assert_eq!(
+            claim.payload["linear_x"].as_f64().unwrap(),
+            5.0,
+            "the real commanded value passes through (not the fabricated 0.25)"
+        );
+        assert_eq!(
+            claim.payload["angular_z"].as_f64().unwrap(),
+            0.0,
+            "no fabricated angular component (was 0.4 for value > 1)"
+        );
+    }
+
+    #[test]
+    fn write_register_zero_is_a_real_stop() {
+        let claim = map_industrial_event_to_claim(&modbus_event("write_register", 0)).unwrap();
+        assert_eq!(claim.payload["linear_x"].as_f64().unwrap(), 0.0);
+    }
+
+    // The REAL magnitude is governed: 5 m/s exceeds the 0.5 envelope → denied.
+    // Previously this was masked to a fabricated 0.25 and wrongly ALLOWED.
+    #[test]
+    fn real_magnitude_is_governed_not_masked() {
+        let decision = evaluate_industrial_event(modbus_event("write_register", 5), FleetPosture::Nominal);
+        assert!(!decision.allowed, "a real 5 m/s setpoint breaches the envelope");
+        assert_eq!(decision.reason, "KINEMATIC_ENVELOPE_BREACH");
+    }
+
+    // A boolean coil carries no velocity magnitude → refuse to translate;
+    // never synthesize 0.25/0.4. Fails closed in every posture.
+    #[test]
+    fn coil_write_is_unmappable_and_fails_closed() {
+        assert_eq!(
+            map_industrial_event_to_claim(&modbus_event("coil_write", 1)).unwrap_err(),
+            "UNMAPPABLE_TO_KINEMATIC_CLAIM",
+        );
+        let decision = evaluate_industrial_event(modbus_event("coil_write", 1), FleetPosture::Nominal);
+        assert!(!decision.allowed, "an unmappable motion command must NOT be admitted");
+        assert!(decision.reason.starts_with("ADAPTER_TRANSLATION_FAILURE"));
+        assert!(decision.reason.contains("UNMAPPABLE_TO_KINEMATIC_CLAIM"));
+    }
+
+    // A generic OPC-UA method call has no velocity semantics → unmappable.
+    #[test]
+    fn call_method_is_unmappable_and_fails_closed() {
+        let event = IndustrialEvent {
+            protocol: IndustrialProtocol::OpcUa,
+            asset_id: "asset-1".to_string(),
+            operation: "call_method".to_string(),
+            address: "ns=2;s=Motor".to_string(),
+            value: 1,
+            risk_class: "kinetic_write".to_string(),
+        };
+        assert_eq!(
+            map_industrial_event_to_claim(&event).unwrap_err(),
+            "UNMAPPABLE_TO_KINEMATIC_CLAIM",
+        );
+        assert!(!evaluate_industrial_event(event, FleetPosture::Nominal).allowed);
     }
 }
 
