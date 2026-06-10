@@ -43,10 +43,17 @@ corresponding claim.
 - **Perception input contract (#126):** the world model must deliver the required
   data, per-source health/freshness, and coverage — including, for SG2, the
   planned trajectory + the drivable-space corridor (from perception/map, not the
-  planner). *Status: being specified.*
+  planner). *Status: filed in the AoU register —* `AOU-PERCEPTION-RANGE-001`
+  (≥ 130 m worst-case detection), `AOU-PERCEPTION-CLASS-001` (worst-case object
+  classes at ≥ R_reliable), `AOU-VEHICLE-FRICTION-001` (effective decel ≥ 3.0 m/s²);
+  see `ASSUMPTIONS_OF_USE.md`. Dispositions remain `AoU-GAP` / `OK-ANALYTICAL`.
 - **Actuation output contract (#127):** the actuator must safe-stop on loss of a
-  valid verdict within a bounded `T_safe-stop`. *Status: T_safe-stop to be
-  quantified.*
+  valid verdict within a bounded `T_safe-stop`, and complete safe-stop initiation
+  within `T_safe-stop = 499 ms` of the Governor's MRC verdict. *Status: filed as*
+  `AOU-ACTUATION-LATENCY-001`, with the ASIL-D-class power / comm-bus deployment
+  gates as `AOU-HW-POWER-001` (DR-1) and `AOU-HW-COMMBUS-001` (DR-2); see
+  `ASSUMPTIONS_OF_USE.md`. `T_safe-stop` quantified at **499 ms** (Governor-WCET
+  S3-PROVEN; actuator residual `AoU-GAP`).
 - **Compute / freedom-from-interference (D3):** the Governor runs on compute
   separate from the planner (separate SoC preferred; isolated partition minimum).
 - **Configuration constraints:** speed cap = f(validated detection range)
@@ -99,7 +106,13 @@ ADR-0001/0002.
   ranges, the speed-cap range assumption, and the quantitative metrics
   (SPFM/LFM/PMHF).
 - **Pending integrity evidence:** MC/DC, the FFI doc, Ferrocene adoption.
-- **AoU contracts to be fully written:** perception (#126), actuation (#127).
+- **AoU contracts written:** perception (#126) and actuation (#127) are filed in
+  the AoU register (`ASSUMPTIONS_OF_USE.md`): `AOU-PERCEPTION-RANGE-001`,
+  `AOU-PERCEPTION-CLASS-001`, `AOU-VEHICLE-FRICTION-001`,
+  `AOU-ACTUATION-LATENCY-001`, plus deployment gates `AOU-HW-POWER-001` (DR-1) and
+  `AOU-HW-COMMBUS-001` (DR-2). Dispositions remain honest (`AoU-GAP` /
+  `OK-ANALYTICAL` / `OK-PROVEN`) — the integrator obligations are recorded, not
+  discharged.
 
 ## 8. Integration guidance
 

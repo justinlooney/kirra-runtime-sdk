@@ -85,6 +85,11 @@ detection onset to actuation onset. It splits into three sub-components:
 
 ## 4. AoU gaps identified (rolled up from §2)
 
+> **Filed (2026-06-10):** these four clauses are now formal register entries in
+> `ASSUMPTIONS_OF_USE.md` — `AOU-PERCEPTION-RANGE-001`, `AOU-PERCEPTION-CLASS-001`,
+> `AOU-VEHICLE-FRICTION-001`, `AOU-ACTUATION-LATENCY-001` (#126/#127). Their
+> dispositions there are unchanged from this matrix.
+
 Four AoU clauses to file across two integrator-contract issues:
 
 ### To #126 (base Perception Input Contract)
