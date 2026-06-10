@@ -17,6 +17,8 @@ pub mod commands;
 pub mod control_loop;
 pub mod rss;
 pub mod runtime;
+// SG4 — WATER_UNTRAVERSABLE governor veto (depth-free, bounded-worst-case, #98).
+pub mod water;
 pub mod safety;
 pub mod scheduler;
 pub mod sensor;
@@ -54,6 +56,7 @@ pub use rss::{
     OcclusionScene, RssAgent, RssParams, RssState, MAX_RSS_AGENTS,
 };
 pub use safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
+pub use water::{water_untraversable_veto, TraversalEvidence, WaterScene, WaterVetoConfig};
 pub use scheduler::{DegradationThresholds, InferenceLoop};
 pub use sensor::{SensorFrame, SensorStream};
 pub use telemetry::{
