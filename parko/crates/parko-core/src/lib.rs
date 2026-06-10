@@ -14,6 +14,8 @@ pub mod backend;
 pub mod backends;
 pub mod clock;
 pub mod commands;
+// SG5 — map-anchored COMMIT_ZONE_BLOCKED veto foundation (#106).
+pub mod commit_zone;
 pub mod control_loop;
 // SG6 — post-collision impact latch (IMU/contact/vanished fusion, #102).
 pub mod impact;
@@ -57,6 +59,7 @@ pub use rss::{
     lateral_safe_distance, longitudinal_safe_distance, occlusion_limited_speed, AgentScene,
     OcclusionScene, RssAgent, RssParams, RssState, MAX_RSS_AGENTS,
 };
+pub use commit_zone::{commit_zone_blocked, CommitZoneCfg, CommitZoneMap, CommitZoneScene};
 pub use impact::{is_impact, ImpactCfg, ImpactEvidence, ImpactLatch};
 pub use safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 pub use water::{water_untraversable_veto, TraversalEvidence, WaterScene, WaterVetoConfig};
