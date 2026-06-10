@@ -105,7 +105,7 @@ const DIVERGENCE_LOCKOUT_MIN_DURATION_MS: u64 = 2_000;
 /// CERT-006 v3 added the four `*_ang` fields so the audit record captures
 /// angular-axis divergence (previously invisible to the comparator). The
 /// `*_lin` fields are the prior `*_vel` fields renamed for clarity.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DivergenceEvent {
     pub primary_lin: f64,
     pub shadow_lin: f64,
