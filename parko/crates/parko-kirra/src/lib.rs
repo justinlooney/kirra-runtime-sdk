@@ -40,9 +40,9 @@ use kirra_runtime_sdk::gateway::kinematics_contract::{
 use kirra_runtime_sdk::verifier::FleetPosture;
 
 use parko_core::commands::ControlCommand;
-use parko_core::rss::{lateral_safe_distance, longitudinal_safe_distance};
+use parko_core::rss::{lateral_safe_distance, longitudinal_safe_distance, occlusion_limited_speed};
 use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
-use parko_core::{AgentScene, RssParams, RssState, MAX_RSS_AGENTS};
+use parko_core::{AgentScene, OcclusionScene, RssParams, RssState, MAX_RSS_AGENTS};
 
 pub mod angular_bound;
 pub mod audit_sink;
@@ -220,6 +220,41 @@ pub fn compute_scene_rss(scene: &AgentScene, params: &RssParams) -> RssState {
         safe: all_safe,
         longitudinal_margin: min_long_margin,
         lateral_margin: min_lat_margin,
+    }
+}
+
+/// CHECKER-OVER-DOER occlusion speed cap — RSS rule iv (issue #122).
+///
+/// The trusted checker computes the maximum admissible ego speed from the
+/// sightline scene ITSELF, via the vetted parko-core primitive
+/// [`occlusion_limited_speed`] — it never trusts a caller-pushed verdict.
+///
+/// Fail-closed scene handling mirrors [`compute_scene_rss`]'s ABSENT-vs-KNOWN
+/// distinction on the occlusion axis:
+///   - `Absent` (no sightline assessment) → `0.0`: worst-case occlusion, the ego
+///     must stop. ABSENT is NOT `KnownClear`.
+///   - `KnownClear` (sightline verified clear) → `f64::INFINITY`: rule iv does
+///     not bind.
+///   - `Limited { d_sight_m, v_emerge_max_mps }` → `occlusion_limited_speed`,
+///     which itself fails closed to `0.0` on any invalid input.
+///
+/// The returned value is a MAX EGO SPEED (m/s); the governor treats a proposed
+/// speed above it as RSS-unsafe (override → MRC profile).
+pub fn compute_occlusion_cap(occlusion: &OcclusionScene, params: &RssParams) -> f64 {
+    match *occlusion {
+        OcclusionScene::Absent => 0.0,
+        OcclusionScene::KnownClear => f64::INFINITY,
+        OcclusionScene::Limited {
+            d_sight_m,
+            v_emerge_max_mps,
+        } => occlusion_limited_speed(
+            d_sight_m,
+            v_emerge_max_mps,
+            params.reaction_time,
+            params.accel_max,
+            params.brake_min,
+            params.brake_max,
+        ),
     }
 }
 
@@ -564,6 +599,49 @@ impl KirraGovernor {
     ) -> EnforcementAction {
         let computed = compute_scene_rss(scene, params);
         self.gate(proposed, previous, delta_time_s, posture, computed.safe)
+    }
+
+    /// AUTHORITATIVE pairwise RSS + occlusion path (issues #92 + #122).
+    ///
+    /// Extends [`evaluate_scene`] with RSS rule iv: alongside the pairwise agent
+    /// verdict, the governor computes the occlusion speed cap from the sightline
+    /// scene it sees ([`compute_occlusion_cap`]) and OVERRIDES the verdict to
+    /// unsafe when the proposed ego speed exceeds that cap. Checker-over-doer: a
+    /// caller-pushed `safe: true` that violates the occlusion bound is overridden
+    /// (→ MRC profile), never trusted.
+    ///
+    /// Fail-closed: an `Absent` occlusion scene caps at `0.0` (any motion is
+    /// unsafe) — DISTINCT from `KnownClear`, where rule iv does not bind. A
+    /// non-finite proposed speed fails the `<=` comparison (NaN) → unsafe.
+    ///
+    /// NOTE: producing the [`OcclusionScene`] from perception (sightline ranging
+    /// / occluded-region extraction) is OUT OF SCOPE here, exactly as the agent
+    /// set's perception ingestion is for `evaluate_scene` — the scene is a check
+    /// INPUT supplied by the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_scene_with_occlusion(
+        &self,
+        proposed: &ControlCommand,
+        previous: Option<&ControlCommand>,
+        delta_time_s: f64,
+        posture: SafetyPosture,
+        scene: &AgentScene,
+        occlusion: &OcclusionScene,
+        params: &RssParams,
+    ) -> EnforcementAction {
+        let pairwise_safe = compute_scene_rss(scene, params).safe;
+        let cap = compute_occlusion_cap(occlusion, params);
+        // The occlusion bound is on SPEED magnitude. `<=` is NaN-safe: a
+        // non-finite proposed speed makes it false → unsafe; an `Absent` cap of
+        // 0.0 makes any |v| > 0 unsafe; a `KnownClear` cap of +inf never binds.
+        let occlusion_ok = proposed.linear_velocity.abs() <= cap;
+        self.gate(
+            proposed,
+            previous,
+            delta_time_s,
+            posture,
+            pairwise_safe && occlusion_ok,
+        )
     }
 }
 
@@ -1197,10 +1275,12 @@ mod tests {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod scene_rss_tests {
-    use super::{compute_scene_rss, KirraGovernor};
+    use super::{compute_occlusion_cap, compute_scene_rss, KirraGovernor};
     use parko_core::commands::ControlCommand;
     use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
-    use parko_core::{AgentScene, RssAgent, RssParams, RssState, MAX_RSS_AGENTS};
+    use parko_core::{
+        AgentScene, OcclusionScene, RssAgent, RssParams, RssState, MAX_RSS_AGENTS,
+    };
 
     fn params() -> RssParams {
         RssParams {
@@ -1347,5 +1427,89 @@ mod scene_rss_tests {
         assert!(!matches!(computed_unsafe, EnforcementAction::Allow),
             "the governor's OWN pairwise computation must override the doer's safe:true \
              and apply the RSS-unsafe MRC profile, got {computed_unsafe:?}");
+    }
+
+    // --- RSS rule iv: occlusion speed bound (issue #122) ---
+
+    /// ABSENT occlusion data must fail closed — DISTINCT from KnownClear. Even a
+    /// clear agent scene and a pushed safe:true cannot make it Allow.
+    #[test]
+    fn occlusion_absent_is_fail_closed_unsafe() {
+        let mut gov = KirraGovernor::new();
+        gov.update_rss_state(RssState { safe: true, longitudinal_margin: f64::MAX, lateral_margin: f64::MAX });
+        let proposed = cmd(8.0);
+        let prev = cmd(8.0);
+        let action = gov.evaluate_scene_with_occlusion(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &OcclusionScene::Absent, &params());
+        assert!(!matches!(action, EnforcementAction::Allow),
+            "absent occlusion data must fail closed (not Allow), got {action:?}");
+    }
+
+    /// KNOWN-CLEAR sightline imposes no rule-iv bound: with a clear agent scene
+    /// the Nominal verdict is Allow (the absent-vs-known distinction matters).
+    #[test]
+    fn occlusion_known_clear_does_not_bind() {
+        let gov = KirraGovernor::new();
+        let proposed = cmd(8.0);
+        let prev = cmd(8.0);
+        let action = gov.evaluate_scene_with_occlusion(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &OcclusionScene::KnownClear, &params());
+        assert!(matches!(action, EnforcementAction::Allow),
+            "a verified-clear sightline must not bind rule iv, got {action:?}");
+    }
+
+    /// THE KEY TEST (rule-iv analogue of the pairwise checker-over-doer): a tight
+    /// sightline whose cap is below the proposed speed OVERRIDES a pushed
+    /// safe:true → MRC profile (not Allow).
+    #[test]
+    fn checker_over_doer_occlusion_overrides_pushed_safe_bool() {
+        let mut gov = KirraGovernor::new();
+        gov.update_rss_state(RssState { safe: true, longitudinal_margin: f64::MAX, lateral_margin: f64::MAX });
+        let proposed = cmd(8.0);
+        let prev = cmd(8.0);
+        let p = params();
+        // 5 m of sightline → cap well below 8 m/s (fixture self-check).
+        let tight = OcclusionScene::Limited { d_sight_m: 5.0, v_emerge_max_mps: 0.0 };
+        assert!(compute_occlusion_cap(&tight, &p) < 8.0,
+            "fixture: the occlusion cap must bind below the proposed 8 m/s");
+
+        let action = gov.evaluate_scene_with_occlusion(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &tight, &p);
+        assert!(!matches!(action, EnforcementAction::Allow),
+            "a proposed speed above the occlusion cap must override pushed safe:true → MRC, got {action:?}");
+    }
+
+    /// The override is CONDITIONAL, not blanket: a sightline long enough that the
+    /// cap exceeds the proposed speed does not bind → Allow.
+    #[test]
+    fn occlusion_generous_sightline_allows() {
+        let gov = KirraGovernor::new();
+        let proposed = cmd(8.0);
+        let prev = cmd(8.0);
+        let p = params();
+        let clear_enough = OcclusionScene::Limited { d_sight_m: 500.0, v_emerge_max_mps: 0.0 };
+        assert!(compute_occlusion_cap(&clear_enough, &p) > 8.0,
+            "fixture: a 500 m sightline cap must exceed 8 m/s");
+        let action = gov.evaluate_scene_with_occlusion(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &clear_enough, &p);
+        assert!(matches!(action, EnforcementAction::Allow),
+            "a sightline long enough must not bind rule iv, got {action:?}");
+    }
+
+    /// The bound is never larger than the no-occlusion (KnownClear) case — for
+    /// any limited sightline, the cap is <= the unbounded cap.
+    #[test]
+    fn occlusion_cap_never_exceeds_no_occlusion() {
+        let p = params();
+        let no_occ = compute_occlusion_cap(&OcclusionScene::KnownClear, &p);
+        for d in [5.0_f64, 20.0, 100.0, 1000.0] {
+            let lim = compute_occlusion_cap(
+                &OcclusionScene::Limited { d_sight_m: d, v_emerge_max_mps: 0.0 }, &p);
+            assert!(lim <= no_occ, "limited cap {lim} (d={d}) must be <= no-occlusion {no_occ}");
+        }
     }
 }
