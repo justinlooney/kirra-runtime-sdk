@@ -19,9 +19,11 @@ argument to be valid. Where an assumption is the integrator's responsibility, it
 a **safety-related application condition (SRAC)** the integrator must discharge for their
 specific deployment.
 
-This file is the **central register** of those assumptions. Until now AoUs were recorded
-inline where they arose (e.g. the SG2 lateral-margin G2 AoU #123 in
-`OCCY_SG2_MARGIN.md`, and the AoU-GAP dispositions in `OCCY_SPEED_CAP_VALIDATION.md`).
+This file is the **central register** of those assumptions. Many AoUs were first recorded
+inline where they arose (e.g. the AoU-GAP dispositions in
+`OCCY_SPEED_CAP_VALIDATION.md`); the SG2 lateral-margin G2 AoU #123, derived inline in
+`OCCY_SG2_MARGIN.md`, is now **filed here as `AOU-LOCALIZATION-001`** (its source analysis
+remains authoritative in that document).
 This register collects the **cross-cutting, deployment-precondition** assumptions in one
 place so each has a stable ID, an explicit verification method, and a recorded
 consequence-if-violated. Inline AoUs in their owning documents remain authoritative for
