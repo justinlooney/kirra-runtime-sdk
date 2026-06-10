@@ -134,9 +134,9 @@ Traceability flows in both directions:
 
 | TR ID | Technical Requirement | Implementation | Test(s) |
 |-------|-----------------------|----------------|---------|
-| TR-012 | The DNP3 protocol adapter and verifier service shall write an audit chain entry for every DNP3 message with `dest_address == DNP3_BROADCAST_ADDRESS` before applying any control output | `src/adapters/dnp3.rs`, `src/bin/kirra_verifier_service.rs:evaluate_dnp3_adapter` | `test_dnp3_broadcast_always_audited` ✗ |
-| TR-012a | If the audit chain write fails for a DNP3 broadcast command, the control output shall be blocked and an error shall be returned to the caller | `src/adapters/dnp3.rs` or `src/bin/kirra_verifier_service.rs` audit-before-action ordering | `test_dnp3_broadcast_blocked_on_audit_write_failure` ✗ |
-| TR-012b | Non-broadcast DNP3 commands (unicast) shall also be audited, but an audit write failure for a non-broadcast command shall not block the control output | `src/adapters/dnp3.rs` | `test_dnp3_unicast_audit_failure_non_fatal` ✗ |
+| TR-012 | The DNP3 protocol adapter and verifier service shall write an audit chain entry for every DNP3 message with `dest_address == DNP3_BROADCAST_ADDRESS` before returning the verdict (Kirra classifies; physical actuation ordering is an integrator AoU) | `src/bin/kirra_verifier_service.rs:evaluate_dnp3_adapter` (+ unified `evaluate_unified_industrial_request`) → `save_posture_event_chained` | `test_dnp3_broadcast_always_audited` ✓ |
+| TR-012a | If the audit chain write fails for a DNP3 broadcast command, the control output shall be blocked and an error shall be returned to the caller | `src/bin/kirra_verifier_service.rs:evaluate_dnp3_adapter` — audit-then-verdict; broadcast audit failure ⇒ `allowed:false` / `DNP3_BROADCAST_AUDIT_UNAVAILABLE` / 503 | `test_dnp3_broadcast_blocked_on_audit_write_failure` ✓ |
+| TR-012b | Non-broadcast DNP3 commands (unicast) shall also be audited, but an audit write failure for a non-broadcast command shall not block the control output | `src/bin/kirra_verifier_service.rs:evaluate_dnp3_adapter` — unicast control audited, audit failure non-fatal | `test_dnp3_unicast_audit_failure_non_fatal` ✓ |
 
 ---
 
