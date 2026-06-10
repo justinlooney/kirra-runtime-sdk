@@ -45,9 +45,13 @@ use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 use parko_core::{AgentScene, RssParams, RssState, MAX_RSS_AGENTS};
 
 pub mod angular_bound;
+pub mod audit_sink;
 pub mod comparator;
 pub mod diverse;
 pub use angular_bound::{AngularVelocityBound, PlatformParams, ROLLOVER_MIN_LINEAR_VELOCITY_MPS};
+pub use audit_sink::{
+    select_divergence_sink, AuditChainLinkerDivergenceSink, FatalAuditConfig,
+};
 pub use comparator::{GovernorComparator, RssAwareGovernor};
 pub use diverse::DiverseKirraGovernor;
 
