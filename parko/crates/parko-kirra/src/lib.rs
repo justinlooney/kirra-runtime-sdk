@@ -42,7 +42,10 @@ use kirra_runtime_sdk::verifier::FleetPosture;
 use parko_core::commands::ControlCommand;
 use parko_core::rss::{lateral_safe_distance, longitudinal_safe_distance, occlusion_limited_speed};
 use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
-use parko_core::{AgentScene, OcclusionScene, RssParams, RssState, MAX_RSS_AGENTS};
+use parko_core::{
+    water_untraversable_veto, AgentScene, OcclusionScene, RssParams, RssState, WaterScene,
+    WaterVetoConfig, MAX_RSS_AGENTS,
+};
 
 pub mod angular_bound;
 pub mod audit_sink;
@@ -641,6 +644,50 @@ impl KirraGovernor {
             delta_time_s,
             posture,
             pairwise_safe && occlusion_ok,
+        )
+    }
+
+    /// AUTHORITATIVE pairwise RSS + SG4 water path (issues #92 + #98).
+    ///
+    /// Extends [`evaluate_scene`] with the SG4 WATER_UNTRAVERSABLE veto: alongside
+    /// the pairwise agent verdict, the governor evaluates the water scene it sees
+    /// (`water_untraversable_veto`, checker-over-doer) and OVERRIDES the verdict
+    /// to unsafe when the water is the unbounded / fail-closed signature — forcing
+    /// the gate's MRC decel-to-stop profile (stop short of water), regardless of
+    /// the planner's `safe: true`.
+    ///
+    /// The governor vetoes only the clearly-dangerous unbounded signature; a
+    /// bounded-safe puddle is NOT vetoed (the planner drives it — no over-stop in
+    /// rain). `Unknown` water (no healthy detector update) fails closed to a veto,
+    /// DISTINCT from `Clear`.
+    ///
+    /// NOTE: producing the [`WaterScene`] from perception (water-surface anomaly
+    /// detection) is OUT OF SCOPE here — the scene is a check INPUT supplied by
+    /// the caller, exactly as the agent set and occlusion scene are. Depth is
+    /// never taken or computed (it is unrangeable).
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_scene_with_water(
+        &self,
+        proposed: &ControlCommand,
+        previous: Option<&ControlCommand>,
+        delta_time_s: f64,
+        posture: SafetyPosture,
+        scene: &AgentScene,
+        water: &WaterScene,
+        water_cfg: &WaterVetoConfig,
+        params: &RssParams,
+    ) -> EnforcementAction {
+        let pairwise_safe = compute_scene_rss(scene, params).safe;
+        // SG4: a WATER_UNTRAVERSABLE veto forces the verdict unsafe → the gate
+        // applies the MRC decel-to-stop profile (stop short of water). A
+        // bounded-safe puddle / Clear / EarnedTraversable does not veto.
+        let water_veto = water_untraversable_veto(water, water_cfg);
+        self.gate(
+            proposed,
+            previous,
+            delta_time_s,
+            posture,
+            pairwise_safe && !water_veto,
         )
     }
 }
@@ -1279,7 +1326,8 @@ mod scene_rss_tests {
     use parko_core::commands::ControlCommand;
     use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
     use parko_core::{
-        AgentScene, OcclusionScene, RssAgent, RssParams, RssState, MAX_RSS_AGENTS,
+        AgentScene, OcclusionScene, RssAgent, RssParams, RssState, TraversalEvidence, WaterScene,
+        WaterVetoConfig, MAX_RSS_AGENTS,
     };
 
     fn params() -> RssParams {
@@ -1511,5 +1559,103 @@ mod scene_rss_tests {
                 &OcclusionScene::Limited { d_sight_m: d, v_emerge_max_mps: 0.0 }, &p);
             assert!(lim <= no_occ, "limited cap {lim} (d={d}) must be <= no-occlusion {no_occ}");
         }
+    }
+
+    // --- SG4 water veto (issue #98) ---
+
+    /// A bounded-safe puddle the planner can drive (short, near visible dry exit,
+    /// geometry intact, no flow).
+    fn bounded_safe_puddle() -> WaterScene {
+        WaterScene::Detected {
+            extent_m: 2.0,
+            exit_distance_m: Some(4.0),
+            flow_detected: false,
+            geometry_confirmed: true,
+        }
+    }
+
+    /// An unbounded water signature (no visible dry exit) — the dangerous case.
+    fn unbounded_water() -> WaterScene {
+        WaterScene::Detected {
+            extent_m: 40.0,
+            exit_distance_m: None,
+            flow_detected: false,
+            geometry_confirmed: true,
+        }
+    }
+
+    /// THE KEY TEST: a pushed `safe: true` over unbounded water is OVERRIDDEN to
+    /// the MRC profile (not Allow) — the governor vetoes the planner's verdict.
+    #[test]
+    fn checker_over_doer_water_overrides_pushed_safe_bool() {
+        let mut gov = KirraGovernor::new();
+        gov.update_rss_state(RssState { safe: true, longitudinal_margin: f64::MAX, lateral_margin: f64::MAX });
+        let proposed = cmd(8.0);
+        let prev = cmd(8.0);
+
+        let action = gov.evaluate_scene_with_water(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &unbounded_water(), &WaterVetoConfig::default(), &params());
+        assert!(!matches!(action, EnforcementAction::Allow),
+            "unbounded water must override the planner's safe:true → MRC, got {action:?}");
+    }
+
+    /// NO-OVER-STOP proof: a pushed `safe: true` over a bounded-safe puddle is NOT
+    /// overridden — the planner proceeds (the governor does not over-stop in rain).
+    #[test]
+    fn water_bounded_safe_puddle_does_not_override() {
+        let gov = KirraGovernor::new();
+        let proposed = cmd(8.0);
+        let prev = cmd(8.0);
+        let action = gov.evaluate_scene_with_water(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &bounded_safe_puddle(), &WaterVetoConfig::default(), &params());
+        assert!(matches!(action, EnforcementAction::Allow),
+            "a bounded-safe puddle must NOT be vetoed (planner drives it), got {action:?}");
+    }
+
+    /// The #98 named negative test — "no false-traverse without evidence":
+    /// Detected-unbounded water WITHOUT an EarnedTraversable grant must veto
+    /// (the untraversable default holds), while the SAME scene with an explicit
+    /// map/operator grant is allowed.
+    #[test]
+    fn no_false_traverse_without_evidence() {
+        let gov = KirraGovernor::new();
+        let proposed = cmd(8.0);
+        let prev = cmd(8.0);
+
+        // Unbounded water, no evidence → veto (not Allow).
+        let vetoed = gov.evaluate_scene_with_water(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &unbounded_water(), &WaterVetoConfig::default(), &params());
+        assert!(!matches!(vetoed, EnforcementAction::Allow),
+            "unbounded water without evidence must NOT traverse, got {vetoed:?}");
+
+        // Same situation, but an EXPLICIT earned-traversable grant → allowed.
+        let earned = WaterScene::EarnedTraversable { evidence: TraversalEvidence::OperatorAuthorized };
+        let allowed = gov.evaluate_scene_with_water(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &earned, &WaterVetoConfig::default(), &params());
+        assert!(matches!(allowed, EnforcementAction::Allow),
+            "an explicit map/operator grant earns traversal, got {allowed:?}");
+    }
+
+    /// Unknown water (no healthy detector update) fails closed to a veto — and is
+    /// DISTINCT from Clear (which does not veto).
+    #[test]
+    fn water_unknown_fail_closed_distinct_from_clear() {
+        let gov = KirraGovernor::new();
+        let proposed = cmd(8.0);
+        let prev = cmd(8.0);
+        let unknown = gov.evaluate_scene_with_water(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &WaterScene::Unknown, &WaterVetoConfig::default(), &params());
+        assert!(!matches!(unknown, EnforcementAction::Allow),
+            "Unknown water must fail closed (not Allow), got {unknown:?}");
+        let clear = gov.evaluate_scene_with_water(
+            &proposed, Some(&prev), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &WaterScene::Clear, &WaterVetoConfig::default(), &params());
+        assert!(matches!(clear, EnforcementAction::Allow),
+            "Clear water must not veto, got {clear:?}");
     }
 }
