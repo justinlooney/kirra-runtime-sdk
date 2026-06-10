@@ -48,8 +48,8 @@ use parko_core::commands::ControlCommand;
 use parko_core::rss::{lateral_safe_distance, longitudinal_safe_distance, occlusion_limited_speed};
 use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 use parko_core::{
-    water_untraversable_veto, AgentScene, ImpactLatch, OcclusionScene, RssParams, RssState,
-    WaterScene, WaterVetoConfig, MAX_RSS_AGENTS,
+    commit_zone_blocked, water_untraversable_veto, AgentScene, CommitZoneCfg, CommitZoneScene,
+    ImpactLatch, OcclusionScene, RssParams, RssState, WaterScene, WaterVetoConfig, MAX_RSS_AGENTS,
 };
 
 pub mod angular_bound;
@@ -698,6 +698,51 @@ impl KirraGovernor {
             delta_time_s,
             posture,
             pairwise_safe && !water_veto,
+        )
+    }
+
+    /// AUTHORITATIVE pairwise RSS + SG5 commit-zone path (issues #92 + #106).
+    ///
+    /// Extends [`evaluate_scene`] with the SG5 map-anchored COMMIT_ZONE_BLOCKED
+    /// veto: alongside the pairwise agent verdict, the governor evaluates the
+    /// commit-zone scene it sees (`commit_zone_blocked`, checker-over-doer) and
+    /// OVERRIDES the verdict to unsafe — forcing the gate's MRC decel-to-stop
+    /// (STOP SHORT of the zone) — when entry is blocked, regardless of the
+    /// planner's `safe: true`.
+    ///
+    /// "Reject fires from MAP ALONE": an `Unknown` (absent / unhealthy) map, or a
+    /// known zone with degraded inputs / missing clearance / unverified exit,
+    /// blocks at the integration layer without live perception of the hazard. A
+    /// `NoZone` or a healthy, clearance-confirmed, exit-verified zone passes
+    /// through (no over-block).
+    ///
+    /// NOTE: producing the [`CommitZoneScene`] from a map source is OUT OF SCOPE
+    /// here — the scene is a check INPUT supplied by the caller. The supplied
+    /// `clearance_confirmed` / `exit_verified` booleans are derived from
+    /// geometry/kinematics (#107) and agent arrival (#108) on top of this brick;
+    /// stop-inside-zone prevention is part of #107.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_scene_with_commit_zone(
+        &self,
+        proposed: &ControlCommand,
+        previous: Option<&ControlCommand>,
+        delta_time_s: f64,
+        posture: SafetyPosture,
+        scene: &AgentScene,
+        commit_zone: &CommitZoneScene,
+        cz_cfg: &CommitZoneCfg,
+        params: &RssParams,
+    ) -> EnforcementAction {
+        let pairwise_safe = compute_scene_rss(scene, params).safe;
+        // SG5: a COMMIT_ZONE_BLOCKED veto forces the verdict unsafe → the gate
+        // applies the MRC decel-to-stop profile (stop short of the zone).
+        let cz_veto = commit_zone_blocked(commit_zone, cz_cfg);
+        self.gate(
+            proposed,
+            previous,
+            delta_time_s,
+            posture,
+            pairwise_safe && !cz_veto,
         )
     }
 
@@ -1363,8 +1408,9 @@ mod scene_rss_tests {
     use parko_core::commands::ControlCommand;
     use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
     use parko_core::{
-        AgentScene, ImpactCfg, ImpactEvidence, ImpactLatch, OcclusionScene, RssAgent, RssParams,
-        RssState, TraversalEvidence, WaterScene, WaterVetoConfig, MAX_RSS_AGENTS,
+        AgentScene, CommitZoneCfg, CommitZoneMap, CommitZoneScene, ImpactCfg, ImpactEvidence,
+        ImpactLatch, OcclusionScene, RssAgent, RssParams, RssState, TraversalEvidence, WaterScene,
+        WaterVetoConfig, MAX_RSS_AGENTS,
     };
 
     fn params() -> RssParams {
@@ -1751,5 +1797,68 @@ mod scene_rss_tests {
             &cmd(8.0), Some(&cmd(8.0)), 0.05, SafetyPosture::Nominal, &l);
         assert!(matches!(resumed, EnforcementAction::Allow),
             "after explicit clearance, motion resumes, got {resumed:?}");
+    }
+
+    // --- SG5 commit-zone veto (issue #106) ---
+
+    fn healthy_zone_map(distance_m: f64) -> CommitZoneMap {
+        CommitZoneMap {
+            zone_ahead: true,
+            distance_to_zone_m: distance_m,
+            confidence: 0.95,
+            age_ms: 50,
+            min_confidence: 0.5,
+            max_age_ms: 1_000,
+        }
+    }
+
+    /// A blocked commit zone (within horizon, clearance not confirmed).
+    fn blocked_zone() -> CommitZoneScene {
+        CommitZoneScene::ZoneAhead {
+            map: healthy_zone_map(50.0),
+            clearance_confirmed: false,
+            exit_verified: true,
+        }
+    }
+
+    /// THE KEY TEST: a pushed `safe: true` into a blocked commit zone is
+    /// OVERRIDDEN to the MRC profile (not Allow) — stop short of the zone.
+    #[test]
+    fn checker_over_doer_commit_zone_overrides_pushed_safe_bool() {
+        let mut gov = KirraGovernor::new();
+        gov.update_rss_state(RssState { safe: true, longitudinal_margin: f64::MAX, lateral_margin: f64::MAX });
+        let action = gov.evaluate_scene_with_commit_zone(
+            &cmd(8.0), Some(&cmd(8.0)), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &blocked_zone(), &CommitZoneCfg::default(), &params());
+        assert!(!matches!(action, EnforcementAction::Allow),
+            "a blocked commit zone must override the planner's safe:true → MRC, got {action:?}");
+    }
+
+    /// A healthy, clearance-confirmed, exit-verified zone passes through (no
+    /// over-block — entry is permitted).
+    #[test]
+    fn commit_zone_confirmed_clear_passes_through() {
+        let gov = KirraGovernor::new();
+        let confirmed = CommitZoneScene::ZoneAhead {
+            map: healthy_zone_map(50.0), clearance_confirmed: true, exit_verified: true,
+        };
+        let action = gov.evaluate_scene_with_commit_zone(
+            &cmd(8.0), Some(&cmd(8.0)), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &confirmed, &CommitZoneCfg::default(), &params());
+        assert!(matches!(action, EnforcementAction::Allow),
+            "a confirmed-clear zone must permit entry, got {action:?}");
+    }
+
+    /// Reject-from-map-alone at the integration layer: an `Unknown` (absent /
+    /// unhealthy) map overrides a pushed safe:true, no live perception needed.
+    #[test]
+    fn commit_zone_unknown_map_overrides_pushed_safe() {
+        let mut gov = KirraGovernor::new();
+        gov.update_rss_state(RssState { safe: true, longitudinal_margin: f64::MAX, lateral_margin: f64::MAX });
+        let action = gov.evaluate_scene_with_commit_zone(
+            &cmd(8.0), Some(&cmd(8.0)), 0.05, SafetyPosture::Nominal,
+            &AgentScene::KnownEmpty, &CommitZoneScene::Unknown, &CommitZoneCfg::default(), &params());
+        assert!(!matches!(action, EnforcementAction::Allow),
+            "an absent/unhealthy map must override pushed safe:true (Reject from map alone), got {action:?}");
     }
 }
