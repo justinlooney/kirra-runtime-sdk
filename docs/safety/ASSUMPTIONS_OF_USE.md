@@ -41,6 +41,12 @@ the verification passes for the target deployment.
 | AOU-PERCEPTION-FRAME-001 | Upstream object velocity is absolute, map/world-frame | Integrator (perception) | **OPEN** | `KIRRA_PERCEPTION_DERATE_ENABLED` (PMON-003 D4 pre-enable gate) |
 | AOU-MSG-TOOLCHAIN-001 | ROS message toolchain codegens the full Autoware message set (no trimmed packages) | Integrator (build / toolchain) | **SUPERSEDED** (owner decision 2026-06-05, option C) | superseded by the curated-interface resolution — see below / KIRRA-OCCY-MSGSYNC-001; residual → AOU-MSG-TOOLCHAIN-002 |
 | AOU-MSG-TOOLCHAIN-002 | r2r codegen of the FULL Autoware message set on a host co-resident with full Autoware | Integrator (build / toolchain) | **OPEN** | any co-resident-with-full-Autoware deployment topology |
+| AOU-PERCEPTION-RANGE-001 | Reliable detection at ≥ 130 m worst-case over the deployment ODD (degraded-condition R per the derate table) | Integrator (perception) | **AoU-GAP** (base) → Item-B-measured (D1) | the 22.35 m/s ODD speed cap (ADR-0001 / SPEED-VAL-001 row 1) |
+| AOU-PERCEPTION-CLASS-001 | Reliable detection of the worst-case object classes (pedestrian / cyclist / child / low-contrast debris) at ≥ R_reliable | Integrator (perception) | **AoU-GAP** (base) → D1 IDC omission coverage | the speed cap (SPEED-VAL-001 row 4); the SG1/SG6 worst-case-object basis |
+| AOU-VEHICLE-FRICTION-001 | Effective deceleration ≥ 3.0 m/s² over the deployment ODD (else sub-ODD weather-derate) | Integrator (vehicle / road) | **OK-ANALYTICAL** (vehicle) + **AoU-GAP** (road friction) | the speed cap's SSD braking term (SPEED-VAL-001 row 3) |
+| AOU-ACTUATION-LATENCY-001 | Actuation completes safe-stop initiation ≤ 499 ms of the MRC verdict, and safe-stops on loss of a valid verdict | Integrator (actuation) | **OK-PROVEN** (Governor) + **AoU-GAP** (actuator residual) | the speed cap's t_react budget (SPEED-VAL-001 row 2); SS-003 MRC fallback |
+| AOU-HW-POWER-001 (DR-1) | Governor D3 compute on an ASIL-D-class redundant / supervised power supply | Integrator (hardware / platform) | **AoU-GAP** — pre-production HW gate | the ASIL-D PMHF target for the Governor element (KIRRA-OCCY-QUANT-001) |
+| AOU-HW-COMMBUS-001 (DR-2) | Governor comm path (Auto-Ethernet PHY+MAC) achieves LFM ≥ 90 % | Integrator (hardware / platform) | **AoU-GAP** — pre-production HW gate | the ASIL-D LFM target for the Governor element (KIRRA-OCCY-QUANT-001) |
 
 ---
 
@@ -277,3 +283,346 @@ built against a verified genuine interface.
 - KIRRA-OCCY-DEPLOY-001 — the deployment-topology commitment (isolation).
 - KIRRA-OCCY-PMON-004 §8 — where the r2r-on-Jazzy panic was first recorded; the r2r-version
   track.
+
+---
+
+# Perception Input Contract (#126) — SEooC assumptions of use
+
+The three clauses below formalize the base-tier **Perception Input Contract**
+(#126) into stable register entries. They were derived and dispositioned in the
+speed-cap validation matrix (`OCCY_SPEED_CAP_VALIDATION.md` §2–4); this register
+**files** them — it does not re-derive them. Each keeps its real disposition
+from that analysis (`AoU-GAP` / `OK-ANALYTICAL`); none is upgraded to closed.
+
+The contract is **bidirectional**: the kernel guarantees fail-closed behavior on
+*absent / stale / out-of-envelope* perception **if** the integrator guarantees
+the in-envelope detection performance these clauses name. The kernel-side half is
+already in code — `AgentScene::Absent → UNSAFE` ("no agents ≠ clear",
+`parko/crates/parko-kirra/src/lib.rs:160`), `OcclusionScene::Absent → stop`
+(#122, PR #251 in review), and the sensor-liveness watchdog (SG-003 / SG9,
+`telemetry_watchdog::spawn_telemetry_watchdog`, wired in
+`src/bin/kirra_verifier_service.rs`). What the kernel **cannot** self-verify is
+that perception, *when it does report*, actually detects the worst-case object at
+the range the speed cap assumes — that is the integrator obligation filed here.
+
+## AOU-PERCEPTION-RANGE-001 — Reliable detection range ≥ 130 m worst-case
+
+### Assumption
+> *Integrator perception shall deliver reliable detection at ≥ 130 m worst-case
+> over the deployment ODD; degraded-condition R characterized per the
+> SPEED_ENVELOPE.md §5–6 derate table.*
+
+### Why it is load-bearing
+The 22.35 m/s (50 mph) ODD speed cap (ADR-0001) is set by the safe-stopping-
+distance relation `SSD = R`: the cap is only valid if the worst-case detection
+range `R_reliable` actually holds. `R_reliable ≈ 130 m` is an integrator
+perception-pipeline property; KIRRA takes no base-tier measurement of it. If the
+real range is shorter, the cap is unconservative — the ego could be committed to
+a speed from which it cannot stop within the distance it can actually see.
+
+### Evidence
+- `SPEED_ENVELOPE.md` §2 (the `R_reliable ≈ 130 m` design basis and its
+  rain/fog/spray degradation note) — anchor `SPEED_ENVELOPE.md:35`.
+- `OCCY_SPEED_CAP_VALIDATION.md` §2 row 1 (disposition + clause derivation).
+
+### Scope
+- **In scope:** the forward look-ahead perception coverage feeding the speed-cap
+  envelope, over the full deployment ODD including degraded conditions.
+- **Owner:** Integrator (perception). Base-tier; the D1 add-on (#124, Item B)
+  supplies a KIRRA-measured per-sensor range and supersedes the gap at D1.
+
+### Verification status — **AoU-GAP** (base) → Item-B-measured (D1)
+No KIRRA base-tier measurement. Discharged for a deployment by the integrator's
+perception range characterization over the ODD (S8-style), or closed unilaterally
+at D1 by the IDC channel (Item B) whose `min(R_radar, R_thermal, R_optical)` is
+empirically characterized.
+
+### Consequence if violated
+The speed cap is unconservative: the ego may travel faster than it can stop
+within its true sightline → a forward-collision pathway (defeats the cap's SSD
+basis). The kernel cannot detect this from inside; it is exactly why the clause is
+an explicit pre-deployment integrator obligation.
+
+### Cross-references
+- `OCCY_SPEED_CAP_VALIDATION.md` §2 row 1, §4 clause 1 — the source analysis.
+- `ADR-0001` — the cap and its R assumption.
+- `UL4600_SAFETY_CASE.md` (G-UL-TOP) — an assumed external requirement the
+  "absence of unreasonable risk" claim rests on; a violation is a path to
+  unreasonable risk via the speed-cap basis.
+- Occy **SG1** (RSS / no forward collision) — the safety goal a range shortfall
+  defeats. Kernel complement: `AgentScene::Absent → UNSAFE` (`lib.rs:160`);
+  occlusion stop (#122); telemetry watchdog (SG-003 / SG9).
+- `#124` / Item B — the D1 closure.
+
+## AOU-PERCEPTION-CLASS-001 — Worst-case object-class detection at ≥ R_reliable
+
+### Assumption
+> *Integrator perception shall reliably detect ISO-26262-relevant worst-case
+> object classes (pedestrian, cyclist, child-pedestrian, low-contrast debris) at
+> ≥ R_reliable distance within the deployment ODD; FN rate per class
+> characterized per integrator's safety case.*
+
+### Why it is load-bearing
+Range alone is insufficient — the cap assumes the worst-case **object class** is
+detected at that range. A pipeline that achieves 130 m on a car but misses a
+child-pedestrian or low-contrast debris until much closer breaks the cap basis
+for the dominant safety case (the 130 m + pedestrian-class combination). Per-class
+false-negative rate is an integrator perception property KIRRA does not measure at
+base tier.
+
+### Evidence
+- `SPEED_ENVELOPE.md` §2 (worst-case object implicit in `R_reliable`) — anchor
+  `SPEED_ENVELOPE.md:35`.
+- `OCCY_SPEED_CAP_VALIDATION.md` §2 row 4, §4 clause 2.
+- `OCCY_DFA.md` §3 C5 — the common-cause **omission** the D1 IDC closes.
+
+### Scope
+- **In scope:** per-class detection (incl. FN-rate characterization) for the
+  ISO-26262 worst-case vulnerable classes, at ≥ R_reliable, over the ODD.
+- **Owner:** Integrator (perception). Base-tier; D1 IDC omission coverage
+  (thermal pedestrian-class, radar low-RCS) closes it at D1.
+
+### Verification status — **AoU-GAP** (base) → D1 IDC omission coverage
+No KIRRA base-tier measurement. Discharged by the integrator's per-class FN-rate
+characterization, or closed at D1 by the IDC channel's diverse omission coverage
+(`OCCY_DFA.md` §3 C5).
+
+### Consequence if violated
+A worst-case object (e.g. child-pedestrian) is detected too late for the
+cap-derived stopping distance → forward collision with a vulnerable road user.
+Both this and AOU-PERCEPTION-RANGE-001 must hold for the cap; neither is
+kernel-verifiable.
+
+### Cross-references
+- `OCCY_SPEED_CAP_VALIDATION.md` §2 row 4, §4 clause 2 — the source analysis.
+- `OCCY_DFA.md` §3 C5 — the omission common-cause and the D1 disposition.
+- `UL4600_SAFETY_CASE.md` (G-UL-TOP) — assumed external requirement.
+- Occy **SG1** (RSS) and **SG6** (post-collision / worst-case object) — the goals a
+  class-detection gap defeats. Kernel complement as above (Absent → UNSAFE;
+  occlusion stop; watchdog).
+- `#124` / Item B — the D1 closure.
+
+## AOU-VEHICLE-FRICTION-001 — Effective deceleration ≥ 3.0 m/s² over the ODD
+
+### Assumption
+> *Integrator vehicle / road combination shall maintain effective deceleration ≥
+> 3.0 m/s² over the deployment ODD; conditions below this threshold are excluded
+> from the ODD or trigger a sub-ODD weather-derate per ADR-0002.*
+
+### Why it is load-bearing
+The cap's stopping-distance term `v² / 2a` uses the comfortable-decel basis
+`a_comfortable = 3.0 m/s²`. The **vehicle** side is analytically covered — the
+kernel reference profile `VehicleKinematicsContract::max_brake_mps2 = 4.5 m/s²`
+(`src/gateway/kinematics_contract.rs:112`, via `VehicleConfig::default_urban`)
+exceeds 3.0 with ~50 % headroom, and the MRC fallback profile holds 3.0
+(`mrc_fallback_profile`, `:134`). The **road-friction** side is not: wet / icy /
+loose surfaces can reduce achievable deceleration below the basis. The kernel
+clamps *commanded* decel to the contract's capability; it cannot guarantee the
+tyre-road interface delivers it.
+
+### Evidence
+- `src/gateway/kinematics_contract.rs:112` (`max_brake_mps2: 4.5`,
+  `VehicleConfig::default_urban`) and `:134` (`mrc_fallback_profile` = 3.0) — the
+  vehicle-capability anchor.
+- `SPEED_ENVELOPE.md` §2 (`a_comfortable = 3.0 m/s²`, "achievable on wet roads").
+- `OCCY_SPEED_CAP_VALIDATION.md` §2 row 3, §4 clause 3.
+- `ADR-0002` — the condition-dependent sub-ODD weather-derate the road-friction
+  residual routes through.
+
+### Scope
+- **In scope:** the effective vehicle+road deceleration available over the ODD.
+  The **vehicle hardware** half is OK-ANALYTICAL (kernel profile); the **road
+  friction** half is the AoU-GAP.
+- **Owner:** Integrator (vehicle / road) — ODD definition + weather-derate
+  configuration.
+
+### Verification status — **OK-ANALYTICAL** (vehicle) + **AoU-GAP** (road friction)
+Vehicle capability is proven by the kernel reference profile. Road-friction
+degradation is discharged by the integrator either excluding sub-threshold
+conditions from the ODD or wiring an ADR-0002 weather-derate (which the runtime
+posture coupling, #99, can drive).
+
+### Consequence if violated
+The cap over-states stopping capability on a low-friction surface → the ego
+cannot stop within the cap-derived distance → forward collision. Mitigated only
+if the integrator excludes the condition from the ODD or derates for it.
+
+### Cross-references
+- `OCCY_SPEED_CAP_VALIDATION.md` §2 row 3, §4 clause 3 — the source analysis.
+- `ADR-0002` — the weather-derate composition; `#99` — runtime posture coupling.
+- `UL4600_SAFETY_CASE.md` (G-UL-TOP) — assumed external requirement.
+- Occy **SG1** (RSS braking term). Kernel complement: the kinematic-contract brake
+  clamp in `validate_vehicle_command` (bounds commanded decel to
+  `max_brake_mps2`).
+
+---
+
+# Actuation Output Contract (#127) — SEooC assumptions of use
+
+The actuation clause formalizes the #127 **Actuation Output Contract** into the
+register. The Governor authors a verdict; the integrator's actuation pipeline
+must *act* on it — both promptly (latency clause) and on loss of it (the
+fail-closed safe-stop the fault model already assumes,
+`OCCY_FAULT_MODEL.md` — "no Accept emitted → actuator safe-stops"). The kernel
+side is `SS-003` LockedOut MRC fallback (`SAFE_STATE_SPECIFICATION.md`): the
+Governor emits the MRC; the integrator must realize it.
+
+## AOU-ACTUATION-LATENCY-001 — Safe-stop initiation ≤ 499 ms; safe-stop on loss of verdict
+
+### Assumption
+> *Integrator actuation pipeline (control compute + bus latency + actuator
+> response) shall complete the safe-stop initiation within 499 ms of the
+> Governor's MRC verdict.*
+
+**Companion fail-closed sub-clause (loss of valid verdict).** The integrator's
+vehicle interface shall honour the Governor's MRC (`linear_velocity_mps = 0.0`,
+`accel_mps2 = −max_decel_mps2`) when published, **and safe-stop on loss of a
+valid verdict** within a bounded `T_safe-stop`. The fault model already
+classifies loss-of-verdict as "MRC immediately" (`OCCY_FAULT_MODEL.md`; #119) —
+this is the integrator's side of that contract.
+
+### Why it is load-bearing
+ADR-0001's reaction-time budget is `t_react = 0.5 s` total
+(`SPEED_ENVELOPE.md:29`). It splits into perception confirmation (integrator,
+#126), the **Governor verdict** (S3-PROVEN: p99.9 ≈ 170–352 ns, ≤ 219 µs jitter
+ceiling — 4–6 orders of magnitude of headroom, effectively 0 contribution), and
+the **actuation residual**. With the Governor contribution negligible, the
+residual budget is `≈ (0.5 s − Governor WCET) ≈ 499.78 ms → 499 ms`. If the
+actuation pipeline is slower, the t_react chain the cap rests on is violated. The
+fail-closed sub-clause is the deeper invariant: a Governor that emits MRC into an
+actuator that does not act is no protection at all (defeats SG9 at the actuator
+boundary).
+
+### Evidence
+- `SPEED_ENVELOPE.md` §2 (`t_react = 0.5 s` budget) — anchor `SPEED_ENVELOPE.md:29`.
+- `GOVERNOR_INTEGRITY_EVIDENCE.md` §5 — the S3 Governor-WCET proof (the
+  negligible-contribution basis).
+- `OCCY_SPEED_CAP_VALIDATION.md` §2 row 2, §3 (the t_react sub-component
+  breakdown), §4 clause 4.
+- `OCCY_FAULT_MODEL.md` — loss-of-verdict → MRC-immediately; the `T_safe-stop`
+  output-contract framing.
+- `SAFE_STATE_SPECIFICATION.md` **SS-003** — the LockedOut MRC fallback the
+  verdict keys off.
+
+### Scope
+- **In scope:** the actuation pipeline latency (control compute + bus + actuator
+  response) from the Governor's MRC verdict to safe-stop initiation, and the
+  fail-closed-on-loss-of-verdict behavior.
+- **Owner:** Integrator (actuation / vehicle interface).
+
+### Verification status — **OK-PROVEN** (Governor) + **AoU-GAP** (actuator residual)
+The Governor's contribution to t_react is S3-PROVEN. The 499 ms actuator residual
+and the loss-of-verdict safe-stop are integrator obligations, discharged by the
+integrator's actuation-pipeline latency characterization and a demonstrated
+safe-stop-on-loss-of-verdict (brake-by-wire timing test). Typical brake-by-wire
+initiates in tens to ~200 ms, so the budget is generous — the clause exists to
+make the contract explicit and surface the rare non-conforming pipeline.
+
+### Consequence if violated
+A slow pipeline blows the t_react budget → the cap is unconservative (forward
+collision pathway). An actuator that does **not** safe-stop on loss of verdict
+defeats the entire fail-closed architecture at its last boundary (the Governor's
+MRC never reaches the wheels). Either is safety-critical.
+
+### Cross-references
+- `OCCY_SPEED_CAP_VALIDATION.md` §2 row 2, §3, §4 clause 4 — the source analysis.
+- `GOVERNOR_INTEGRITY_EVIDENCE.md` §5 — the Governor-WCET proof; `#115` (S3).
+- `OCCY_FAULT_MODEL.md` (#119) — loss-of-verdict MRC; `SAFE_STATE_SPECIFICATION.md`
+  SS-003.
+- `UL4600_SAFETY_CASE.md` (G-UL-TOP) — assumed external requirement.
+- Occy **SG9** (fail-closed safe-stop) — the goal a non-acting actuator defeats;
+  Occy **SG1** (the t_react term of the cap).
+- Companion hardware-platform deployment requirements: **AOU-HW-POWER-001** (DR-1),
+  **AOU-HW-COMMBUS-001** (DR-2) — filed below (both posted to #127).
+
+---
+
+# Hardware-platform deployment requirements (#127 — DR-1, DR-2)
+
+DR-1 and DR-2 were posted to #127 as **pre-production hardware-deployment gates**
+derived from the quantitative HW-metrics analysis (`OCCY_QUANTITATIVE_METRICS.md`,
+KIRRA-OCCY-QUANT-001). They are recorded here verbatim. **Note (honest filing):**
+unlike the actuation-latency clause above, DR-1/DR-2 are **hardware platform**
+(PMHF / LFM) requirements on the Governor's compute element — they are *not*
+actuation-latency sub-clauses; they are filed as their own register entries and
+cross-linked from AOU-ACTUATION-LATENCY-001 because they share the #127 tracker.
+
+## AOU-HW-POWER-001 (DR-1) — ASIL-D-class power supply for the Governor compute
+
+### Assumption
+> *DR-1 — Power supply: the Governor's D3 compute must be powered by an
+> ASIL-D-class redundant or supervised supply (dual-PMIC with voted outputs, or
+> single PMIC with ≥ 99 % built-in self-test diagnostic coverage). Single-supply
+> configuration yields 10 FIT residual from the power sub-element alone, exceeding
+> the ASIL-D PMHF target of 10 FIT for the entire Governor element.*
+
+### Why it is load-bearing
+The Governor element carries an ASIL-D PMHF budget. The quantitative analysis
+shows a **single-supply PMHF = 17.7 FIT (FAIL)** vs **dual-supply = 8.7 FIT
+(PASS)** — the power sub-element alone can blow the whole-element target, so the
+fail-closed safety argument's random-hardware-failure budget is not met without a
+redundant/supervised supply.
+
+### Evidence
+- `OCCY_QUANTITATIVE_METRICS.md` (KIRRA-OCCY-QUANT-001) — SPFM/LFM/PMHF analysis;
+  single-supply 17.7 FIT FAIL / dual-supply 8.7 FIT PASS.
+
+### Scope
+- **In scope:** the power supply to the Governor's D3 compute element.
+- **Owner:** Integrator (hardware / platform). Pre-production deployment gate.
+
+### Verification status — **AoU-GAP** — pre-production hardware-deployment gate
+Discharged by the integrator selecting an ASIL-D-class redundant/supervised
+supply and recording the resulting PMHF in their hardware safety case.
+
+### Consequence if violated
+The Governor element's PMHF exceeds the ASIL-D target — a random power-element
+fault can disable the safety function without diagnosis, undermining the
+fail-closed claim's quantitative basis.
+
+### Cross-references
+- `OCCY_QUANTITATIVE_METRICS.md` (KIRRA-OCCY-QUANT-001) — the source.
+- `AOU-ACTUATION-LATENCY-001` — the #127 actuation contract it is tracked beside.
+- `UL4600_SAFETY_CASE.md` (G-UL-TOP) — assumed external requirement.
+- Occy **SG9** (fail-closed integrity) — the goal an under-budget power element
+  undermines.
+
+## AOU-HW-COMMBUS-001 (DR-2) — Comm-bus latent-fault metric ≥ 90 %
+
+### Assumption
+> *DR-2 — Comm bus LFM: the Governor's communication path (Automotive Ethernet
+> PHY+MAC) must achieve LFM ≥ 90 %, via either (a) a redundant ASIL-D TSN stack or
+> (b) a documented periodic self-test protocol executed at startup and every 24 h
+> of operation. Without this, the rolled LFM for the Governor element is ~89.5 %,
+> missing the ASIL-D target by 0.5 pp.*
+
+### Why it is load-bearing
+The ASIL-D Latent-Fault-Metric target is **≥ 90 %** per sub-element. The comm
+path's rolled LFM lands at **~89.5 %** without additional latent-fault detection —
+0.5 pp short — so a latent fault in the communication element could go undetected
+and accumulate toward a dual-point failure.
+
+### Evidence
+- `OCCY_QUANTITATIVE_METRICS.md` (KIRRA-OCCY-QUANT-001) — LFM ≥ 90 % per-sub-element
+  gate; comm-path ~89.5 % without mitigation.
+
+### Scope
+- **In scope:** the Governor's communication path (Automotive Ethernet PHY+MAC)
+  latent-fault detection.
+- **Owner:** Integrator (hardware / platform). Pre-production deployment gate.
+
+### Verification status — **AoU-GAP** — pre-production hardware-deployment gate
+Discharged by either a redundant ASIL-D TSN stack or a documented startup +
+24 h periodic self-test, with the resulting LFM recorded in the integrator's
+hardware safety case.
+
+### Consequence if violated
+The Governor element misses the ASIL-D LFM target — latent communication faults
+may accumulate undetected, eroding the dual-point-failure protection the ASIL-D
+argument assumes.
+
+### Cross-references
+- `OCCY_QUANTITATIVE_METRICS.md` (KIRRA-OCCY-QUANT-001) — the source.
+- `AOU-ACTUATION-LATENCY-001` — the #127 actuation contract it is tracked beside.
+- `UL4600_SAFETY_CASE.md` (G-UL-TOP) — assumed external requirement.
+- Occy **SG9** (fail-closed integrity) — the goal an under-target LFM undermines.
