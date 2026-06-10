@@ -237,6 +237,10 @@ pub struct AppState {
     /// detected but could not be durably recorded (#245/#247 pattern). MUST be 0
     /// in a healthy deployment; never gates the verdict path.
     pub post_incident_write_failures: Arc<AtomicU64>,
+    /// #112 — operator-observable count of command-source handoff audit writes
+    /// that were detected but could not be durably recorded (#245/#247 pattern).
+    /// MUST be 0 in a healthy deployment; never gates the verdict path.
+    pub command_source_write_failures: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -263,6 +267,7 @@ impl AppState {
             rss_recovery_streak: Arc::new(Mutex::new(RssRecoveryStreak { count: 0, start_ms: 0 })),
             current_incident: Arc::new(Mutex::new(None)),
             post_incident_write_failures: Arc::new(AtomicU64::new(0)),
+            command_source_write_failures: Arc::new(AtomicU64::new(0)),
         }
     }
 
