@@ -593,6 +593,18 @@ async fn perform_promotion(
         );
     }
 
+    // #112: record the control-authority handoff provenance ALONGSIDE the
+    // promotion event (complement, not a duplicate). A primary failure transfers
+    // autonomous command authority to this standby controller. Observability
+    // only — never blocks promotion (its own store lock + failure counter).
+    crate::command_source::record_handoff(
+        app,
+        crate::command_source::CommandSource::AutonomousPlanner,
+        crate::command_source::CommandSource::StandbyController,
+        reason,
+        ts,
+    );
+
     // Step 5: Initial recalculation as Active instance.
     // is_active() now returns true, so recalculate_and_broadcast will write
     // to the cache and emit broadcasts instead of returning early.
