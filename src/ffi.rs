@@ -1,5 +1,5 @@
 use std::sync::{Mutex, LazyLock};
-use crate::kirra_core::KirraKernelGovernor;
+use crate::kirra_core::{KirraKernelGovernor, RuntimeTrustEngine};
 use crate::kinematics_contract::KinematicContract;
 use crate::{SafetyGovernor, SafetyContract};
 
@@ -60,7 +60,118 @@ pub unsafe extern "C" fn kirra_reset_state(token_ptr: *const u8, token_len: usiz
         _ => return 0,
     };
     let token = unsafe { std::slice::from_raw_parts(token_ptr, token_len) };
+    // #103 DELTA 1: thread the REAL wall-clock into the reset so the cooldown /
+    // brute-force timer actually advances. Previously this passed `0`, which
+    // froze the timer — after 5 failed attempts `reset_cooldown_end_ms` became
+    // 60000 and `0 < 60000` stayed true forever, so the intended 60 s cooldown
+    // never elapsed. We use the SAME clock convention as the gateway reset path
+    // (`gateway/mod.rs`: SystemTime since UNIX_EPOCH, ms) — one time convention
+    // across both reset paths. `authenticated_manual_reset`'s signature is
+    // unchanged (the caller supplies time, which is correct).
     if let Ok(mut g) = GLOBAL_GOVERNOR.lock() {
-        g.trust_engine.authenticated_manual_reset(token, &key, 0).map(|_| 1).unwrap_or(0)
+        reset_engine_at(&mut g.trust_engine, token, &key, supervisor_now_ms())
     } else { 0 }
+}
+
+// ---------------------------------------------------------------------------
+// #103 DELTA 2 — DEFERRED (documented reservation; NO emission in this PR).
+//
+// A LockedOut clearance via supervisor reset is a safety-critical transition
+// with no audit row today. The obvious fix — emit a signed event at this reset
+// site — is BLOCKED by architecture: the signed-chain append primitive (in
+// `src/audit_chain.rs`) and the SQLite chain live in the *verifier-service*
+// subsystem, and neither kirra_core reset path (this FFI shim, or the
+// `gateway/mod.rs` admin socket) carries an audit-chain handle. Reaching it
+// would need cross-subsystem plumbing the design deliberately avoids.
+//
+// RESERVED audit vocabulary (for the future emitting path — NOT defined as code
+// here, to avoid dead_code in a clippy-clean tree):
+//   event types : SUPERVISOR_RESET_SUCCEEDED, SUPERVISOR_RESET_REJECTED
+//   reject reasons (SUPERVISOR_RESET_REJECTED): COOLDOWN_ACTIVE,
+//                  BRUTE_FORCE_SUSPECTED, INVALID_TOKEN
+//   never log/record the token bytes — outcome + reason code only.
+//
+// FOLLOW-UP (#103): the signed clearance audit belongs in a verifier-service
+// supervisor-reset route — that subsystem owns BOTH the fleet posture and the
+// signed chain — pending a separate scoping of the kernel-trust-reset (this
+// path) vs the fleet-posture-clearance distinction. Until then the #117 UL 4600
+// clearance/reset SPI stays GAP (NOT emitted).
+// ---------------------------------------------------------------------------
+
+/// Wall-clock milliseconds since the UNIX epoch — the single time convention
+/// shared by both supervisor-reset paths (mirrors `gateway/mod.rs`'s `now`).
+fn supervisor_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Time-injectable core of the FFI reset, factored out so the cooldown /
+/// brute-force timing is unit-testable without the C boundary, the process-wide
+/// `GLOBAL_GOVERNOR`, or `KIRRA_SUPERVISOR_RESET_KEY` (which a test cannot set —
+/// `std::env::set_var` in a multithreaded test is forbidden, INV-13). Returns
+/// `1` on a successful reset, `0` on any rejection (fail-closed, matching the
+/// C contract). The caller supplies `current_time_ms`; the
+/// `authenticated_manual_reset` signature is unchanged.
+fn reset_engine_at(
+    engine: &mut RuntimeTrustEngine,
+    token: &[u8],
+    key: &[u8],
+    current_time_ms: u64,
+) -> i32 {
+    engine
+        .authenticated_manual_reset(token, key, current_time_ms)
+        .map(|_| 1)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod reset_clock_tests {
+    use super::*;
+
+    /// DELTA 1: the injected clock flows into the cooldown computation — after a
+    /// brute-force lockout the cooldown end is set RELATIVE to the real
+    /// timestamp (`T + 60_000`), not to a frozen `0`. With the old `now = 0`,
+    /// `reset_cooldown_end_ms` would be `60_000` (a 1970 instant) and a probe at
+    /// a real timestamp would NOT read as cooldown-active — the timer was inert.
+    #[test]
+    fn reset_threads_real_clock_into_cooldown_window() {
+        let mut engine = RuntimeTrustEngine::new();
+        let key = b"supervisor-key";
+
+        // Five wrong tokens arm the brute-force counter.
+        for _ in 0..5 {
+            assert_eq!(reset_engine_at(&mut engine, b"wrong", key, 1_000), 0);
+        }
+        assert_eq!(engine.failed_reset_attempts, 5);
+
+        // A real-ish wall-clock timestamp (~2024 in ms).
+        let t: u64 = 1_700_000_000_000;
+        // failed >= 5 → brute-force branch arms the cooldown RELATIVE to `t`.
+        assert_eq!(reset_engine_at(&mut engine, key, key, t), 0);
+        assert_eq!(
+            engine.reset_cooldown_end_ms,
+            t + 60_000,
+            "cooldown end must be set relative to the injected real clock, not a frozen 0"
+        );
+
+        // A probe inside the 60 s window reads as cooldown-active (rejected) — a
+        // behaviour that is only meaningful because the window is real-time
+        // bounded. With the inert `now = 0`, `t + 59_999 < 60_000` would be false
+        // and this branch would never be reached.
+        assert!(t + 59_999 < engine.reset_cooldown_end_ms);
+        assert_eq!(reset_engine_at(&mut engine, key, key, t + 59_999), 0);
+    }
+
+    /// The clock the production FFI path supplies is a real current wall clock,
+    /// not the old hardcoded `0`.
+    #[test]
+    fn supervisor_clock_is_real_wall_clock_ms() {
+        let now = supervisor_now_ms();
+        assert!(
+            now > 1_600_000_000_000,
+            "supervisor reset must use real wall-clock ms (got {now}), never a frozen 0"
+        );
+    }
 }
