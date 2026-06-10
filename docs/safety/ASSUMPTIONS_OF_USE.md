@@ -47,6 +47,7 @@ the verification passes for the target deployment.
 | AOU-ACTUATION-LATENCY-001 | Actuation completes safe-stop initiation ≤ 499 ms of the MRC verdict, and safe-stops on loss of a valid verdict | Integrator (actuation) | **OK-PROVEN** (Governor) + **AoU-GAP** (actuator residual) | the speed cap's t_react budget (SPEED-VAL-001 row 2); SS-003 MRC fallback |
 | AOU-HW-POWER-001 (DR-1) | Governor D3 compute on an ASIL-D-class redundant / supervised power supply | Integrator (hardware / platform) | **AoU-GAP** — pre-production HW gate | the ASIL-D PMHF target for the Governor element (KIRRA-OCCY-QUANT-001) |
 | AOU-HW-COMMBUS-001 (DR-2) | Governor comm path (Auto-Ethernet PHY+MAC) achieves LFM ≥ 90 % | Integrator (hardware / platform) | **AoU-GAP** — pre-production HW gate | the ASIL-D LFM target for the Governor element (KIRRA-OCCY-QUANT-001) |
+| AOU-LOCALIZATION-001 | Integrator localization ≤ 0.10 m 95th-pct lateral (cross-track) error over the ODD; else the documented 0.75 m conservative-fallback margin | Integrator (localization) | **AoU-GAP** (base) — integrator-characterized; runtime gate live (#123 / PR #264) | `CONTAINMENT_LATERAL_MARGIN_M = 0.40 m` (SG2 ASIL D); all map-anchored SG5 commit-zone enforcement (#260–#262) + the SG4 `MapKnownSafe` earn-back |
 
 ---
 
@@ -626,3 +627,119 @@ argument assumes.
 - `AOU-ACTUATION-LATENCY-001` — the #127 actuation contract it is tracked beside.
 - `UL4600_SAFETY_CASE.md` (G-UL-TOP) — assumed external requirement.
 - Occy **SG9** (fail-closed integrity) — the goal an under-target LFM undermines.
+
+---
+
+# Localization integrity (#123) — SEooC assumption of use
+
+The clause below files the **G2 localization assumption-of-use** as a stable
+register entry. It was derived and dispositioned in the SG2 lateral-margin
+analysis (`OCCY_SG2_MARGIN.md`, KIRRA-OCCY-SG2-MARGIN-001 §2–3, §5); this register
+**files** it — it does not re-derive. The **runtime complement** (the parko-core
+localization-integrity gate, #123 runtime half / PR #264) is merged; this is its
+**contractual** half. The two are a pair: the gate fail-closes every map-anchored
+veto when the integrator's integrity reporting says the bound is not currently
+held, and this AoU records the obligation that the bound *be* held (and the
+documented fallback for ODDs that cannot).
+
+## AOU-LOCALIZATION-001 — Integrator localization ≤ 0.10 m 95th-pct lateral error
+
+### Assumption
+> *Integrator localization shall achieve ≤ 0.10 m 95th-percentile lateral
+> (cross-track) error within the deployment ODD; ODDs that cannot meet this bound
+> shall deploy the documented conservative-fallback margin configuration
+> (0.75 m) instead.*
+
+### Why it is load-bearing
+The SG2 lateral-containment margin `CONTAINMENT_LATERAL_MARGIN_M = 0.40 m`
+(`src/gateway/containment.rs:56`, SG2 ASIL D) is **derived** assuming the
+localization cross-track term `ε_localization = 0.10 m` — the *typical*-column
+value in the `OCCY_SG2_MARGIN.md` §2 error-budget table. That same row records the
+**worst-case** urban-canyon NDT / visual-LiDAR figure of `≈ 0.30 m` — exactly the
+case the 0.10 m bound **excludes**. The 0.40 m PRIMARY setting is the typical-term
+sum; substituting the 0.30 m worst-case localization term is what drives the
+0.75 m CONSERVATIVE FALLBACK (`OCCY_SG2_MARGIN.md` §3). So a violated bound
+silently consumes the containment headroom the ASIL-D SG2 argument depends on.
+
+Additionally — and this is the broader reach the runtime gate makes explicit —
+**every map-anchored trust in the kernel interprets map geometry through the ego
+pose:** all SG5 commit-zone enforcement (the #260–#262 bricks — a mapped rail
+crossing / box junction is located *relative to the ego*) and the SG4
+`MapKnownSafe` water earn-back (a mapped ford is anchored in the map frame). A
+localization bound violation **silently mislocates every one of these
+map-anchored vetoes** — the veto may fire for the wrong stretch of road, or fail
+to fire for the right one — without any single check observing the fault. This is
+why the assumption is filed once, centrally, rather than inline under SG2 alone.
+
+### Evidence
+- `OCCY_SG2_MARGIN.md` §2 error-budget table — the `ε_localization` row
+  (typical **0.10 m** / worst-case 0.30 m) — anchor `OCCY_SG2_MARGIN.md:45`; and
+  the rounded-sum row (PRIMARY **0.40 m** / FALLBACK **0.75 m**) at
+  `OCCY_SG2_MARGIN.md:49`.
+- `OCCY_SG2_MARGIN.md` §3 margin-setting table — PRIMARY 0.40 m (conditional on
+  the ≤ 0.10 m G2 AoU) vs CONSERVATIVE FALLBACK 0.75 m (uncharacterized accuracy,
+  `ε_localization > 0.10 m`, or urban-canyon / multipath ODD) — anchor
+  `OCCY_SG2_MARGIN.md:73`.
+- `OCCY_SG2_MARGIN.md` §5 — the G2 localization assumption-of-use statement
+  (≤ 0.10 m, 95th-percentile, evaluated over the ODD) — anchor
+  `OCCY_SG2_MARGIN.md:99`.
+- `src/gateway/containment.rs:56` — `CONTAINMENT_LATERAL_MARGIN_M = 0.40` (the
+  derived constant the bound underwrites).
+
+### Scope
+- **In scope:** the integrator localization stack's 95th-percentile cross-track
+  (lateral) accuracy over the **full deployment ODD**, including the urban-canyon
+  / multipath conditions the worst-case column names.
+- **Owner:** Integrator (localization). Base-tier; KIRRA takes no base-tier
+  measurement of localization accuracy (`OCCY_SG2_MARGIN.md` §5 — "pilot does not
+  measure").
+
+### Verification status — **AoU-GAP** (base) — integrator-characterized
+No KIRRA base-tier measurement. Discharged for a deployment by the integrator's
+per-deployment characterization of the localization stack vs. ground truth on a
+representative track (the deployment-specific **G2 evidence package** named in
+`OCCY_SG2_MARGIN.md` §5). An ODD that **cannot** meet the bound — or whose
+localization accuracy is uncharacterized, or which contains urban-canyon /
+multipath zones outside the integrator's localization profile — must instead
+deploy the **0.75 m conservative-fallback** margin configuration
+(`OCCY_SG2_MARGIN.md` §3; a deployment config flag, **not** the code default).
+
+**Kernel complement (runtime half, #123 / PR #264).** The parko-core
+localization-integrity gate (`parko/crates/parko-core/src/localization.rs`:
+`localization_trusted`, `gate_commit_zone_scene`, `gate_water_scene`) is the
+runtime reaction to a **reported** bound violation: when the integrator's
+integrity channel reports lateral error over the bound (or is stale / absent),
+every map-anchored commit-zone scene degrades to `Unknown` (fail-closed veto) and
+the `MapKnownSafe` water earn-back is stripped (operator authority survives —
+it is not map-frame-dependent). The gate **does not measure** the bound; it
+fail-closes on the integrator's report that the bound is not met. It is a
+mitigation, not a discharge — this AoU remains the integrator obligation.
+
+### Consequence if violated
+The SG2 containment margin is **unconservative**: the 0.40 m PRIMARY value no
+longer covers the true cross-track error budget, so the ego can leave the
+intended corridor inside the margin the ASIL-D argument assumes — a lateral
+departure / lane-edge-incursion pathway. Concurrently, **every map-anchored SG5
+commit-zone veto and the SG4 `MapKnownSafe` earn-back is referenced to a wrong
+pose** — a high-consequence zone (rail crossing, box junction, narrow bridge) or
+a mapped ford is mislocated, so the veto can mis-fire or silently fail to fire.
+The kernel cannot self-detect the pose error; it is mitigated only by the
+integrator holding the bound (or deploying the 0.75 m fallback), with the runtime
+gate fail-closing whatever the integrity channel does report.
+
+### Cross-references
+- `OCCY_SG2_MARGIN.md` (KIRRA-OCCY-SG2-MARGIN-001) §2–3, §5 — the source analysis
+  (the error budget, the PRIMARY / FALLBACK setting, and the G2 AoU statement);
+  this register files it without re-deriving.
+- `src/gateway/containment.rs:56` — `CONTAINMENT_LATERAL_MARGIN_M = 0.40` (the
+  derived SG2 ASIL-D constant the bound underwrites).
+- `parko/crates/parko-core/src/localization.rs` (#123 runtime half / PR #264) —
+  the runtime localization-integrity gate (the kernel complement to this clause).
+- The SG5 commit-zone bricks **#260–#262** and the SG4 water `MapKnownSafe`
+  earn-back (#98) — the map-anchored mechanisms a violated bound mislocates.
+- `UL4600_SAFETY_CASE.md` (G-UL-TOP) — assumed external requirement; a violation
+  is a path to unreasonable risk via the SG2 margin and the map-anchored vetoes.
+- Occy **SG2** (lateral containment) — the goal whose margin this bound
+  underwrites; **SG5** (commit-zone) and **SG4** (water-untraversable) — the
+  map-anchored goals a violated pose mislocates.
+- `#123` — the issue (runtime gate = PR #264; this clause = the docs half).
