@@ -957,9 +957,13 @@ async fn evaluate_industrial_adapter(
     let protocol_name = format!("{:?}", req.protocol);
 
     match evaluate_unified_industrial_request(req, posture) {
-        Ok(result) => {
-            let should_audit = !result.allowed
-                || result.adapter_details.get("is_broadcast").and_then(|v| v.as_bool()).unwrap_or(false);
+        Ok(mut result) => {
+            // SG-012 / H-011: a DNP3 broadcast (only DNP3 sets `is_broadcast`)
+            // must carry a tamper-evident record; mirror the dedicated DNP3
+            // handler's fail-closed policy on this generic path too.
+            let is_broadcast = result.adapter_details
+                .get("is_broadcast").and_then(|v| v.as_bool()).unwrap_or(false);
+            let should_audit = !result.allowed || is_broadcast;
 
             if should_audit {
                 let audit = json!({
@@ -976,20 +980,33 @@ async fn evaluate_industrial_adapter(
                 } else {
                     "INDUSTRIAL_ACTION_DENIED"
                 };
-                match svc.app.store.lock() {
-                    Ok(mut store) => {
-                        if let Err(e) = store.save_posture_event_chained(
-                            "industrial_adapter", event_type,
-                            &audit.to_string(), None, now_ms(),
-                        ) {
+                let audit_ok = match svc.app.store.lock() {
+                    Ok(mut store) => match store.save_posture_event_chained(
+                        "industrial_adapter", event_type,
+                        &audit.to_string(), None, now_ms(),
+                    ) {
+                        Ok(()) => true,
+                        Err(e) => {
                             tracing::error!(error = %e, event_type = event_type,
                                 "AUDIT-CHAIN WRITE FAILED for industrial adapter event — event missing from tamper-evident log");
+                            false
                         }
-                    }
+                    },
                     Err(_) => {
                         tracing::error!(event_type = event_type,
                             "industrial adapter: store lock poisoned — audit write SKIPPED for this event");
+                        false
                     }
+                };
+
+                // TR-012a: a broadcast whose mandatory audit could not be
+                // written is BLOCKED (fail-closed); non-broadcast audit failure
+                // stays non-fatal (TR-012b).
+                if is_broadcast && !audit_ok {
+                    result.allowed = false;
+                    result.denial_reason = Some("DNP3_BROADCAST_AUDIT_UNAVAILABLE".to_string());
+                    tracing::error!(
+                        "DNP3 broadcast BLOCKED (unified path) — mandatory audit write unavailable (SG-012 / H-011 fail-closed)");
                 }
             }
 
@@ -1250,39 +1267,71 @@ async fn evaluate_dnp3_adapter(
     let (allowed, denial_reason) = kirra_runtime_sdk::protocol_adapter::command_allowed_for_posture_pub(&eval.command, &posture);
     let audit_ref = now_ms().to_string();
 
-    if !allowed || eval.is_broadcast {
+    // SG-012 / H-011 — a DNP3 broadcast control command must carry a
+    // tamper-evident record. Kirra CLASSIFIES, it does not actuate: "before
+    // control output" means before this handler returns its verdict, and the
+    // integrator MUST NOT actuate ahead of this audited verdict (a documented
+    // assumption-of-use). Audit policy:
+    //   * Broadcast (TR-012 / TR-012a): MUST be audited; if the mandatory audit
+    //     write fails (or the store lock is poisoned), the command is BLOCKED
+    //     (fail-closed) — H-011's hazard is a broadcast control executed without
+    //     a tamper-evident record.
+    //   * Unicast control (TR-012b): also audited, but an audit-write failure is
+    //     NON-fatal — for a single target the enforcement decision outranks the
+    //     record (blocking on a transient disk error would be fail-open).
+    //   * Denials: audited.
+    let mut allowed = allowed;
+    let mut denial_reason = denial_reason;
+    let mut status = StatusCode::OK;
+
+    if eval.is_broadcast || eval.is_control || !allowed {
         let event_type = if eval.is_broadcast {
             "DNP3_BROADCAST_COMMAND"
-        } else {
+        } else if !allowed {
             "INDUSTRIAL_ACTION_DENIED"
+        } else {
+            "DNP3_CONTROL_COMMAND"
         };
-        match svc.app.store.lock() {
-            Ok(mut store) => {
-                if let Err(e) = store.save_posture_event_chained(
-                    "dnp3_adapter", event_type,
-                    &json!({
-                        "function_name": eval.function_name,
-                        "is_broadcast": eval.is_broadcast,
-                        "is_control": eval.is_control,
-                        "critical_infrastructure_relevant": eval.critical_infrastructure_relevant,
-                        "dest_address": msg.dest_address,
-                        "posture": posture_str,
-                        "lockout_reason": lockout_reason.as_ref().map(|r| r.to_string()),
-                    }).to_string(),
-                    None, now_ms(),
-                ) {
+        let audit_payload = json!({
+            "function_name": eval.function_name,
+            "is_broadcast": eval.is_broadcast,
+            "is_control": eval.is_control,
+            "critical_infrastructure_relevant": eval.critical_infrastructure_relevant,
+            "dest_address": msg.dest_address,
+            "posture": posture_str,
+            "lockout_reason": lockout_reason.as_ref().map(|r| r.to_string()),
+        })
+        .to_string();
+        let audit_ok = match svc.app.store.lock() {
+            Ok(mut store) => match store.save_posture_event_chained(
+                "dnp3_adapter", event_type, &audit_payload, None, now_ms(),
+            ) {
+                Ok(()) => true,
+                Err(e) => {
                     tracing::error!(error = %e, event_type = event_type,
                         "AUDIT-CHAIN WRITE FAILED for dnp3 adapter event — event missing from tamper-evident log");
+                    false
                 }
-            }
+            },
             Err(_) => {
                 tracing::error!(event_type = event_type,
                     "dnp3 adapter: store lock poisoned — audit write SKIPPED for this event");
+                false
             }
+        };
+
+        // TR-012a: a BROADCAST whose mandatory audit could not be written is
+        // BLOCKED (fail-closed). Unicast audit failure is non-fatal (TR-012b).
+        if eval.is_broadcast && !audit_ok {
+            allowed = false;
+            denial_reason = Some("DNP3_BROADCAST_AUDIT_UNAVAILABLE".to_string());
+            status = StatusCode::SERVICE_UNAVAILABLE;
+            tracing::error!(dest_address = msg.dest_address,
+                "DNP3 BROADCAST control BLOCKED — mandatory audit write unavailable (SG-012 / H-011 fail-closed)");
         }
     }
 
-    Json(json!({
+    (status, Json(json!({
         "protocol": "dnp3",
         "command": format!("{:?}", eval.command),
         "allowed": allowed,
@@ -1295,7 +1344,7 @@ async fn evaluate_dnp3_adapter(
             "critical_infrastructure_relevant": eval.critical_infrastructure_relevant,
         },
         "audit_ref": audit_ref,
-    })).into_response()
+    }))).into_response()
 }
 
 async fn register_federation_controller(
@@ -3350,5 +3399,120 @@ mod local_asset_lockedout_seed_tests {
             FleetPosture::Nominal,
             "the feed lifts the local asset out of LockedOut on recalc"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SG-012 / H-011 — DNP3 broadcast mandatory audit (TR-012 / TR-012a / TR-012b).
+// A broadcast control MUST carry a tamper-evident record; if the mandatory
+// audit write fails, the command is BLOCKED (fail-closed). Unicast audit
+// failure is non-fatal. The store mutex is poisoned to simulate audit failure.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod dnp3_mandatory_audit_tests {
+    use super::evaluate_dnp3_adapter;
+
+    use std::sync::Arc;
+
+    use axum::body::to_bytes;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::Json;
+
+    use kirra_runtime_sdk::adapters::dnp3::{Dnp3Message, Dnp3Object, DNP3_BROADCAST_ADDRESS};
+    use kirra_runtime_sdk::posture_cache::{CachedFleetPosture, ServiceState, SharedPostureCache};
+    use kirra_runtime_sdk::verifier::{AppState, FleetPosture, VerifierOperationMode};
+    use kirra_runtime_sdk::verifier_store::VerifierStore;
+
+    fn svc() -> Arc<ServiceState> {
+        let store = VerifierStore::new(":memory:").expect("in-memory store");
+        let app = Arc::new(AppState::new(store, VerifierOperationMode::Active));
+        // Fresh Nominal posture so the gate admits the command (we test the
+        // AUDIT mechanism, not the posture gate).
+        let posture_cache: SharedPostureCache =
+            Arc::new(std::sync::RwLock::new(Some(CachedFleetPosture::new(FleetPosture::Nominal))));
+        Arc::new(ServiceState {
+            app,
+            posture_cache,
+            audit_verifying_key: None,
+            fabric_router: Arc::new(kirra_runtime_sdk::fabric::router::FabricRouter::new()),
+            fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
+            fabric_causal_log: Arc::new(kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new_in_memory(None)),
+            posture_engine_tx: std::sync::OnceLock::new(),
+            perception_cap: kirra_runtime_sdk::gateway::perception_monitor::empty_perception_cap(),
+            perception_monitor_enabled: false,
+        })
+    }
+
+    /// CROB control message (function 0x05 Direct_Operate + Group 12) to `dest`.
+    fn control_msg(dest: u16) -> Dnp3Message {
+        Dnp3Message {
+            source_address: 0x0001,
+            dest_address: dest,
+            function_code: 0x05,
+            data_link_control: 0,
+            objects: vec![Dnp3Object { group: 12, variation: 1, data: vec![] }],
+            source_node: "substation_01".to_string(),
+        }
+    }
+
+    /// Poison the store mutex so every `store.lock()` returns `Err` — i.e. the
+    /// mandatory audit write cannot land.
+    fn poison_store(svc: &ServiceState) {
+        let store = Arc::clone(&svc.app.store);
+        let _ = std::thread::spawn(move || {
+            let _g = store.lock().unwrap();
+            panic!("intentionally poisoning the store mutex for the audit-failure test");
+        })
+        .join();
+        assert!(svc.app.store.lock().is_err(), "store mutex should now be poisoned");
+    }
+
+    async fn post(svc: Arc<ServiceState>, msg: Dnp3Message) -> (StatusCode, serde_json::Value) {
+        let resp = evaluate_dnp3_adapter(State(svc), Ok(Json(msg))).await.into_response();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
+        (status, serde_json::from_slice(&bytes).expect("json body"))
+    }
+
+    #[tokio::test]
+    async fn test_dnp3_broadcast_always_audited() {
+        let svc = svc();
+        let (status, v) = post(Arc::clone(&svc), control_msg(DNP3_BROADCAST_ADDRESS)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["allowed"], true, "broadcast admitted in Nominal");
+        assert_eq!(v["adapter_details"]["is_broadcast"], true);
+        // The mandatory audit entry was written to the tamper-evident log.
+        let n = svc.app.store.lock().unwrap()
+            .count_recent_posture_events("dnp3_adapter", 0).unwrap();
+        assert!(n >= 1, "a broadcast must always produce an audit entry, got {n}");
+    }
+
+    #[tokio::test]
+    async fn test_dnp3_broadcast_blocked_on_audit_write_failure() {
+        let svc = svc();
+        poison_store(&svc); // mandatory audit write will fail
+        let (status, v) = post(Arc::clone(&svc), control_msg(DNP3_BROADCAST_ADDRESS)).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a broadcast whose mandatory audit failed must be blocked"
+        );
+        assert_eq!(v["allowed"], false, "TR-012a: broadcast blocked when audit unavailable");
+        assert_eq!(v["denial_reason"], "DNP3_BROADCAST_AUDIT_UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn test_dnp3_unicast_audit_failure_non_fatal() {
+        let svc = svc();
+        poison_store(&svc); // audit write will fail for this unicast control too
+        let (status, v) = post(Arc::clone(&svc), control_msg(0x0005)).await;
+        assert_eq!(status, StatusCode::OK, "unicast audit failure is non-fatal");
+        assert_eq!(
+            v["allowed"], true,
+            "TR-012b: a unicast command is NOT blocked by an audit-write failure"
+        );
+        assert_eq!(v["adapter_details"]["is_broadcast"], false);
     }
 }
