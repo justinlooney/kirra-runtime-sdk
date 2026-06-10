@@ -58,7 +58,9 @@ pub mod comparator;
 pub mod diverse;
 pub use angular_bound::{AngularVelocityBound, PlatformParams, ROLLOVER_MIN_LINEAR_VELOCITY_MPS};
 pub use audit_sink::{
-    select_divergence_sink, AuditChainLinkerDivergenceSink, FatalAuditConfig,
+    select_divergence_sink, select_impact_sink, AuditChainLinkerDivergenceSink, FatalAuditConfig,
+    ImpactAuditSink, ImpactClearedPayload, ImpactDetectedPayload, ImpactEventSink,
+    InMemoryImpactSink, RecordedImpactLatch, IMPACT_CLEARED_EVENT_TYPE, IMPACT_DETECTED_EVENT_TYPE,
 };
 pub use comparator::{GovernorComparator, RssAwareGovernor};
 pub use diverse::DiverseKirraGovernor;
