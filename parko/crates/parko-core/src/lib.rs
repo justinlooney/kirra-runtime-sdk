@@ -50,8 +50,8 @@ pub use commands::ControlCommand;
 pub use control_loop::ControlLoop;
 pub use runtime::{RuntimeClock, RuntimeState, TickStatus};
 pub use rss::{
-    lateral_safe_distance, longitudinal_safe_distance, AgentScene, RssAgent, RssParams, RssState,
-    MAX_RSS_AGENTS,
+    lateral_safe_distance, longitudinal_safe_distance, occlusion_limited_speed, AgentScene,
+    OcclusionScene, RssAgent, RssParams, RssState, MAX_RSS_AGENTS,
 };
 pub use safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 pub use scheduler::{DegradationThresholds, InferenceLoop};

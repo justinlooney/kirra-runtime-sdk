@@ -140,6 +140,102 @@ pub fn longitudinal_safe_distance(
     raw.max(0.0)
 }
 
+/// Search ceiling for the rule-iv closing-speed inversion (m/s). Far above any
+/// ground-vehicle + emerging-actor closing speed; a sightline that admits a
+/// closing speed at or beyond this does not bind the ego below the ceiling, so
+/// the returned cap is `ceiling - v_emerge_max` — still finite, never `Inf`.
+const OCCLUSION_SEARCH_CEILING_MPS: f64 = 150.0;
+
+/// Maximum safe ego speed under RSS rule iv — occlusion / limited sightline
+/// (IEEE 2846-2022 §5, occlusion handling).
+///
+/// Returns the largest ego speed (m/s) at which the ego can still maintain RSS
+/// longitudinal safe distance against a worst-case actor that could emerge from
+/// the occluded region at the sightline boundary `d_sight`.
+///
+/// Worst-case-emergence model — a safety-modelling CHOICE; reviewer, read this:
+///   * A hidden actor may exist just beyond the visible range and move toward
+///     the ego's conflict point at up to `v_emerge_max`. The encounter is
+///     modelled as CLOSING: the ego (at `v_ego`) and the actor (at
+///     `v_emerge_max`) approach a fixed conflict point at the sightline
+///     boundary, so the effective approach speed is `v_ego + v_emerge_max`.
+///   * The ego must keep its required longitudinal safe distance against a
+///     stationary conflict point (`lead_vel = 0`) at that closing speed within
+///     `d_sight`: `longitudinal_safe_distance(v_ego + v_emerge_max, 0, ..) <= d_sight`.
+///   * Both knobs move the bound conservatively: a SHORTER sightline or a FASTER
+///     possible emerger lowers the permitted ego speed.
+///   * `v_emerge_max = 0` reduces this to the classic "stop within the available
+///     sightline" (SSD) rule. A caller that cannot bound the emerging speed
+///     should pass the largest credible value; the parko-kirra `Absent` path
+///     takes this to its fail-closed limit (a full stop).
+///
+/// Method: `longitudinal_safe_distance(., 0, ..)` is continuous and monotonically
+/// increasing in the closing speed, so the largest admissible closing speed is
+/// found by bounded bisection and the ego cap is that minus `v_emerge_max`
+/// (clamped >= 0).
+///
+/// FAIL-CLOSED: any invalid input (non-finite; `d_sight <= 0`; negative
+/// `v_emerge_max`; or the non-finite / non-positive brake/accel conditions the
+/// longitudinal primitive guards) returns `0.0` — the ego must stop. `0.0` is
+/// the speed-cap analogue of `RSS_FAILSAFE_DISTANCE_M` (defence in depth, SG9).
+// SAFETY: SG1 SG9 | REQ: rss-occlusion-sightline-failsafe | TEST: test_occlusion_nonpositive_dsight_is_stop,test_occlusion_nonfinite_input_is_stop,test_occlusion_invalid_brake_is_stop,test_occlusion_monotonic_in_sightline,test_occlusion_roundtrips_longitudinal,test_occlusion_faster_emerger_lowers_cap
+// (≅ Occy SG1 RSS rule iv / occlusion; H9 occlusion trigger -> SG9 fail-closed
+//  to a stop. Any invalid input returns 0.0 — a fail-closed speed cap.)
+pub fn occlusion_limited_speed(
+    d_sight: f64,
+    v_emerge_max: f64,
+    reaction_time: f64,
+    accel_max: f64,
+    brake_min: f64,
+    brake_max: f64,
+) -> f64 {
+    // See lateral/longitudinal note: no debug_assert! — the runtime guard is the
+    // safety contract, and the fail-closed tests drive these invalid inputs.
+    if !(finite_positive(d_sight)
+        && v_emerge_max.is_finite()
+        && v_emerge_max >= 0.0
+        && finite_positive(brake_min)
+        && finite_positive(brake_max)
+        && reaction_time.is_finite()
+        && accel_max.is_finite())
+    {
+        return 0.0;
+    }
+
+    // required(v_close): the gap the ego needs to stop short of a fixed conflict
+    // point at worst-case closing speed `v_close`. Monotone increasing in v_close
+    // (lead_vel = 0, so the lead-braking term is absent).
+    let required = |v_close: f64| -> f64 {
+        longitudinal_safe_distance(v_close, 0.0, reaction_time, accel_max, brake_min, brake_max)
+    };
+
+    // Even a zero closing speed needs the reaction-phase creep gap; a sightline
+    // below that admits no motion → stop.
+    if required(0.0) > d_sight {
+        return 0.0;
+    }
+
+    // Largest admissible closing speed, via monotone bisection.
+    let mut lo = 0.0_f64;
+    let mut hi = OCCLUSION_SEARCH_CEILING_MPS;
+    if required(hi) <= d_sight {
+        // Sightline does not bind below the search ceiling.
+        lo = hi;
+    } else {
+        // ~60 iterations drives the interval far below f64 speed resolution.
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if required(mid) <= d_sight {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+    }
+
+    (lo - v_emerge_max).max(0.0)
+}
+
 // ---------------------------------------------------------------------------
 // Agent-set input model for pairwise RSS (issue #92)
 // ---------------------------------------------------------------------------
@@ -207,6 +303,25 @@ pub enum AgentScene {
     /// One or more agents to check pairwise. An empty vector here is treated
     /// fail-closed (callers must use `KnownEmpty` for a verified-clear scene).
     Agents(Vec<RssAgent>),
+}
+
+/// The occlusion / sightline descriptor the governor sees this tick, for RSS
+/// rule iv (issue #122). Mirrors [`AgentScene`]'s ABSENT vs KNOWN distinction,
+/// which is safety-critical here too: a MISSING sightline assessment must NOT be
+/// read as "the road is clear".
+#[derive(Debug, Clone, Copy)]
+pub enum OcclusionScene {
+    /// No occlusion / sightline assessment this tick (perception gap) →
+    /// fail-closed: treat as worst-case occlusion (zero sightline → the ego must
+    /// stop). ABSENT is NOT `KnownClear`.
+    Absent,
+    /// Perception ran and the relevant sightline is verified clear → RSS rule iv
+    /// imposes no speed bound.
+    KnownClear,
+    /// A limited sightline: the nearest occluded-region boundary is `d_sight_m`
+    /// along the ego path, and an actor could emerge from it at up to
+    /// `v_emerge_max_mps`.
+    Limited { d_sight_m: f64, v_emerge_max_mps: f64 },
 }
 
 #[cfg(test)]
@@ -527,5 +642,65 @@ mod tests {
         let r2 = longitudinal_safe_distance(0.0, 0.0, 0.0, 0.0, -f64::MIN_POSITIVE, 1.0);
         assert!(r1 < RSS_FAILSAFE_DISTANCE_M, "tiny positive brake_min passes the guard, got {r1}");
         assert!(r2 >= RSS_FAILSAFE_DISTANCE_M, "tiny negative brake_min must fail safe, got {r2}");
+    }
+
+    // ── occlusion_limited_speed (RSS rule iv, issue #122) ────────────────────
+    // Shared ego params for the occlusion tests: rt=0.5, accel=2.0, brakes=6.0.
+
+    /// d_sight <= 0 → ego must stop (0.0). Zero and negative sightlines.
+    #[test]
+    fn test_occlusion_nonpositive_dsight_is_stop() {
+        assert_eq!(occlusion_limited_speed(0.0, 0.0, 0.5, 2.0, 6.0, 6.0), 0.0,
+            "zero sightline must fail closed to a stop");
+        assert_eq!(occlusion_limited_speed(-5.0, 0.0, 0.5, 2.0, 6.0, 6.0), 0.0,
+            "negative sightline must fail closed to a stop");
+    }
+
+    /// Non-finite inputs (incl. negative emerge velocity) → 0.0.
+    #[test]
+    fn test_occlusion_nonfinite_input_is_stop() {
+        assert_eq!(occlusion_limited_speed(f64::NAN, 0.0, 0.5, 2.0, 6.0, 6.0), 0.0, "NaN d_sight → stop");
+        assert_eq!(occlusion_limited_speed(50.0, f64::INFINITY, 0.5, 2.0, 6.0, 6.0), 0.0, "Inf v_emerge → stop");
+        assert_eq!(occlusion_limited_speed(50.0, -1.0, 0.5, 2.0, 6.0, 6.0), 0.0, "negative v_emerge is invalid → stop");
+        assert_eq!(occlusion_limited_speed(50.0, 0.0, f64::NAN, 2.0, 6.0, 6.0), 0.0, "NaN reaction_time → stop");
+    }
+
+    /// The same non-positive/non-finite brake/accel guard as the primitives.
+    #[test]
+    fn test_occlusion_invalid_brake_is_stop() {
+        assert_eq!(occlusion_limited_speed(50.0, 0.0, 0.5, 2.0, 0.0, 6.0), 0.0, "zero brake_min → stop");
+        assert_eq!(occlusion_limited_speed(50.0, 0.0, 0.5, 2.0, 6.0, -1.0), 0.0, "negative brake_max → stop");
+    }
+
+    /// Monotonicity: a longer sightline allows a greater-or-equal speed, and a
+    /// much longer one strictly more.
+    #[test]
+    fn test_occlusion_monotonic_in_sightline() {
+        let cap = |d: f64| occlusion_limited_speed(d, 0.0, 0.5, 2.0, 6.0, 6.0);
+        let (a, b, c) = (cap(10.0), cap(40.0), cap(120.0));
+        assert!(a <= b && b <= c, "more sightline must allow >= speed: {a}, {b}, {c}");
+        assert!(c > a, "a much longer sightline must allow a strictly higher speed: {a} vs {c}");
+    }
+
+    /// Hand-anchored via the longitudinal primitive as the ORACLE: take a closing
+    /// speed, compute the sightline it requires, and confirm the inverse recovers
+    /// it (v_emerge_max = 0, so the ego cap equals the closing speed).
+    #[test]
+    fn test_occlusion_roundtrips_longitudinal() {
+        let (rt, acc, bmin, bmax) = (0.5, 2.0, 6.0, 6.0);
+        let v = 12.0_f64;
+        let d = longitudinal_safe_distance(v, 0.0, rt, acc, bmin, bmax);
+        let cap = occlusion_limited_speed(d, 0.0, rt, acc, bmin, bmax);
+        assert!((cap - v).abs() < 1e-3,
+            "the inverse of longitudinal_safe_distance must recover {v}, got {cap}");
+    }
+
+    /// A faster possible emerger lowers the cap (the conservative direction).
+    #[test]
+    fn test_occlusion_faster_emerger_lowers_cap() {
+        let slow = occlusion_limited_speed(60.0, 0.0, 0.5, 2.0, 6.0, 6.0);
+        let fast = occlusion_limited_speed(60.0, 5.0, 0.5, 2.0, 6.0, 6.0);
+        assert!(fast < slow, "a faster possible emerger must lower the cap: slow={slow}, fast={fast}");
+        assert!(fast >= 0.0, "the cap is never negative, got {fast}");
     }
 }
