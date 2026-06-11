@@ -26,6 +26,8 @@ homepage = "https://kirrasystems.com"
 authors = ["Justin Looney <justin@kirrasystems.io>"]
 keywords = ["safety", "autonomous", "robotics", "automotive", "runtime"]
 categories = ["embedded", "safety-critical"]
+license-file = "COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
 
 [lib]
 name = "kirra_runtime_sdk"

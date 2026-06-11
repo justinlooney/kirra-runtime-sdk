@@ -3,7 +3,8 @@ name = "parko-tensorrt"
 version = "0.1.0"
 edition = "2021"
 description = "TensorRT (NVIDIA Jetson) backend for parko-core via ort's TensorRT execution provider"
-license = "Apache-2.0"
+license-file = "../../../COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
 
 [dependencies]
 parko-core = { path = "../parko-core" }

@@ -3,7 +3,8 @@ name = "parko-onnx"
 version = "0.1.0"
 edition = "2021"
 description = "ONNX Runtime backend for parko-core via ort"
-license = "Apache-2.0"
+license-file = "../../../COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
 
 [features]
 # CUDA execution provider (NVIDIA GPU). Enables ort's `cuda` feature, which

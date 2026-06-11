@@ -12,7 +12,8 @@ name = "kirra-wire-client"
 version = "0.1.0"
 edition = "2021"
 description = "DEV/TEST client-side mirror of the kirra-governor-service UDP wire schema (serde + bincode). Not a safety artifact."
-license = "Apache-2.0"
+license-file = "../../COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

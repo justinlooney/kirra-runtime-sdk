@@ -3,7 +3,8 @@ name = "parko-kirra"
 version = "0.1.0"
 edition = "2021"
 description = "Adapter that bridges parko-core's SafetyGovernor trait to the kirra-runtime-sdk kinematics contract"
-license = "Apache-2.0"
+license-file = "../../../COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
 
 [dependencies]
 parko-core = { path = "../parko-core" }

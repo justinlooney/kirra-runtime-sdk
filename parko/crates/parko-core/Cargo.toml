@@ -3,7 +3,8 @@ name = "parko-core"
 version = "0.1.0"
 edition = "2021"
 description = "Core types and traits for vendor-neutral ML inference runtime"
-license = "Apache-2.0"
+license-file = "../../../COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
 
 [features]
 # Exposes test-only seams (e.g. set_state_for_test) to integration tests.

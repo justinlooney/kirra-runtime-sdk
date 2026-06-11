@@ -16,7 +16,8 @@ name = "parko-openvino"
 version = "0.1.0"
 edition = "2021"
 description = "OpenVINO inference backend for parko-core (CPU device; runtime-linked)"
-license = "Apache-2.0"
+license-file = "../../../COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
 
 [dependencies]
 parko-core = { path = "../parko-core" }
