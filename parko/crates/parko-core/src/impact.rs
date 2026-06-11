@@ -385,6 +385,17 @@ struct PendingClose {
 /// could be beyond the near-field, so absence is UNINFORMATIVE → release, no
 /// latch. The obligation is consumed either way.
 ///
+/// RESIDUAL (explicit). After the horizon, *departed* and *under-vehicle* are
+/// perceptually INDISTINGUISHABLE — both present as an empty scene. This detector
+/// chooses NOT-latch there; the alternative would latch on every close-encounter
+/// followed by a perception outage. Compensating controls bound the residual:
+/// (1) motion was vetoed THROUGHOUT the gap (the existing `AgentScene::Absent →
+/// UNSAFE` evaluation), so the vehicle did not move while the scene was unknown;
+/// and (2) resumption from an extended gap goes through the existing
+/// recovery-confirm discipline, not a bare resume. This detector covers the
+/// ≤ 1-cycle SG6 window (an object that vanishes BETWEEN adjacent frames), not
+/// long-gap epistemics.
+///
 /// NUISANCE TRADE (decided, per SG6's err direction): a close encounter + a brief
 /// sensor blip + an agent that genuinely walked away fast CAN latch → operator
 /// clearance. That is the stated direction: immobilize when a person MIGHT be
