@@ -349,6 +349,22 @@ impl VerifierStore {
             [],
         )?;
 
+        // Operator clearance grants (#103 SG6 / operator-console Phase A).
+        // RECORD-ONLY: a row here is a recorded + audit-chained supervisor grant;
+        // it does NOT release any node. Delivery to the node's ClearanceLoop is
+        // Phase B (node transport) — `delivery` stays 'PENDING-NODE-TRANSPORT'.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS clearance_grants (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id        TEXT    NOT NULL,
+                operator_id    TEXT    NOT NULL,
+                granted_at_ms  INTEGER NOT NULL,
+                delivery       TEXT    NOT NULL DEFAULT 'PENDING-NODE-TRANSPORT',
+                created_at_ms  INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
         // AV subsystem metadata: confidence floors, telemetry timestamps, recovery streak.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS av_subsystem_meta (
@@ -1222,6 +1238,78 @@ impl VerifierStore {
         )?;
         crate::audit_chain::AuditChainLinker::append_audit_event_tx(
             &tx, event_type, posture_json, created_at_ms as i64, self.signing_key.as_ref(),
+        )?;
+        tx.commit()
+    }
+
+    /// True iff `node_id` is a registered node — clearance-grant well-formedness
+    /// (operator-console Phase A; mirrors `OperatorClearanceGrant::is_well_formed`'s
+    /// "the node must exist" half).
+    pub fn node_exists(&self, node_id: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE node_id = ?1",
+            params![node_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Persist a supervisor clearance grant — **RECORD-ONLY** (operator-console
+    /// Phase A). One transaction writes the `clearance_grants` row (Phase-B
+    /// pickup, `delivery = PENDING-NODE-TRANSPORT`) AND appends a signed,
+    /// hash-chained `OperatorClearanceGrantIssued` audit event. It records and
+    /// signs the grant; it does **NOT** release the node — delivery to the node's
+    /// `ClearanceLoop` is Phase B. Mirrors `save_posture_event_chained`'s
+    /// table+chain transaction. Does not touch nodes / posture. Returns the row id.
+    pub fn save_clearance_grant_chained(
+        &mut self,
+        node_id: &str,
+        operator_id: &str,
+        granted_at_ms: u64,
+    ) -> Result<i64> {
+        let payload = serde_json::json!({
+            "node_id": node_id,
+            "operator_id": operator_id,
+            "granted_at_ms": granted_at_ms,
+            "delivery": "PENDING-NODE-TRANSPORT",
+        })
+        .to_string();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO clearance_grants
+             (node_id, operator_id, granted_at_ms, delivery, created_at_ms)
+             VALUES (?1, ?2, ?3, 'PENDING-NODE-TRANSPORT', ?4)",
+            params![node_id, operator_id, granted_at_ms as i64, granted_at_ms as i64],
+        )?;
+        let id = tx.last_insert_rowid();
+        crate::audit_chain::AuditChainLinker::append_audit_event_tx(
+            &tx,
+            "OperatorClearanceGrantIssued",
+            &payload,
+            granted_at_ms as i64,
+            self.signing_key.as_ref(),
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Append a signed, hash-chained console audit event with **no** other table
+    /// write — used for REJECTED clearance attempts (unauthorized / malformed).
+    /// The `payload_json` must NEVER contain the supervisor key bytes (outcome +
+    /// reason + attempted ids only).
+    pub fn append_clearance_audit_event(
+        &mut self,
+        event_type: &str,
+        payload_json: &str,
+        created_at_ms: u64,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        crate::audit_chain::AuditChainLinker::append_audit_event_tx(
+            &tx,
+            event_type,
+            payload_json,
+            created_at_ms as i64,
+            self.signing_key.as_ref(),
         )?;
         tx.commit()
     }

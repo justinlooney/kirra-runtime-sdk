@@ -417,6 +417,16 @@ pub async fn enforce_actuator_safety_envelope(
 /// as a follow-up against the safety docs.
 fn is_posture_exempt(path: &str) -> bool {
     matches!(path, "/health" | "/health/live" | "/ready" | "/metrics")
+        // Operator console (#103 SG6 / Phase A): the observe-and-recover plane.
+        // It MUST be reachable regardless of fleet posture — it is exactly the
+        // plane an operator uses to SEE a LockedOut fleet and record a supervisor
+        // clearance grant; a posture-gated console would lock the operator out of
+        // the recovery affordance when it is most needed. Its one mutation
+        // (`POST /console/clearance-grants`) is gated by the supervisor key IN THE
+        // HANDLER (an out-of-band operator action, not a fleet command), not by
+        // fleet posture. Reads under `/console` are QM.
+        || path == "/console"
+        || path.starts_with("/console/")
 }
 
 /// Global command-classification + posture-routing gate.
