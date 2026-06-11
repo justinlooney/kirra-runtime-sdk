@@ -65,7 +65,10 @@ pub use commit_zone::{
     commit_zone_blocked, exit_clearance_verified, CommitZoneCfg, CommitZoneMap, CommitZoneScene,
     ExitClearanceEvidence,
 };
-pub use impact::{is_impact, ImpactCfg, ImpactEvidence, ImpactLatch};
+pub use impact::{
+    is_impact, ClearanceLoop, ClearanceRejection, ClearanceState, ImpactCfg, ImpactEvidence,
+    ImpactLatch, OperatorClearanceGrant, DEFAULT_MAX_GRANT_AGE_MS,
+};
 pub use localization::{
     gate_commit_zone_scene, gate_water_scene, localization_trusted, LocalizationCfg,
     LocalizationIntegrity,
