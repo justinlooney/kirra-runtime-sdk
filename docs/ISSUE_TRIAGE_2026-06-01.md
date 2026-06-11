@@ -1,3 +1,8 @@
+> ⚠️ **HISTORICAL SNAPSHOT (2026-06-01, HEAD `19bcb01`) — substantially superseded.**
+> The live issue tracker is authoritative. Do NOT use this document to determine
+> whether an issue is open, decided, or implemented; multiple rows below were
+> resolved after this date. See the addendum at the end for known resolutions.
+
 # KIRRA Issue Triage — 2026-06-01
 
 **Scope:** all 77 open issues + recent main state (HEAD `19bcb01`).
@@ -183,3 +188,29 @@ No issue was bucketed `NEEDS-TRIAGE` — all 77 had enough evidence to place. **
 - **Zero issues closed.** Close recommendations in §"READY TO CLOSE" are for human approval only.
 - **main untouched.** Triage doc landed on branch `kirra-issue-triage-2026-06-01`; no commits to main.
 - **Code untouched.** This triage pass is read-only against the working tree; the only file written is this document.
+
+---
+
+## Resolved after this snapshot (as of 2026-06-11)
+
+Grounded against `main` (each line cites an on-main deliverable). The live tracker
+remains authoritative — this is a convenience pointer, not a re-triage. Items that
+could not be verified on `main` are omitted rather than asserted.
+
+- **#98** — SG4 water-untraversable veto: `parko/crates/parko-core/src/water.rs` (`water_untraversable_veto`).
+- **#99** — flood-condition → FleetPosture coupling: `src/posture_engine.rs:471` (REQ `flood-posture-coupling`; `flood_condition_active`).
+- **#102** — richer impact / contact: the SG6 latch `parko/crates/parko-core/src/impact.rs` (`ImpactLatch`); the signed audit bridge **#263** (`parko/crates/parko-kirra/src/audit_sink.rs`, `RecordedImpactLatch`); the derived `vanished_object` (`VanishedObjectDetector`, same `impact.rs`).
+- **#103** — clearance loop + reset hardening: `ClearanceLoop` (`impact.rs`, #267); supervisor reset key `KIRRA_SUPERVISOR_RESET_KEY` (#255, `src/`); AoU `AOU-CLEARANCE-AUTH-001` (`docs/safety/ASSUMPTIONS_OF_USE.md`, #268).
+- **#107** — SG5 exit-clearance + stop-inside: `parko/crates/parko-core/src/commit_zone.rs` (`exit_clearance_verified`).
+- **#108** — SG5 non-yielding-agent clearance: `commit_zone.rs` (`non_yielding_clearance`; re-landed via #269).
+- **#117 / #118** — UL4600 safety case / ISO 21434 TARA: `docs/safety/UL4600_SAFETY_CASE.md`; `docs/safety/OCCY_TARA.md`.
+- **#122** — occlusion-aware caution (PO-1 G1): `parko/crates/parko-core/src/rss.rs` (`OcclusionScene` / occlusion cap).
+- **#123** — localization-integrity gate + AoU: `parko/crates/parko-core/src/localization.rs` (`gate_commit_zone_scene`, #264); `AOU-LOCALIZATION-001` (`ASSUMPTIONS_OF_USE.md`, #265).
+- **#126 / #127** — perception / actuation SEooC AoU clauses: `AOU-PERCEPTION-RANGE-001` / `-CLASS-001` / `AOU-ACTUATION-LATENCY-001` in `docs/safety/ASSUMPTIONS_OF_USE.md`.
+- **#128** — SG2 drivable-space ENFORCED: see the in-doc closing note above (still accurate); live call at `crates/kirra-ros2-adapter/src/validation.rs:161`. The GitHub issue close is a separate owner action.
+- **#136** — angular-velocity SOTIF: `docs/safety/ANGULAR_VELOCITY_SOTIF.md` + the `KIRRA-OCCY-ANGULAR-SOTIF-001` registration in `docs/safety/SAFETY_CASE_INDEX.md` (#266).
+- **#146** — runtime-isolation CI guard: `parko/ci/check-runtime-isolation.sh` (wired in `.github/workflows/ci.yml`).
+- **#160** — canonical safety-goal ID scheme: closed by-design — `AEGIS-SG-00X` kept; the `src/` cross-reference comments remain (no piecemeal rename).
+- **CERT-006** — comparator diversity / divergence audit sink: `parko/crates/parko-kirra/src/audit_sink.rs` (`AuditChainLinkerDivergenceSink`); `docs/safety/COMPARATOR_DIVERSITY.md`.
+
+**New since this snapshot — EPIC #270 (iceoryx2 transport / QNX governor lane):** issues #270–#279; the host spike `tools/iceoryx2-spike/` (#273); the transport decision `docs/adr/0006-governor-transport-iceoryx2.md` (#275); the contract-channel spec `docs/safety/HYPERVISOR_CONTRACT_CHANNEL.md` (#278 design half).
