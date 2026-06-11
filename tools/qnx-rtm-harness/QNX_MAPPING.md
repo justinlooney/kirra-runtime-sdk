@@ -87,7 +87,14 @@ TR covers the transport-contract instantiation** the harness exercises.
 
 - **SG-07 replay → `NO-RTM-ID`.** Replay (`sequence == last_accepted`) is the equal
   case of the same SG-014 anti-replay principle as SG-02; same finding — federation
-  TR-014 is not the message bus. Candidate new TR alongside SG-02.
+  TR-014 is not the message bus. The nearest *existing command-path* replay
+  requirement is **TR-016b** (REQUIREMENTS_TRACEABILITY.md:179 — the DDS bridge
+  shall hold no sequence/history cache that would let stale commands replay to
+  reconnecting subscribers). SG-07 still does not trace to it: TR-016b verifies the
+  **absence** of a replay-enabling cache in the bridge (code inspection), whereas
+  SG-07 verifies **active rejection** of a replayed frame at the judge — they are
+  **complementary barriers** (don't-cache vs do-reject), and neither substitutes for
+  the other. Candidate new TR (alongside SG-02) remains needed.
 
 ---
 
