@@ -1,0 +1,30 @@
+# crates/kirra-planner/Cargo.toml
+#
+# Occy autonomy planner — Phase-0 interface lock (#89 / Occy 0.A).
+#
+# This crate PROPOSES trajectories that the EXISTING checker consumes; it does
+# not check. The held line (Phase-0): NO parallel redefinitions of types that
+# already exist on main — import them. The checked trajectory type
+# (`TrajectoryPoint`), the validation entry (`validate_trajectory_slow`, the #131
+# per-trajectory containment path), and the corridor/config/ego types all live in
+# `kirra-ros2-adapter`; `default-features = false` keeps ROS / r2r out of this
+# crate (the adapter's `default = []`). `FleetPosture` is in `kirra-runtime-sdk`.
+#
+# Phase-0 FINDING (surfaced in the PR, not fixed here): the checked trajectory
+# contract + the validation entry living in the *adapter* (a downstream
+# integration crate) inverts the planner -> adapter direction and pulls the whole
+# SDK. Proposal: promote the contract to a lean shared home in a later phase.
+[package]
+name = "kirra-planner"
+version = "0.1.0"
+edition = "2021"
+description = "Occy autonomy planner — Phase-0 interface lock. Proposes trajectories consumed by the existing #131 validation path; does not itself check."
+license-file = "../../COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
+
+[dependencies]
+# The #131 checker entry + the checked trajectory/corridor/config/ego types.
+# default-features = false → no ROS (adapter `default = []`; `ros2` is opt-in).
+kirra-ros2-adapter = { path = "../kirra-ros2-adapter", default-features = false }
+# FleetPosture (verifier.rs) for the posture → planner-mode mapping.
+kirra-runtime-sdk = { path = "../.." }
