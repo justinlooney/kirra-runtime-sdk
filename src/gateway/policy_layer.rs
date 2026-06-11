@@ -413,8 +413,11 @@ pub async fn enforce_actuator_safety_envelope(
 /// initially `None`, which `should_route_command` blocks unconditionally)
 /// and prevents external liveness probes from confirming the process is
 /// alive. The minimal allowlist below is liveness + metrics only;
-/// readiness MAY still reflect posture inside its own handler. Tracked
-/// as a follow-up against the safety docs.
+/// readiness MAY still reflect posture inside its own handler. The full
+/// exemption registry — liveness/observability + the `/console` plane — and the
+/// "`/console` is read-only EXCEPT the supervisor-key-gated grant" invariant are
+/// documented in the safety docs per #306. The set is pinned by
+/// `console_exemption_set_is_pinned` below.
 fn is_posture_exempt(path: &str) -> bool {
     matches!(path, "/health" | "/health/live" | "/ready" | "/metrics")
         // Operator console (#103 SG6 / Phase A): the observe-and-recover plane.
@@ -538,6 +541,33 @@ mod actuator_middleware_tests {
     use super::*;
     use crate::gateway::kinematics_contract::{ProposedVehicleCommand, VehicleKinematicsContract};
     use crate::verifier::FleetPosture;
+
+    /// Pin the posture-exemption set in BOTH directions (#306). The failure modes
+    /// it guards are asymmetric and both bad: silently GAINING an exemption
+    /// un-gates a real path; silently LOSING the `/console` exemption locks the
+    /// operator out of the recovery affordance exactly when the fleet is
+    /// LockedOut — the worst regression this file can have. A refactor of
+    /// `is_posture_exempt` must keep this green.
+    #[test]
+    fn console_exemption_set_is_pinned() {
+        // EXEMPT: liveness/observability + the whole /console plane (reads AND the
+        // supervisor-gated grant — the grant's gate is the key, not posture).
+        for p in [
+            "/health", "/health/live", "/ready", "/metrics",
+            "/console", "/console/fleet", "/console/audit",
+            "/console/escalations", "/console/clearance-grants",
+        ] {
+            assert!(is_posture_exempt(p), "{p} MUST be posture-exempt");
+        }
+        // NOT EXEMPT: prefix-confusion guard — a near-miss must not ride in on a
+        // loose prefix, and a normal gated path stays gated.
+        for p in [
+            "/consoleX", "/console-x", "/consol", "/con",
+            "/fleet/posture", "/attestation/register", "/",
+        ] {
+            assert!(!is_posture_exempt(p), "{p} must NOT be posture-exempt");
+        }
+    }
 
     /// The body cap must comfortably exceed a serialized worst-case
     /// ProposedVehicleCommand so the cap can never reject a legitimate
