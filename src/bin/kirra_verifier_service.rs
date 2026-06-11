@@ -4,9 +4,9 @@
 use axum::{
     extract::{Path, Query, Request, State},
     extract::rejection::JsonRejection,
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
+    response::{sse::{Event, KeepAlive, Sse}, Html, IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
 };
@@ -25,7 +25,7 @@ use kirra_runtime_sdk::verifier::{
 use kirra_runtime_sdk::verifier_store::{DurableWriteError, VerifierStore};
 use kirra_runtime_sdk::posture_cache::{now_ms, ServiceState, POSTURE_CACHE_TTL_MS};
 use kirra_runtime_sdk::posture_engine_v2::{resolve_posture_with_reason, LockoutReason};
-use kirra_runtime_sdk::security::admin_token_ok;
+use kirra_runtime_sdk::security::{admin_token_ok, constant_time_compare};
 use kirra_runtime_sdk::action_filter::{evaluate_action_claim, ActionClaim};
 use kirra_runtime_sdk::protocol_adapter::{
     evaluate_unified_industrial_request, UnifiedIndustrialRequest,
@@ -2629,6 +2629,265 @@ async fn main() {
         .expect("server error");
 }
 
+// ===========================================================================
+// Operator console — Phase A (#103 SG6).
+//
+// A real UI served by this service against real store data, plus the ONE
+// authenticated inbound affordance: recording a supervisor clearance grant.
+//
+// THE HONESTY RULE (Phase A): nothing here releases a vehicle. A grant is
+// RECORDED AND SIGNED; release happens only when Phase B delivers it to the
+// node's `ClearanceLoop`. The response, the audit payload, and the UI all say
+// so (`delivery: pending-phase-b` / `PENDING-NODE-TRANSPORT`).
+//
+// Reachability: the `/console` plane is posture-EXEMPT (see
+// `gateway::policy_layer::is_posture_exempt`) — it must work *during* LockedOut,
+// which is exactly when an operator needs it. The reads are QM; the grant is
+// gated by the supervisor key below.
+// ===========================================================================
+
+/// GET /console — the operator console UI. One self-contained static file
+/// embedded at build time (`include_str!`): inline CSS+JS, no CDN, no build
+/// step — it works air-gapped.
+async fn console_html() -> impl IntoResponse {
+    Html(include_str!("../../static/console.html"))
+}
+
+/// GET /console/fleet — per-node posture summary from the durable store
+/// (`load_nodes`). QM read. `note` is the Untrusted reason carried on the node's
+/// trust state (the latest trust note); `null` for Trusted/Unknown.
+async fn console_fleet(State(svc): State<Arc<ServiceState>>) -> impl IntoResponse {
+    let nodes = match svc.app.store.lock() {
+        Ok(store) => match store.load_nodes() {
+            Ok(n) => n,
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "load_nodes failed" }))).into_response()
+            }
+        },
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "store lock poisoned" }))).into_response()
+        }
+    };
+    let fleet: Vec<_> = nodes
+        .iter()
+        .map(|n| {
+            let (posture, note) = match &n.status {
+                NodeTrustState::Trusted => ("Trusted", None),
+                NodeTrustState::Untrusted(reason) => ("Untrusted", Some(reason.clone())),
+                NodeTrustState::Unknown => ("Unknown", None),
+            };
+            json!({
+                "node_id": n.node_id,
+                "posture": posture,
+                "note": note,
+                "last_seen_ms": n.last_trust_update_ms,
+            })
+        })
+        .collect();
+    Json(json!({ "fleet": fleet, "total": fleet.len() })).into_response()
+}
+
+#[derive(Deserialize)]
+struct ConsoleAuditQuery {
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+/// GET /console/audit?limit=&offset= — passthrough to `load_audit_chain_page`.
+///
+/// GROUNDING NOTE: `load_audit_chain_page` is **offset-paginated** (DESC by id),
+/// not before-seq cursored. The console pages by offset (the "load older" control
+/// increments `offset` over the DESC feed — the same backward paging the original
+/// `?before=<seq>` intent describes). Returns exactly what the page rows carry
+/// (sequence, event_type, payload, signature key-id, per-row signature status,
+/// and the page-level `chain_intact` flag) — no invented fields. QM read.
+async fn console_audit(
+    State(svc): State<Arc<ServiceState>>,
+    Query(params): Query<ConsoleAuditQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).min(500);
+    let offset = params.offset.unwrap_or(0);
+    let vk = svc.audit_verifying_key.as_ref();
+    match svc.app.store.lock() {
+        Ok(store) => match store.load_audit_chain_page(limit, offset, vk) {
+            Ok(page) => Json(page).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "error": "audit query failed" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+}
+
+/// GET /console/escalations — derived view of OPEN SG6 escalations.
+///
+/// CONSERVATIVE SUPERSET + AMBIGUITY NOTE: the SG6 impact lifecycle events
+/// (`ImpactDetected` / `ImpactEscalationRaised` / `ImpactCleared`, parko-kirra
+/// `audit_sink`, #102/#103) DO land in this audit chain — but their payloads
+/// (`ImpactDetectedPayload`) carry **no node/asset id**, so per-node attribution
+/// is NOT derivable from the chain alone. This view therefore returns the
+/// fleet-level OPEN superset over a single timeline: scanning most-recent-first,
+/// the detect/raise events seen before the first `ImpactCleared` are "open"
+/// (events since the last clear). It passes through whatever each event row
+/// carries — no fabricated node_id. Per-node attribution is a Phase-B / event-
+/// taxonomy enhancement. QM read.
+async fn console_escalations(State(svc): State<Arc<ServiceState>>) -> impl IntoResponse {
+    let vk = svc.audit_verifying_key.as_ref();
+    let page = match svc.app.store.lock() {
+        Ok(store) => match store.load_audit_chain_page(1000, 0, vk) {
+            Ok(p) => p,
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "audit query failed" }))).into_response()
+            }
+        },
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "store lock poisoned" }))).into_response()
+        }
+    };
+    let mut open = Vec::new();
+    for e in &page.entries {
+        let v = serde_json::to_value(e).unwrap_or(serde_json::Value::Null);
+        let et = v.get("event_type").and_then(|x| x.as_str()).unwrap_or("");
+        if et == "ImpactCleared" {
+            break; // most-recent clear closes the single-timeline superset
+        }
+        if et == "ImpactDetected" || et == "ImpactEscalationRaised" {
+            open.push(v);
+        }
+    }
+    Json(json!({
+        "open_escalations": open,
+        "count": open.len(),
+        "note": "fleet-level superset — impact events carry no node id (see handler doc); attribution is Phase B",
+    }))
+    .into_response()
+}
+
+/// Pure supervisor-key decision (testable without env — INV-13 forbids `set_var`
+/// in multithreaded tests). REUSES the #255 mechanism: the value is the
+/// `KIRRA_SUPERVISOR_RESET_KEY`, constant-time compared. Fail-closed:
+/// unconfigured / empty / `> 64` bytes (INVARIANT #7) → 503; missing or
+/// mismatched provided key → 401.
+fn supervisor_key_ok(provided: Option<&str>, configured: Option<&str>) -> Result<(), StatusCode> {
+    let configured = configured.filter(|v| !v.is_empty()).ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if configured.len() > 64 {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let provided = provided.ok_or(StatusCode::UNAUTHORIZED)?;
+    if !constant_time_compare(provided.as_bytes(), configured.as_bytes()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
+}
+
+/// Env-reading wrapper: pulls `KIRRA_SUPERVISOR_RESET_KEY` (env-only, INVARIANT
+/// #7) and the `x-kirra-supervisor-key` header, then delegates to
+/// [`supervisor_key_ok`].
+fn check_supervisor_key(headers: &HeaderMap) -> Result<(), StatusCode> {
+    let configured = std::env::var("KIRRA_SUPERVISOR_RESET_KEY").ok();
+    let provided = headers
+        .get("x-kirra-supervisor-key")
+        .and_then(|h| h.to_str().ok());
+    supervisor_key_ok(provided, configured.as_deref())
+}
+
+#[derive(Deserialize)]
+struct ClearanceGrantRequest {
+    node_id: String,
+    operator_id: String,
+}
+
+/// POST /console/clearance-grants — the ONE inbound console affordance.
+///
+/// **RECORD-ONLY (Phase A):** records + signs a supervisor clearance grant; it
+/// does NOT release the node (delivery to the node `ClearanceLoop` is Phase B).
+/// Auth = the #255 supervisor key (`x-kirra-supervisor-key`). The server stamps
+/// `granted_at_ms` from ITS clock — the client never supplies a timestamp (a
+/// client time would re-open the future-dating hole the loop's validation
+/// closes). Never mutates posture.
+async fn console_clearance_grant(
+    State(svc): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+    Json(req): Json<ClearanceGrantRequest>,
+) -> impl IntoResponse {
+    let now = now_ms();
+
+    // 1. Supervisor authorization (reused #255 mechanism).
+    if let Err(code) = check_supervisor_key(&headers) {
+        // A *provided-but-rejected* attempt (401) is audited; a server-misconfig
+        // (503, key unset) is not an operator attempt. Never record key bytes.
+        if code == StatusCode::UNAUTHORIZED {
+            let payload = json!({
+                "reason": "unauthorized",
+                "node_id": req.node_id,
+                "operator_id": req.operator_id,
+            })
+            .to_string();
+            if let Ok(mut store) = svc.app.store.lock() {
+                let _ = store.append_clearance_audit_event(
+                    "OperatorClearanceGrantRejected", &payload, now);
+            }
+        }
+        return (code,
+                Json(json!({ "status": "rejected", "reason": "supervisor authorization failed" })))
+            .into_response();
+    }
+
+    // 2. Well-formedness, server-side (mirrors OperatorClearanceGrant::is_well_formed).
+    let operator_id = req.operator_id.trim();
+    if operator_id.is_empty() {
+        let payload = json!({ "reason": "empty_operator_id", "node_id": req.node_id }).to_string();
+        if let Ok(mut store) = svc.app.store.lock() {
+            let _ = store.append_clearance_audit_event(
+                "OperatorClearanceGrantRejected", &payload, now);
+        }
+        return (StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "status": "rejected", "reason": "operator_id must be non-empty" })))
+            .into_response();
+    }
+    let registered = match svc.app.store.lock() {
+        Ok(store) => store.node_exists(&req.node_id).unwrap_or(false),
+        Err(_) => false,
+    };
+    if !registered {
+        let payload = json!({
+            "reason": "unregistered_node",
+            "node_id": req.node_id,
+            "operator_id": operator_id,
+        })
+        .to_string();
+        if let Ok(mut store) = svc.app.store.lock() {
+            let _ = store.append_clearance_audit_event(
+                "OperatorClearanceGrantRejected", &payload, now);
+        }
+        return (StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "status": "rejected", "reason": "node_id is not a registered node" })))
+            .into_response();
+    }
+
+    // 3. Record + sign — RECORD-ONLY. Delivery is Phase B; posture is untouched.
+    match svc.app.store.lock() {
+        Ok(mut store) => match store.save_clearance_grant_chained(&req.node_id, operator_id, now) {
+            Ok(_id) => (StatusCode::OK, Json(json!({
+                "status": "recorded",
+                "delivery": "pending-phase-b",
+                "node_id": req.node_id,
+                "operator_id": operator_id,
+                "granted_at_ms": now,
+                "note": "grant recorded and signed; the vehicle is NOT released — delivery to the node ClearanceLoop is Phase B",
+            }))).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "status": "error", "reason": "persist failed" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "status": "error", "reason": "store lock poisoned" }))).into_response(),
+    }
+}
+
 /// Assembles the complete production router from a fully-initialized
 /// `ServiceState`. Extracted verbatim from `main()` (issue #72) so the EXACT
 /// assembled router can be exercised by the binary-internal posture-gate test
@@ -2703,6 +2962,18 @@ fn build_app(svc_state: Arc<ServiceState>) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Operator console — Phase A (#103 SG6). Reads are QM; the one mutation
+    // (clearance-grant recording) is gated by the supervisor key IN the handler,
+    // so this group carries no auth layer. The whole `/console` plane is
+    // posture-exempt (gateway::policy_layer::is_posture_exempt) so it stays
+    // reachable during LockedOut — the posture it exists to recover from.
+    let console_routes = Router::new()
+        .route("/console", get(console_html))
+        .route("/console/fleet", get(console_fleet))
+        .route("/console/audit", get(console_audit))
+        .route("/console/escalations", get(console_escalations))
+        .route("/console/clearance-grants", post(console_clearance_grant));
+
     Router::new()
         .merge(probe_routes)
         .merge(identity_gated_routes)
@@ -2710,6 +2981,7 @@ fn build_app(svc_state: Arc<ServiceState>) -> Router {
         .merge(actuator_routes)
         .merge(attestation_routes)
         .merge(read_routes)
+        .merge(console_routes)
         .with_state(svc_state.clone())
         .layer(cors)
         // Outermost layer: command-classification + posture-routing gate.
@@ -3639,5 +3911,210 @@ mod systemd_notify_tests {
         let mut buf = [0u8; 64];
         let n = listener.recv(&mut buf).expect("recv");
         assert_eq!(&buf[..n], b"READY=1", "the exact sd_notify datagram must be delivered");
+    }
+}
+
+// ===========================================================================
+// Operator console — Phase A tests (#103 SG6).
+// ===========================================================================
+#[cfg(test)]
+mod console_phase_a_tests {
+    use super::{build_app, supervisor_key_ok};
+
+    use std::sync::Arc;
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt; // oneshot
+
+    use kirra_runtime_sdk::posture_cache::{ServiceState, SharedPostureCache};
+    use kirra_runtime_sdk::verifier::{
+        AppState, NodeTrustState, RegisteredNode, VerifierOperationMode,
+    };
+    use kirra_runtime_sdk::verifier_store::VerifierStore;
+
+    fn build_state() -> Arc<ServiceState> {
+        let store = VerifierStore::new(":memory:").expect("in-memory store");
+        let app = Arc::new(AppState::new(store, VerifierOperationMode::Active));
+        let posture_cache: SharedPostureCache = Arc::new(std::sync::RwLock::new(None));
+        Arc::new(ServiceState {
+            app,
+            posture_cache,
+            audit_verifying_key: None,
+            fabric_router: Arc::new(kirra_runtime_sdk::fabric::router::FabricRouter::new()),
+            fabric_telemetry: Arc::new(kirra_runtime_sdk::fabric::telemetry::FabricTelemetry::new()),
+            fabric_causal_log: Arc::new(
+                kirra_runtime_sdk::fabric::causal_log::FabricCausalLog::new_in_memory(None),
+            ),
+            posture_engine_tx: std::sync::OnceLock::new(),
+            perception_cap: kirra_runtime_sdk::gateway::perception_monitor::empty_perception_cap(),
+            perception_monitor_enabled: false,
+        })
+    }
+
+    fn seed_node(svc: &Arc<ServiceState>, node_id: &str) {
+        let node = RegisteredNode {
+            node_id: node_id.to_string(),
+            status: NodeTrustState::Untrusted("post-collision latch".to_string()),
+            registered_at_ms: 1,
+            last_trust_update_ms: 1_700_000_000_000,
+            ak_public_pem: None,
+            expected_pcr16_digest_hex: None,
+        };
+        svc.app.persist_and_insert_node(node).expect("seed node");
+    }
+
+    async fn get(svc: Arc<ServiceState>, path: &str) -> (StatusCode, String) {
+        let resp = build_app(svc)
+            .oneshot(Request::builder().method("GET").uri(path).body(Body::empty()).unwrap())
+            .await
+            .expect("router");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn console_html_is_served() {
+        let (status, body) = get(build_state(), "/console").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("OPERATOR CONSOLE"), "the embedded UI must be served");
+    }
+
+    #[tokio::test]
+    async fn console_fleet_returns_seeded_node() {
+        let svc = build_state();
+        seed_node(&svc, "robot-01");
+        let (status, body) = get(svc, "/console/fleet").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("robot-01"), "fleet view must list the seeded node");
+        assert!(body.contains("Untrusted"), "posture mapped from NodeTrustState");
+        assert!(body.contains("post-collision latch"), "the Untrusted note carries through");
+    }
+
+    #[tokio::test]
+    async fn console_audit_returns_a_page() {
+        let (status, body) = get(build_state(), "/console/audit?limit=10").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"entries\""), "audit page passthrough");
+        assert!(body.contains("\"chain_intact\""), "the chain-verified flag is exposed");
+    }
+
+    #[tokio::test]
+    async fn grant_without_supervisor_env_is_fail_closed_503() {
+        // No KIRRA_SUPERVISOR_RESET_KEY in the test env → fail-closed 503 (never
+        // a silent accept). The 401/422 paths require the env set, which a
+        // multithreaded test cannot do (INV-13); those are covered by the pure
+        // `supervisor_key_ok` truth table + the store-level audit/grant tests.
+        let svc = build_state();
+        let resp = build_app(svc)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/console/clearance-grants")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"node_id":"robot-01","operator_id":"alice"}"#))
+                    .unwrap(),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn console_plane_is_posture_exempt_with_cold_cache() {
+        // `build_state()` has a COLD (None) posture cache. A non-exempt READ
+        // would be denied 503 by the posture gate on a cold cache (fail-closed) —
+        // the `/console` plane returns 200, proving it is posture-exempt
+        // (reachable to observe and recover, e.g. during LockedOut). Regression
+        // lock for `gateway::policy_layer::is_posture_exempt`.
+        let (status, _) = get(build_state(), "/console/fleet").await;
+        assert_eq!(status, StatusCode::OK, "the /console plane must be posture-exempt");
+    }
+
+    #[test]
+    fn supervisor_key_ok_truth_table() {
+        // unconfigured / empty / over-length → 503 (fail-closed, INV-7)
+        assert_eq!(supervisor_key_ok(Some("k"), None), Err(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(supervisor_key_ok(Some("k"), Some("")), Err(StatusCode::SERVICE_UNAVAILABLE));
+        let too_long = "x".repeat(65);
+        assert_eq!(supervisor_key_ok(Some("x"), Some(&too_long)), Err(StatusCode::SERVICE_UNAVAILABLE));
+        // configured but no / wrong key → 401 ("no auth → 401")
+        assert_eq!(supervisor_key_ok(None, Some("secret")), Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(supervisor_key_ok(Some("wrong"), Some("secret")), Err(StatusCode::UNAUTHORIZED));
+        // correct key → Ok
+        assert_eq!(supervisor_key_ok(Some("secret"), Some("secret")), Ok(()));
+    }
+
+    #[test]
+    fn valid_grant_recorded_in_chain_with_pending_marker() {
+        let store = VerifierStore::new(":memory:").expect("store");
+        let app = AppState::new(store, VerifierOperationMode::Active);
+        {
+            let mut s = app.store.lock().unwrap();
+            s.save_clearance_grant_chained("robot-01", "alice", 1_700_000_000_000)
+                .expect("record grant");
+        }
+        let page = app.store.lock().unwrap().load_audit_chain_page(50, 0, None).expect("page");
+        let found = page.entries.iter().any(|e| {
+            let v = serde_json::to_value(e).unwrap();
+            v.get("event_type").and_then(|x| x.as_str()) == Some("OperatorClearanceGrantIssued")
+                && serde_json::to_string(&v).unwrap().contains("PENDING-NODE-TRANSPORT")
+        });
+        assert!(found, "the grant must be a signed chain event with the PENDING delivery marker");
+    }
+
+    #[test]
+    fn rejected_attempt_is_audited() {
+        let store = VerifierStore::new(":memory:").expect("store");
+        let app = AppState::new(store, VerifierOperationMode::Active);
+        {
+            let mut s = app.store.lock().unwrap();
+            s.append_clearance_audit_event(
+                "OperatorClearanceGrantRejected",
+                r#"{"reason":"empty_operator_id","node_id":"robot-01"}"#,
+                1_700_000_000_000,
+            )
+            .expect("audit reject");
+        }
+        let page = app.store.lock().unwrap().load_audit_chain_page(50, 0, None).expect("page");
+        assert!(
+            page.entries.iter().any(|e| serde_json::to_value(e).unwrap()
+                .get("event_type").and_then(|x| x.as_str()) == Some("OperatorClearanceGrantRejected")),
+            "a rejected attempt must leave a signed audit row"
+        );
+    }
+
+    #[test]
+    fn grant_never_mutates_posture() {
+        // The Phase-A honesty proof: recording a grant changes NO posture.
+        let store = VerifierStore::new(":memory:").expect("store");
+        let app = AppState::new(store, VerifierOperationMode::Active);
+        seed_node_app(&app, "robot-01");
+
+        let before = app.calculate_posture("robot-01");
+        {
+            let mut s = app.store.lock().unwrap();
+            s.save_clearance_grant_chained("robot-01", "alice", 1_700_000_000_000)
+                .expect("record grant");
+        }
+        let after = app.calculate_posture("robot-01");
+        assert_eq!(
+            serde_json::to_string(&before).unwrap(),
+            serde_json::to_string(&after).unwrap(),
+            "a recorded grant must NOT mutate posture (Phase A records; it does not release)"
+        );
+    }
+
+    fn seed_node_app(app: &AppState, node_id: &str) {
+        let node = RegisteredNode {
+            node_id: node_id.to_string(),
+            status: NodeTrustState::Untrusted("post-collision latch".to_string()),
+            registered_at_ms: 1,
+            last_trust_update_ms: 1_700_000_000_000,
+            ak_public_pem: None,
+            expected_pcr16_digest_hex: None,
+        };
+        app.persist_and_insert_node(node).expect("seed node");
     }
 }

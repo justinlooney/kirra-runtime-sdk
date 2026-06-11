@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KIRRA Operator Console — Phase A</title>
+<!--
+  Operator console, Phase A (#103 SG6). ONE self-contained file: inline CSS+JS,
+  no CDN, no build step — works air-gapped.
+
+  HONESTY RULE: this UI never claims more than the system did. The clearance
+  grant is RECORDED AND SIGNED; the vehicle is NOT released here. Release happens
+  when Phase B delivers the grant to the node's ClearanceLoop. No recovery
+  animation, no "released" state — a grant renders as
+  "GRANT RECORDED — DELIVERY PENDING (PHASE B)".
+
+  The supervisor key is held in memory for the session only — NEVER localStorage.
+-->
+<style>
+  :root { --bg:#0b0e13; --panel:#141a23; --line:#222c39; --ink:#d7e0ea; --dim:#8595a8;
+          --ok:#2ec27e; --warn:#e0a52b; --bad:#e0533b; --accent:#4a86e8; --pend:#7c8aa0; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+         background:var(--bg); color:var(--ink); }
+  header { display:flex; align-items:center; gap:18px; padding:12px 18px;
+           background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; letter-spacing:.5px; }
+  .badge { padding:2px 8px; border-radius:10px; font-size:11px; border:1px solid var(--line); color:var(--dim); }
+  .chainhead { color:var(--accent); }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:14px; padding:14px; }
+  @media (max-width:880px){ main { grid-template-columns:1fr; } }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; min-width:0; }
+  section h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--dim);
+               margin:0 0 10px; border-bottom:1px solid var(--line); padding-bottom:6px; }
+  .tiles { display:flex; flex-wrap:wrap; gap:8px; }
+  .tile { border:1px solid var(--line); border-radius:6px; padding:8px 10px; min-width:150px; }
+  .tile .nid { font-weight:600; }
+  .tile .note { color:var(--dim); font-size:12px; word-break:break-word; }
+  .p-Trusted { border-left:3px solid var(--ok); }
+  .p-Untrusted { border-left:3px solid var(--warn); }
+  .p-Unknown { border-left:3px solid var(--pend); }
+  .pill { display:inline-block; padding:1px 7px; border-radius:9px; font-size:11px; }
+  .pill.Trusted{ background:rgba(46,194,126,.15); color:var(--ok); }
+  .pill.Untrusted{ background:rgba(224,165,43,.15); color:var(--warn); }
+  .pill.Unknown{ background:rgba(124,138,160,.15); color:var(--pend); }
+  .feed { max-height:340px; overflow:auto; }
+  .row { border-bottom:1px solid var(--line); padding:6px 0; font-size:12px; }
+  .row .et { color:var(--accent); }
+  .row .sig-verified { color:var(--ok); } .row .sig-unsigned,.row .sig-unverified { color:var(--warn); }
+  .row pre { margin:4px 0 0; color:var(--dim); white-space:pre-wrap; word-break:break-word; font-size:11px; }
+  label { display:block; margin:8px 0 3px; color:var(--dim); font-size:12px; }
+  input { width:100%; background:var(--bg); border:1px solid var(--line); color:var(--ink);
+          border-radius:5px; padding:7px; font:inherit; }
+  button { margin-top:12px; background:var(--accent); color:#fff; border:0; border-radius:5px;
+           padding:8px 14px; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .result { margin-top:10px; padding:9px; border-radius:5px; font-size:13px; display:none; }
+  .result.recorded { display:block; background:rgba(74,134,232,.12); border:1px solid var(--accent); }
+  .result.rejected { display:block; background:rgba(224,83,59,.12); border:1px solid var(--bad); color:var(--bad); }
+  .result .pend { color:var(--warn); font-weight:600; }
+  .empty { color:var(--dim); font-style:italic; }
+  footer { padding:12px 18px; color:var(--dim); font-size:11px; border-top:1px solid var(--line);
+           background:var(--panel); line-height:1.6; }
+  .err { color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>KIRRA · OPERATOR CONSOLE</h1>
+  <span class="badge">PHASE A · read views + authenticated grant recording</span>
+  <span class="badge">chain head: <span class="chainhead" id="chainhead">—</span></span>
+  <span class="badge" id="chainint">chain: —</span>
+  <span class="badge" id="conn">polling…</span>
+</header>
+
+<main>
+  <section>
+    <h2>Fleet posture</h2>
+    <div class="tiles" id="fleet"><span class="empty">loading…</span></div>
+  </section>
+
+  <section>
+    <h2>Escalation docket (SG6, open)</h2>
+    <div id="escalations"><span class="empty">loading…</span></div>
+  </section>
+
+  <section>
+    <h2>Supervisor clearance grant <span class="badge">RECORD-ONLY · delivery = Phase B</span></h2>
+    <form id="grantform" autocomplete="off">
+      <label for="node_id">Node id (must be registered)</label>
+      <input id="node_id" name="node_id" required>
+      <label for="operator_id">Operator id</label>
+      <input id="operator_id" name="operator_id" required>
+      <label for="supkey">Supervisor key (held in memory for this session only — never stored)</label>
+      <input id="supkey" name="supkey" type="password" required>
+      <button type="submit" id="grantbtn">Record clearance grant</button>
+    </form>
+    <div class="result" id="grantresult"></div>
+  </section>
+
+  <section>
+    <h2>Audit chain feed</h2>
+    <div class="feed" id="audit"><span class="empty">loading…</span></div>
+  </section>
+</main>
+
+<footer>
+  <strong>QM domain.</strong> This console is a <em>read-only view</em> of the
+  verifier's real store, plus <em>one</em> authenticated affordance: recording a
+  supervisor clearance grant. It does not — and in Phase A cannot — release a
+  vehicle: a grant is recorded and cryptographically signed into the audit chain;
+  delivery to the node's <code>ClearanceLoop</code> is Phase B. The governor
+  judges; this UI does not. Posture-exempt so it stays reachable during LockedOut.
+</footer>
+
+<script>
+"use strict";
+const POLL_MS = 4000;
+const enc = (s) => String(s == null ? "" : s);
+function esc(s){ return enc(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function getJSON(path){
+  const r = await fetch(path, { headers: { "accept":"application/json" } });
+  if(!r.ok) throw new Error(path+" → "+r.status);
+  return r.json();
+}
+
+function renderFleet(d){
+  const el = document.getElementById("fleet");
+  const fleet = (d && d.fleet) || [];
+  if(!fleet.length){ el.innerHTML = '<span class="empty">no registered nodes</span>'; return; }
+  el.innerHTML = fleet.map(n => {
+    const p = esc(n.posture||"Unknown");
+    const note = n.note ? '<div class="note">'+esc(n.note)+'</div>' : '';
+    const seen = n.last_seen_ms ? new Date(Number(n.last_seen_ms)).toISOString().replace('T',' ').replace('Z','') : '—';
+    return '<div class="tile p-'+p+'"><div class="nid">'+esc(n.node_id)+
+           ' <span class="pill '+p+'">'+p+'</span></div>'+note+
+           '<div class="note">last seen: '+esc(seen)+'</div></div>';
+  }).join("");
+}
+
+function payloadOf(e){
+  // field-tolerant: the page rows carry whatever they carry — show what's there.
+  return e.event_json ?? e.payload ?? e.posture_json ?? null;
+}
+function sigOf(e){ return e.signature_status ?? (e.signature ? "signed" : "unsigned"); }
+
+function renderEscalations(d){
+  const el = document.getElementById("escalations");
+  const open = (d && d.open_escalations) || [];
+  if(!open.length){ el.innerHTML = '<span class="empty">no open escalations</span>'; return; }
+  el.innerHTML = '<div class="note" style="color:var(--dim);font-size:11px;margin-bottom:6px">'+
+    esc((d && d.note) || "")+'</div>' + open.map(e => {
+      const pl = payloadOf(e);
+      return '<div class="row"><span class="et">'+esc(e.event_type||"?")+'</span>'+
+        (e.sequence!=null?(' · seq '+esc(e.sequence)):'')+
+        (pl?('<pre>'+esc(typeof pl==="string"?pl:JSON.stringify(pl))+'</pre>'):'')+'</div>';
+  }).join("");
+}
+
+function renderAudit(d){
+  const el = document.getElementById("audit");
+  const entries = (d && d.entries) || [];
+  const head = entries[0] || null;
+  document.getElementById("chainhead").textContent = head ? (head.sequence ?? head.id ?? "—") : "—";
+  const ci = document.getElementById("chainint");
+  if(d && typeof d.chain_intact === "boolean"){
+    ci.textContent = "chain: " + (d.chain_intact ? "verified ✓" : "BROKEN ✗");
+    ci.style.color = d.chain_intact ? "var(--ok)" : "var(--bad)";
+  }
+  if(!entries.length){ el.innerHTML = '<span class="empty">no audit entries</span>'; return; }
+  el.innerHTML = entries.map(e => {
+    const sig = esc(sigOf(e)); const pl = payloadOf(e);
+    const sigcls = /verif/i.test(sig) ? "sig-verified" : (/unsigned/i.test(sig)?"sig-unsigned":"sig-unverified");
+    return '<div class="row"><span class="et">'+esc(e.event_type||"?")+'</span>'+
+      (e.sequence!=null?(' · seq '+esc(e.sequence)):'')+
+      ' · <span class="'+sigcls+'">'+sig+'</span>'+
+      (e.key_id?(' · key '+esc(e.key_id)):'')+
+      (pl?('<pre>'+esc(typeof pl==="string"?pl:JSON.stringify(pl))+'</pre>'):'')+'</div>';
+  }).join("");
+}
+
+async function poll(){
+  const conn = document.getElementById("conn");
+  try {
+    const [fleet, esc_, audit] = await Promise.all([
+      getJSON("/console/fleet"), getJSON("/console/escalations"), getJSON("/console/audit?limit=50"),
+    ]);
+    renderFleet(fleet); renderEscalations(esc_); renderAudit(audit);
+    conn.textContent = "updated " + new Date().toLocaleTimeString(); conn.classList.remove("err");
+  } catch(e){ conn.textContent = "poll error: "+e.message; conn.classList.add("err"); }
+}
+
+document.getElementById("grantform").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const btn = document.getElementById("grantbtn");
+  const res = document.getElementById("grantresult");
+  const node_id = document.getElementById("node_id").value.trim();
+  const operator_id = document.getElementById("operator_id").value.trim();
+  const supkey = document.getElementById("supkey").value; // in-memory only; never stored
+  btn.disabled = true; res.className = "result"; res.style.display = "none";
+  try {
+    const r = await fetch("/console/clearance-grants", {
+      method: "POST",
+      headers: { "content-type":"application/json", "x-kirra-supervisor-key": supkey },
+      body: JSON.stringify({ node_id, operator_id }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if(r.ok && body.status === "recorded"){
+      res.className = "result recorded";
+      res.innerHTML = '<span class="pend">GRANT RECORDED — DELIVERY PENDING (PHASE B)</span><br>'+
+        'node <b>'+esc(body.node_id)+'</b> · operator <b>'+esc(body.operator_id)+'</b> · '+
+        'granted_at '+esc(body.granted_at_ms)+'<br>'+
+        '<span style="color:var(--dim)">'+esc(body.note||"")+'</span>';
+      document.getElementById("supkey").value = ""; // drop the key from the field
+      poll();
+    } else {
+      res.className = "result rejected";
+      res.innerHTML = 'REJECTED ('+r.status+'): '+esc(body.reason || "request refused");
+    }
+  } catch(e){
+    res.className = "result rejected"; res.innerHTML = "REJECTED: "+esc(e.message);
+  } finally {
+    document.getElementById("supkey").value = ""; // never retain the key
+    btn.disabled = false;
+  }
+});
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
