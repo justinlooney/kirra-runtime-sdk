@@ -22,7 +22,10 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use kirra_runtime_sdk::verifier_store::VerifierStore;
-use parko_core::{ImpactCfg, ImpactEvidence, ImpactLatch};
+use parko_core::{
+    ClearanceLoop, ClearanceRejection, ClearanceState, ImpactCfg, ImpactEvidence, ImpactLatch,
+    OperatorClearanceGrant,
+};
 
 use crate::comparator::{DivergenceEvent, DivergenceEventSink, InMemoryDivergenceSink};
 
@@ -264,6 +267,12 @@ pub fn select_divergence_sink(
 pub const IMPACT_DETECTED_EVENT_TYPE: &str = "ImpactDetected";
 /// The audit-log event type for an impact-latch CLEARANCE (true→false).
 pub const IMPACT_CLEARED_EVENT_TYPE: &str = "ImpactCleared";
+/// The audit-log event type for the once-per-incident operator-escalation edge
+/// (#103). PascalCase, same table/convention.
+pub const IMPACT_ESCALATION_RAISED_EVENT_TYPE: &str = "ImpactEscalationRaised";
+/// The audit-log event type for a REJECTED clearance attempt (#103) — a
+/// malformed grant, or a clear attempt with nothing to clear.
+pub const IMPACT_CLEARANCE_REJECTED_EVENT_TYPE: &str = "ImpactClearanceRejected";
 
 /// Audit source tag for SG6 impact events (the `governor_comparator` analogue).
 const IMPACT_AUDIT_SOURCE: &str = "governor_impact_latch";
@@ -303,23 +312,48 @@ impl ImpactDetectedPayload {
     }
 }
 
-/// The note recorded with an `ImpactCleared` event — the clearance source.
+/// The note recorded with an `ImpactCleared` event — the clearance source. On the
+/// #103 clearance loop this carries the clearing operator's id (an audit subject).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ImpactClearedPayload {
-    /// A short note on WHAT cleared the latch. The authenticated-clearance
-    /// mechanism (#103) is a deferred follow-up; this records whatever clearance
-    /// source the caller asserts.
+    /// A short note on WHAT cleared the latch. For the #103 loop this is the
+    /// clearing operator's id. The authenticated-clearance mechanism itself is a
+    /// named-boundary deferral — parko records the asserted source, it does not
+    /// authenticate it (auth lives in the verifier / #255 reset key).
     pub clearance_source: String,
+}
+
+/// The context recorded with an `ImpactEscalationRaised` event (#103) — the
+/// once-per-incident operator-intervention-required signal.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImpactEscalationPayload {
+    /// A short, fixed description of why the escalation was raised.
+    pub detail: String,
+}
+
+/// The context recorded with an `ImpactClearanceRejected` event (#103). Carries
+/// the rejection reason and the operator id (an audit SUBJECT — id is fine to
+/// record; there is no operator token at this layer to leak).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImpactClearanceRejectedPayload {
+    /// The clearing operator's id from the rejected grant (audit subject).
+    pub operator_id: String,
+    /// The stable rejection reason code (`malformed_grant` / `not_immobilized`).
+    pub reason: String,
 }
 
 /// Infallible sink for SG6 impact-latch transitions. `record_*` NEVER returns an
 /// error and NEVER blocks the latch — a failed audit write is the sink's problem,
-/// not the motion veto's (see [`RecordedImpactLatch`]).
+/// not the motion veto's (see [`RecordedImpactLatch`] / [`RecordedClearanceLoop`]).
 pub trait ImpactEventSink: Send + Sync {
     /// Record a false→true latch transition (exactly once per rising edge).
     fn record_detected(&self, payload: &ImpactDetectedPayload);
     /// Record a true→false clearance (exactly once per falling edge).
     fn record_cleared(&self, payload: &ImpactClearedPayload);
+    /// Record the once-per-incident operator-escalation edge (#103).
+    fn record_escalation_raised(&self, payload: &ImpactEscalationPayload);
+    /// Record a rejected clearance attempt (#103).
+    fn record_clearance_rejected(&self, payload: &ImpactClearanceRejectedPayload);
 }
 
 /// Durable, signed [`ImpactEventSink`] — the SG6 analogue of
@@ -373,6 +407,12 @@ impl ImpactEventSink for ImpactAuditSink {
     fn record_cleared(&self, payload: &ImpactClearedPayload) {
         self.record_event(IMPACT_CLEARED_EVENT_TYPE, payload);
     }
+    fn record_escalation_raised(&self, payload: &ImpactEscalationPayload) {
+        self.record_event(IMPACT_ESCALATION_RAISED_EVENT_TYPE, payload);
+    }
+    fn record_clearance_rejected(&self, payload: &ImpactClearanceRejectedPayload) {
+        self.record_event(IMPACT_CLEARANCE_REJECTED_EVENT_TYPE, payload);
+    }
 }
 
 /// Ephemeral, in-memory [`ImpactEventSink`] for dev / test / the no-durable-audit
@@ -406,6 +446,12 @@ impl ImpactEventSink for InMemoryImpactSink {
     }
     fn record_cleared(&self, payload: &ImpactClearedPayload) {
         self.push(IMPACT_CLEARED_EVENT_TYPE, payload);
+    }
+    fn record_escalation_raised(&self, payload: &ImpactEscalationPayload) {
+        self.push(IMPACT_ESCALATION_RAISED_EVENT_TYPE, payload);
+    }
+    fn record_clearance_rejected(&self, payload: &ImpactClearanceRejectedPayload) {
+        self.push(IMPACT_CLEARANCE_REJECTED_EVENT_TYPE, payload);
     }
 }
 
@@ -484,6 +530,109 @@ impl RecordedImpactLatch {
             });
         }
         self.last_latched = now;
+    }
+}
+
+/// SG6 — a [`ClearanceLoop`] (#103) wrapped with the rising-edge audit recorder,
+/// emitting through the same [`ImpactEventSink`] family #263 established.
+///
+/// Audit sequence per incident: `ImpactDetected` on the Normal→Latched edge
+/// (incident open, with the trigger breakdown), then `ImpactEscalationRaised`
+/// ONCE on the Latched→EscalationRaised edge (operator-intervention signal), then
+/// either `ImpactCleared` (a well-formed grant) or `ImpactClearanceRejected` (a
+/// rejected attempt, with the reason). No per-tick spam; re-impact while
+/// escalated raises nothing new.
+///
+/// INFALLIBLE toward the control path: the state machine is mutated FIRST, then
+/// the best-effort audit write — so [`is_immobilized`](Self::is_immobilized) (the
+/// motion veto) is BIT-IDENTICAL with or without a sink, and a failed write only
+/// increments the durable sink's `write_failures` counter.
+// SAFETY: SG6 | REQ: clearance-confirmation-loop | TEST: test_loop_escalation_raised_once,test_loop_clear_emits_impact_cleared,test_loop_rejection_recorded_state_unchanged,test_loop_sink_failure_state_unaffected,test_loop_veto_unchanged_without_sink
+pub struct RecordedClearanceLoop {
+    clearance: ClearanceLoop,
+    sink: Arc<dyn ImpactEventSink>,
+    last_escalation_pending: bool,
+}
+
+impl RecordedClearanceLoop {
+    /// Wrap a fresh clearance loop with a recorder over `sink`.
+    pub fn new(sink: Arc<dyn ImpactEventSink>) -> Self {
+        Self {
+            clearance: ClearanceLoop::new(),
+            sink,
+            last_escalation_pending: false,
+        }
+    }
+
+    /// The current lifecycle state.
+    pub fn state(&self) -> ClearanceState {
+        self.clearance.state()
+    }
+
+    /// True while immobilized (Latched OR EscalationRaised) — feeds the motion
+    /// veto. Identical to [`ClearanceLoop::is_immobilized`].
+    pub fn is_immobilized(&self) -> bool {
+        self.clearance.is_immobilized()
+    }
+
+    /// True once the operator-escalation has been raised for the active incident.
+    pub fn escalation_pending(&self) -> bool {
+        self.clearance.escalation_pending()
+    }
+
+    /// Observe one tick. Delegates to [`ClearanceLoop::observe`] (state FIRST),
+    /// then emits `ImpactDetected` on the incident-open edge and exactly ONE
+    /// `ImpactEscalationRaised` on the false→true escalation edge.
+    pub fn observe(&mut self, evidence: &ImpactEvidence, cfg: &ImpactCfg, now_ms: u64) {
+        let before = self.clearance.state();
+        self.clearance.observe(evidence, cfg, now_ms);
+        let after = self.clearance.state();
+
+        // Incident open (Normal → Latched): record the trigger breakdown.
+        if before == ClearanceState::Normal && after == ClearanceState::Latched {
+            self.sink
+                .record_detected(&ImpactDetectedPayload::from_evidence(evidence, cfg));
+        }
+        // Operator-escalation rising edge (once per incident).
+        let pending = self.clearance.escalation_pending();
+        if pending && !self.last_escalation_pending {
+            self.sink.record_escalation_raised(&ImpactEscalationPayload {
+                detail: "post-collision immobilization — operator clearance required".to_string(),
+            });
+        }
+        self.last_escalation_pending = pending;
+    }
+
+    /// The ONLY clearance path. Delegates to [`ClearanceLoop::try_clear`] (state
+    /// FIRST), then records the outcome: `ImpactCleared` on success (with the
+    /// operator id as the clearance source — not duplicated elsewhere), or
+    /// `ImpactClearanceRejected` (with the reason) on rejection. Returns the
+    /// loop's `Result` unchanged.
+    pub fn try_clear(
+        &mut self,
+        grant: &OperatorClearanceGrant,
+        now_ms: u64,
+        max_grant_age_ms: u64,
+    ) -> Result<(), ClearanceRejection> {
+        let outcome = self
+            .clearance
+            .try_clear(grant, now_ms, max_grant_age_ms);
+        match &outcome {
+            Ok(()) => {
+                self.last_escalation_pending = false;
+                self.sink.record_cleared(&ImpactClearedPayload {
+                    clearance_source: grant.operator_id.clone(),
+                });
+            }
+            Err(rej) => {
+                self.sink
+                    .record_clearance_rejected(&ImpactClearanceRejectedPayload {
+                        operator_id: grant.operator_id.clone(),
+                        reason: rej.reason_code().to_string(),
+                    });
+            }
+        }
+        outcome
     }
 }
 
@@ -839,5 +988,127 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(json["contact_sensor"], true);
         assert_eq!(json["spike_over_threshold"], false, "a non-finite spike never reads as fired");
+    }
+
+    // ─────────────── #103 clearance-loop audit integration ──────────────────
+
+    const LOOP_MAX_AGE: u64 = 60_000;
+
+    fn good_grant(now: u64) -> OperatorClearanceGrant {
+        OperatorClearanceGrant { operator_id: "op-7".to_string(), granted_at_ms: now - 100 }
+    }
+    /// Drive a recorded loop into EscalationRaised.
+    fn escalate(loop_: &mut RecordedClearanceLoop) {
+        loop_.observe(&contact_ev(), &icfg(), 1_000); // Normal → Latched (Detected)
+        loop_.observe(&clean_ev(), &icfg(), 1_001); // Latched → EscalationRaised (Raised)
+        assert_eq!(loop_.state(), ClearanceState::EscalationRaised);
+    }
+
+    /// Escalation is recorded exactly ONCE per incident — re-impact while
+    /// escalated raises nothing new.
+    #[test]
+    fn test_loop_escalation_raised_once() {
+        let sink = Arc::new(InMemoryImpactSink::new());
+        let mut loop_ = RecordedClearanceLoop::new(sink.clone());
+        escalate(&mut loop_);
+        // many more ticks, including a re-impact
+        for t in 0..5 {
+            loop_.observe(&clean_ev(), &icfg(), 2_000 + t);
+        }
+        loop_.observe(&contact_ev(), &icfg(), 3_000); // re-impact while escalated
+        assert_eq!(count_type(&sink, IMPACT_ESCALATION_RAISED_EVENT_TYPE), 1,
+            "exactly one ImpactEscalationRaised per incident");
+        assert_eq!(count_type(&sink, IMPACT_DETECTED_EVENT_TYPE), 1,
+            "exactly one ImpactDetected on the incident-open edge");
+    }
+
+    /// A well-formed grant emits ONE `ImpactCleared` (operator id as source) and
+    /// no rejection.
+    #[test]
+    fn test_loop_clear_emits_impact_cleared() {
+        let sink = Arc::new(InMemoryImpactSink::new());
+        let mut loop_ = RecordedClearanceLoop::new(sink.clone());
+        escalate(&mut loop_);
+        let now = 5_000u64;
+        assert!(loop_.try_clear(&good_grant(now), now, LOOP_MAX_AGE).is_ok());
+        assert_eq!(loop_.state(), ClearanceState::Normal);
+        assert_eq!(count_type(&sink, IMPACT_CLEARED_EVENT_TYPE), 1, "one ImpactCleared on success");
+        assert_eq!(count_type(&sink, IMPACT_CLEARANCE_REJECTED_EVENT_TYPE), 0, "no rejection on success");
+        let (_, body) = sink.events().into_iter().find(|(t, _)| t == IMPACT_CLEARED_EVENT_TYPE).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["clearance_source"], "op-7", "the clearing operator id is the source");
+    }
+
+    /// A rejected clearance is RECORDED (reason + operator id) and leaves the
+    /// state unchanged (still immobilized) — never silently absorbed.
+    #[test]
+    fn test_loop_rejection_recorded_state_unchanged() {
+        let sink = Arc::new(InMemoryImpactSink::new());
+        let mut loop_ = RecordedClearanceLoop::new(sink.clone());
+        escalate(&mut loop_);
+        let now = 5_000u64;
+        let malformed = OperatorClearanceGrant { operator_id: "op-9".to_string(), granted_at_ms: now + 10 }; // future
+        let r = loop_.try_clear(&malformed, now, LOOP_MAX_AGE);
+        assert_eq!(r, Err(ClearanceRejection::MalformedGrant));
+        assert!(loop_.is_immobilized(), "state must be unchanged after a rejected grant");
+        assert_eq!(count_type(&sink, IMPACT_CLEARANCE_REJECTED_EVENT_TYPE), 1);
+        assert_eq!(count_type(&sink, IMPACT_CLEARED_EVENT_TYPE), 0, "no ImpactCleared on rejection");
+        let (_, body) = sink.events().into_iter().find(|(t, _)| t == IMPACT_CLEARANCE_REJECTED_EVENT_TYPE).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["reason"], "malformed_grant");
+        assert_eq!(json["operator_id"], "op-9", "the operator id (audit subject) is recorded");
+    }
+
+    /// Sink failure (poisoned store) does NOT affect the state machine or the
+    /// motion veto — the #263 infallibility proof, extended to the loop.
+    #[test]
+    fn test_loop_sink_failure_state_unaffected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("impact_audit.sqlite");
+        let store = Arc::new(Mutex::new(VerifierStore::new(db.to_str().unwrap()).expect("store")));
+        // Poison the store mutex.
+        let s = Arc::clone(&store);
+        let _ = std::thread::spawn(move || {
+            let _g = s.lock().unwrap();
+            panic!("poison the audit store for the failure test");
+        })
+        .join();
+
+        let sink = Arc::new(ImpactAuditSink::new(Arc::clone(&store)));
+        let mut loop_ = RecordedClearanceLoop::new(sink.clone());
+        loop_.observe(&contact_ev(), &icfg(), 1_000);
+        loop_.observe(&clean_ev(), &icfg(), 1_001);
+        assert!(loop_.is_immobilized(), "veto unaffected by sink failure");
+        assert!(loop_.escalation_pending(), "escalation state unaffected by sink failure");
+        assert!(sink.write_failures() >= 1, "the failed writes must be counted");
+        // A good grant still clears the state machine regardless of audit outcome.
+        let now = 5_000u64;
+        assert!(loop_.try_clear(&good_grant(now), now, LOOP_MAX_AGE).is_ok());
+        assert!(!loop_.is_immobilized(), "clearance state machine unaffected by sink failure");
+    }
+
+    /// The wrapped loop's veto tracks a bare `ClearanceLoop` bit-for-bit over a
+    /// sequence + a clear (no-durable in-memory sink).
+    #[test]
+    fn test_loop_veto_unchanged_without_sink() {
+        use parko_core::ClearanceLoop as BareLoop;
+        let sink = Arc::new(InMemoryImpactSink::new());
+        let mut recorded = RecordedClearanceLoop::new(sink);
+        let mut bare = BareLoop::new();
+
+        let seq = [clean_ev(), contact_ev(), clean_ev(), clean_ev()];
+        for (i, ev) in seq.iter().enumerate() {
+            let now = 1_000 + i as u64;
+            recorded.observe(ev, &icfg(), now);
+            bare.observe(ev, &icfg(), now);
+            assert_eq!(recorded.is_immobilized(), bare.is_immobilized(),
+                "wrapped loop veto must track the bare loop");
+        }
+        let now = 9_000u64;
+        let g = OperatorClearanceGrant { operator_id: "op".to_string(), granted_at_ms: now - 10 };
+        let _ = recorded.try_clear(&g, now, LOOP_MAX_AGE);
+        let _ = bare.try_clear(&g, now, LOOP_MAX_AGE);
+        assert_eq!(recorded.is_immobilized(), bare.is_immobilized());
+        assert!(!recorded.is_immobilized());
     }
 }

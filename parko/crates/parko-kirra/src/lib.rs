@@ -49,9 +49,9 @@ use parko_core::rss::{lateral_safe_distance, longitudinal_safe_distance, occlusi
 use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
 use parko_core::{
     commit_zone_blocked, gate_commit_zone_scene, gate_water_scene, localization_trusted,
-    water_untraversable_veto, AgentScene, CommitZoneCfg, CommitZoneScene, ImpactLatch,
-    LocalizationCfg, LocalizationIntegrity, OcclusionScene, RssParams, RssState, WaterScene,
-    WaterVetoConfig, MAX_RSS_AGENTS,
+    water_untraversable_veto, AgentScene, ClearanceLoop, CommitZoneCfg, CommitZoneScene,
+    ImpactLatch, LocalizationCfg, LocalizationIntegrity, OcclusionScene, RssParams, RssState,
+    WaterScene, WaterVetoConfig, MAX_RSS_AGENTS,
 };
 
 pub mod angular_bound;
@@ -61,8 +61,10 @@ pub mod diverse;
 pub use angular_bound::{AngularVelocityBound, PlatformParams, ROLLOVER_MIN_LINEAR_VELOCITY_MPS};
 pub use audit_sink::{
     select_divergence_sink, select_impact_sink, AuditChainLinkerDivergenceSink, FatalAuditConfig,
-    ImpactAuditSink, ImpactClearedPayload, ImpactDetectedPayload, ImpactEventSink,
-    InMemoryImpactSink, RecordedImpactLatch, IMPACT_CLEARED_EVENT_TYPE, IMPACT_DETECTED_EVENT_TYPE,
+    ImpactAuditSink, ImpactClearanceRejectedPayload, ImpactClearedPayload, ImpactDetectedPayload,
+    ImpactEscalationPayload, ImpactEventSink, InMemoryImpactSink, RecordedClearanceLoop,
+    RecordedImpactLatch, IMPACT_CLEARANCE_REJECTED_EVENT_TYPE, IMPACT_CLEARED_EVENT_TYPE,
+    IMPACT_DETECTED_EVENT_TYPE, IMPACT_ESCALATION_RAISED_EVENT_TYPE,
 };
 pub use comparator::{GovernorComparator, RssAwareGovernor};
 pub use diverse::DiverseKirraGovernor;
@@ -833,6 +835,31 @@ impl KirraGovernor {
         }
         self.evaluate(proposed, previous, delta_time_s, posture)
     }
+
+    /// AUTHORITATIVE post-collision path through the SG6 CLEARANCE LOOP (#103).
+    ///
+    /// While the [`ClearanceLoop`] is immobilized — in EITHER `Latched` OR
+    /// `EscalationRaised` — OVERRIDE any proposed motion → immobilize, exactly as
+    /// [`evaluate_with_impact_latch`](Self::evaluate_with_impact_latch) does for
+    /// the bare latch. The difference is the EXIT: the loop returns to `Normal`
+    /// only via `ClearanceLoop::try_clear` with a well-formed operator grant (the
+    /// SS-003 structural no-resume), never on clean evidence.
+    pub fn evaluate_with_clearance_loop(
+        &self,
+        proposed: &ControlCommand,
+        previous: Option<&ControlCommand>,
+        delta_time_s: f64,
+        posture: SafetyPosture,
+        clearance: &ClearanceLoop,
+    ) -> EnforcementAction {
+        if clearance.is_immobilized() {
+            return EnforcementAction::Deny {
+                reason: "SG6: post-collision clearance loop — immobilize until operator clearance"
+                    .to_string(),
+            };
+        }
+        self.evaluate(proposed, previous, delta_time_s, posture)
+    }
 }
 
 impl SafetyGovernor for KirraGovernor {
@@ -1469,9 +1496,10 @@ mod scene_rss_tests {
     use parko_core::commands::ControlCommand;
     use parko_core::safety::{EnforcementAction, SafetyGovernor, SafetyPosture};
     use parko_core::{
-        AgentScene, CommitZoneCfg, CommitZoneMap, CommitZoneScene, ImpactCfg, ImpactEvidence,
-        ImpactLatch, LocalizationCfg, LocalizationIntegrity, OcclusionScene, RssAgent, RssParams,
-        RssState, TraversalEvidence, WaterScene, WaterVetoConfig, MAX_RSS_AGENTS,
+        AgentScene, ClearanceLoop, ClearanceState, CommitZoneCfg, CommitZoneMap, CommitZoneScene,
+        ImpactCfg, ImpactEvidence, ImpactLatch, LocalizationCfg, LocalizationIntegrity,
+        OcclusionScene, OperatorClearanceGrant, RssAgent, RssParams, RssState, TraversalEvidence,
+        WaterScene, WaterVetoConfig, MAX_RSS_AGENTS,
     };
 
     fn params() -> RssParams {
@@ -1858,6 +1886,38 @@ mod scene_rss_tests {
             &cmd(8.0), Some(&cmd(8.0)), 0.05, SafetyPosture::Nominal, &l);
         assert!(matches!(resumed, EnforcementAction::Allow),
             "after explicit clearance, motion resumes, got {resumed:?}");
+    }
+
+    // --- SG6 clearance loop (issue #103) ---
+
+    /// The clearance-loop motion veto immobilizes in BOTH Latched and
+    /// EscalationRaised, and releases ONLY after a well-formed operator grant —
+    /// the SS-003 structural no-resume at the governor boundary.
+    #[test]
+    fn clearance_loop_vetoes_in_both_states_and_releases_only_on_grant() {
+        let gov = KirraGovernor::new();
+        let mut l = ClearanceLoop::new();
+        let contact = ImpactEvidence { imu_accel_spike_mps2: 0.5, contact_sensor: true, vanished_object: false };
+        let clean = ImpactEvidence { imu_accel_spike_mps2: 0.5, contact_sensor: false, vanished_object: false };
+
+        // Latched → Deny.
+        l.observe(&contact, &ImpactCfg::default(), 1_000);
+        assert_eq!(l.state(), ClearanceState::Latched);
+        let d1 = gov.evaluate_with_clearance_loop(&cmd(8.0), Some(&cmd(8.0)), 0.05, SafetyPosture::Nominal, &l);
+        assert!(matches!(d1, EnforcementAction::Deny { .. }), "Latched must immobilize, got {d1:?}");
+
+        // EscalationRaised → still Deny; clean evidence never resumes.
+        l.observe(&clean, &ImpactCfg::default(), 1_001);
+        assert_eq!(l.state(), ClearanceState::EscalationRaised);
+        let d2 = gov.evaluate_with_clearance_loop(&cmd(8.0), Some(&cmd(8.0)), 0.05, SafetyPosture::Nominal, &l);
+        assert!(matches!(d2, EnforcementAction::Deny { .. }), "EscalationRaised must immobilize, got {d2:?}");
+
+        // A well-formed grant — and ONLY that — releases motion.
+        let now = 5_000u64;
+        let grant = OperatorClearanceGrant { operator_id: "op-1".to_string(), granted_at_ms: now - 100 };
+        l.try_clear(&grant, now, 60_000).expect("well-formed grant clears");
+        let resumed = gov.evaluate_with_clearance_loop(&cmd(8.0), Some(&cmd(8.0)), 0.05, SafetyPosture::Nominal, &l);
+        assert!(matches!(resumed, EnforcementAction::Allow), "after the grant, motion resumes, got {resumed:?}");
     }
 
     // --- SG5 commit-zone veto (issue #106) ---
