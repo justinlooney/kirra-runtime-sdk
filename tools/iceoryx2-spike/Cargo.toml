@@ -9,7 +9,8 @@
 name = "iceoryx2-spike"
 version = "0.0.0"
 edition = "2021"
-publish = false
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
+license-file = "../../COPYRIGHT"
 description = "Host-side iceoryx2 feature-subset + fault-matrix spike (#273)"
 
 # PINNED — host-side feature-subset spike (#273). Version recorded in README.

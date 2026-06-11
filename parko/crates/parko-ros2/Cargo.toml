@@ -18,7 +18,8 @@ name = "parko-ros2"
 version = "0.1.0"
 edition = "2021"
 description = "ROS 2 node for Parko's end-to-end ML control path (M2; parallel to kirra-ros2-adapter)"
-license = "Apache-2.0 OR MIT"
+license-file = "../../../COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
 
 [features]
 # Default = no ROS / no ORT. The state-machine + mapping tests run

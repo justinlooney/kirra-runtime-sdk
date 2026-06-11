@@ -5,7 +5,8 @@ edition = "2021"
 description = "Wire schema for Kirra's learning-loop capture records — the single authoritative, governor-free type set shared by the SDK emitters and the offline collector."
 repository = "https://github.com/justinlooney/kirra-runtime-sdk"
 authors = ["Justin Looney <justin@kirrasystems.io>"]
-license = "MIT OR Apache-2.0"
+license-file = "../../COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
 
 # §0 SAFETY BOUNDARY: this crate depends on `serde` ONLY. It carries no governor
 # types and no logic — just the leaf record shapes. The offline collector depends

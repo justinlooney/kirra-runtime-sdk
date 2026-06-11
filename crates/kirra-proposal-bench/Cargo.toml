@@ -9,7 +9,8 @@ name = "kirra-proposal-bench"
 version = "0.1.0"
 edition = "2021"
 description = "DEV/TEST UDP bench for kirra-governor-service — sends a proposal sweep and prints the verdict table. Not a safety artifact."
-license = "Apache-2.0"
+license-file = "../../COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
 
 [[bin]]
 name = "kirra-proposal-bench"
