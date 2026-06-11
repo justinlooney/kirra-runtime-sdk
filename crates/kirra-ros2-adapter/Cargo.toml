@@ -8,13 +8,19 @@
 # integrators that DO run ROS 2 (e.g. Autoware) enable the `ros2` feature
 # here and link this crate into their node graph.
 #
-# Phase 1 scope (this crate, this commit):
-#   - AcceptedTrajectory state machine + `AdaptorState` (DashMap-backed).
-#   - `CorridorSource` trait + `MockCorridorSource` (5 m half-width corridor).
-#   - r2r-backed `run_adapter` node skeleton with stubbed subscriptions
-#     and internal mpsc channels feeding slow- and fast-loop task stubs.
-#   - NO call into `validate_trajectory_containment` yet — Phase 2 wiring.
-#   - NO kirra-runtime-sdk dep yet — Phase 1 owns its own shared types.
+# Current state (the Option-B wiring is LIVE; this header began as a Phase-1
+# skeleton note and is updated to match reality):
+#   - This crate DOES depend on `kirra-runtime-sdk` (see `[dependencies]` below).
+#   - The slow loop CALLS `validate_trajectory_containment` per accepted
+#     trajectory at `src/validation.rs:161` (from
+#     `kirra_runtime_sdk::gateway::containment`). SG2 is ENFORCED via this
+#     Option-B wiring (#131; see `docs/safety/TRACEABILITY_MATRIX.md`).
+#   - Phase 1 originally stubbed both (own shared types, no containment call);
+#     wired since #131.
+#
+# Crate shape: `AcceptedTrajectory` state machine + `AdaptorState` (DashMap),
+# `CorridorSource` trait + `MockCorridorSource` (5 m half-width corridor),
+# r2r-backed `run_adapter` node feeding slow- and fast-loop tasks.
 #
 # r2r is pinned (=0.9.5) because the project explicitly states "the API will
 # change". Bumping is a deliberate maintenance action, not a transitive ride.
