@@ -9,8 +9,16 @@
 // certified WCET. Certified WCET must be measured on the QNX target under FIFO
 // scheduling (#274). Host numbers are never presented as WCET.
 //
-// The SG-0N row IDs are PLACEHOLDERS; mapping them to the real kernel RTM IDs
-// (REQUIREMENTS_TRACEABILITY.md SG-001..SG-016) is issue #272.
+// RTM TRACING (#272, this change): the local `SG-0N` is the HARNESS ROW INDEX —
+// NOT a kernel RTM identifier. The `rtm_id`/`tr_id` fields are the bridge to the
+// real kernel RTM (docs/safety/REQUIREMENTS_TRACEABILITY.md, AEGIS-RTM-001). The
+// honest grounded result (per-row JUSTIFICATION in QNX_MAPPING.md): only the
+// over-envelope row has a genuine RTM home — SG-001/TR-001 (PROXY bound,
+// reject-not-clamp). The other six transport-contract fault classes (frame magic,
+// sequence monotonicity, message deadline, payload CRC, payload bounds, replay)
+// have NO matching kernel TR — they are honest NO-RTM-ID gaps, candidate new TRs
+// for the EPIC #270 transport-contract lane. The valid row is the clean-accept
+// CONTROL. The gaps ARE evidence (they feed the RTM gap report); never force-fit.
 
 #include <algorithm>
 #include <cstdint>
@@ -71,8 +79,15 @@ struct Baseline {
 
 // Mutator: takes the baseline view + payload + crc by value, injects a fault.
 struct Row {
-    const char *id;
-    const char *name;
+    const char *id;   // LOCAL harness row index (SG-0N) — NOT a kernel RTM id.
+    const char *name; // exactly what this row injects (honest fault name).
+    // RTM bridge (#272). `rtm_display` is the human column; `rtm_id`/`tr_id` are
+    // the CSV cells. A genuine hit carries SG-NNN/TR-NNN; an honest gap carries
+    // "NO-RTM-ID"/"CANDIDATE"; the no-fault control carries "CONTROL"/"NONE".
+    // See QNX_MAPPING.md for the per-row justification.
+    const char *rtm_display;
+    const char *rtm_id;
+    const char *tr_id;
     std::uint8_t expected;
     // Whether the Rust JUDGE is invoked. FALSE for the rows the SHIM driver
     // rejects on its own (oversize bounds AND CRC corruption) — they never cross
@@ -105,15 +120,19 @@ void inj_replay(KirraContractView &v, std::uint8_t *, std::uint32_t &) {
     v.sequence = 1000; // EQUAL to last_accepted ⇒ replay ⇒ SequenceRegress
 }
 
+// Verdicts + injection unchanged from #284; only the RTM-mapping cells are added.
+// Mapping is GROUNDED in REQUIREMENTS_TRACEABILITY.md / SAFETY_GOALS.md — only the
+// over-envelope row evidences a real kernel TR (SG-001/TR-001, proxy); the rest
+// are honest NO-RTM-ID transport-contract gaps (QNX_MAPPING.md justifies each).
 const Row kRows[] = {
-    {"SG-00", "valid",                  KIRRA_VERDICT_OK,               true,  inj_valid},
-    {"SG-01", "bad-magic",              KIRRA_VERDICT_STALE_HEADER,     true,  inj_bad_magic},
-    {"SG-02", "sequence-regress",       KIRRA_VERDICT_SEQUENCE_REGRESS, true,  inj_seq_regress},
-    {"SG-03", "deadline-missed",        KIRRA_VERDICT_DEADLINE_MISSED,  true,  inj_deadline},
-    {"SG-04", "payload-corrupt (CRC)",  KIRRA_VERDICT_PAYLOAD_CORRUPT,  false, inj_payload_corrupt},
-    {"SG-05", "payload-oversize",       KIRRA_VERDICT_PAYLOAD_OVERSIZE, false, inj_oversize},
-    {"SG-06", "over-envelope",          KIRRA_VERDICT_KINEMATIC_LIMIT,  true,  inj_kinematic},
-    {"SG-07", "replay (seq==last)",     KIRRA_VERDICT_SEQUENCE_REGRESS, true,  inj_replay},
+    {"SG-00", "valid",                 "CONTROL",       "CONTROL",   "NONE",      KIRRA_VERDICT_OK,               true,  inj_valid},
+    {"SG-01", "bad-magic",             "NO-RTM-ID",     "NO-RTM-ID", "CANDIDATE", KIRRA_VERDICT_STALE_HEADER,     true,  inj_bad_magic},
+    {"SG-02", "sequence-regress",      "NO-RTM-ID",     "NO-RTM-ID", "CANDIDATE", KIRRA_VERDICT_SEQUENCE_REGRESS, true,  inj_seq_regress},
+    {"SG-03", "deadline-missed",       "NO-RTM-ID",     "NO-RTM-ID", "CANDIDATE", KIRRA_VERDICT_DEADLINE_MISSED,  true,  inj_deadline},
+    {"SG-04", "payload-corrupt (CRC)", "NO-RTM-ID",     "NO-RTM-ID", "CANDIDATE", KIRRA_VERDICT_PAYLOAD_CORRUPT,  false, inj_payload_corrupt},
+    {"SG-05", "payload-oversize",      "NO-RTM-ID",     "NO-RTM-ID", "CANDIDATE", KIRRA_VERDICT_PAYLOAD_OVERSIZE, false, inj_oversize},
+    {"SG-06", "over-envelope",         "SG-001/TR-001", "SG-001",    "TR-001",    KIRRA_VERDICT_KINEMATIC_LIMIT,  true,  inj_kinematic},
+    {"SG-07", "replay (seq==last)",    "NO-RTM-ID",     "NO-RTM-ID", "CANDIDATE", KIRRA_VERDICT_SEQUENCE_REGRESS, true,  inj_replay},
 };
 
 struct RowResult {
@@ -169,8 +188,10 @@ void print_banner() {
     std::printf(" KIRRA QNX RTM harness (#271) — C++ shim (driver) -> Rust judge (checker)\n");
     std::printf(" PASS GATE = VERDICT CORRECTNESS ONLY.  Timing is INDICATIVE (host FDIT).\n");
     std::printf(" Certified WCET must be measured on the QNX target under FIFO scheduling\n");
-    std::printf(" (#274) — host numbers are NEVER presented as WCET.  SG-0N IDs are\n");
-    std::printf(" placeholders; real-RTM-ID mapping is #272.\n");
+    std::printf(" (#274) — host numbers are NEVER presented as WCET.  The RTM column maps\n");
+    std::printf(" each row to the kernel RTM (#272); SG-0N is the LOCAL row index, not an\n");
+    std::printf(" RTM id.  Only over-envelope hits a real TR (SG-001, proxy); the rest are\n");
+    std::printf(" honest NO-RTM-ID transport-contract gaps (see QNX_MAPPING.md).\n");
     std::printf("============================================================================\n");
 }
 
@@ -182,17 +203,18 @@ int main() {
     RowResult results[sizeof(kRows) / sizeof(kRows[0])];
     bool all_pass = true;
 
-    std::printf("\n%-6s %-22s %-6s %-16s %10s %10s %10s\n",
-                "id", "fault class", "ok", "verdict", "p50(ns)", "p99(ns)", "max(ns)");
-    std::printf("----------------------------------------------------------------------------------\n");
+    std::printf("\n%-6s %-22s %-14s %-6s %-16s %10s %10s %10s\n",
+                "row", "fault class", "rtm", "ok", "verdict", "p50(ns)", "p99(ns)", "max(ns)");
+    std::printf("-------------------------------------------------------------------------------------------------\n");
 
     for (std::size_t i = 0; i < sizeof(kRows) / sizeof(kRows[0]); ++i) {
         results[i] = run_row(kRows[i]);
         const RowResult &r = results[i];
         const bool row_ok = r.pass && r.short_circuit_ok;
         if (!row_ok) all_pass = false;
-        std::printf("%-6s %-22s %-6s %-16s %10llu %10llu %10llu\n",
-                    kRows[i].id, kRows[i].name, row_ok ? "PASS" : "FAIL",
+        std::printf("%-6s %-22s %-14s %-6s %-16s %10llu %10llu %10llu\n",
+                    kRows[i].id, kRows[i].name, kRows[i].rtm_display,
+                    row_ok ? "PASS" : "FAIL",
                     verdict_name(r.observed),
                     static_cast<unsigned long long>(r.p50),
                     static_cast<unsigned long long>(r.p99),
@@ -206,19 +228,26 @@ int main() {
         }
     }
 
-    // Machine-readable CSV (placeholder IDs; #272 remaps). Column order:
-    // id,fault_class,result,expected_verdict,observed_verdict,p50_ns,p99_ns,max_ns
-    std::printf("\nCSV:\n");
-    std::printf("id,fault_class,result,expected_verdict,observed_verdict,p50_ns,p99_ns,max_ns\n");
+    // Machine-readable CSV. The RTM gap report (RTM_GAP_REPORT.md) has NO per-test
+    // CSV evidence-table format to match — its tables are markdown (goal | ASIL |
+    // description | tests), no timing columns — so this is the PROPOSED grounded
+    // format (flagged proposed in QNX_MAPPING.md), per #272's instruction. Columns:
+    // harness_row is the LOCAL index; rtm_id/tr_id are the kernel-RTM bridge;
+    // wcet_status is constant TBD-QNX-TARGET (host timing is never WCET, #274).
+    std::printf("\nCSV (proposed format — RTM_GAP_REPORT.md has no per-test CSV table to match):\n");
+    std::printf("harness_row,rtm_id,tr_id,fault_class,verdict_expected,verdict_observed,"
+                "pass,p50_ns,p99_ns,max_ns,wcet_status\n");
     for (std::size_t i = 0; i < sizeof(kRows) / sizeof(kRows[0]); ++i) {
         const RowResult &r = results[i];
         const bool row_ok = r.pass && r.short_circuit_ok;
-        std::printf("%s,%s,%s,%s,%s,%llu,%llu,%llu\n",
-                    kRows[i].id, kRows[i].name, row_ok ? "PASS" : "FAIL",
+        std::printf("%s,%s,%s,%s,%s,%s,%s,%llu,%llu,%llu,%s\n",
+                    kRows[i].id, kRows[i].rtm_id, kRows[i].tr_id, kRows[i].name,
                     verdict_name(kRows[i].expected), verdict_name(r.observed),
+                    row_ok ? "PASS" : "FAIL",
                     static_cast<unsigned long long>(r.p50),
                     static_cast<unsigned long long>(r.p99),
-                    static_cast<unsigned long long>(r.max));
+                    static_cast<unsigned long long>(r.max),
+                    "TBD-QNX-TARGET");
     }
 
     std::printf("\nGATE (verdict correctness): %s\n", all_pass ? "PASS" : "FAIL");

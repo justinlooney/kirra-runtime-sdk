@@ -3,7 +3,9 @@
 C++ **shim** (driver) → Rust **judge** (checker) over a frozen `extern "C"`
 contract ABI, with an automated **FDIT / RTM fault-injection** matrix that proves
 **verdict correctness** across eight fault classes. Part of **EPIC #270**
-(iceoryx2 transport / QNX governor lane). RTM-ID tracing is the follow-up **#272**.
+(iceoryx2 transport / QNX governor lane). Each row is **traced to the kernel RTM**
+(**#272** — see `QNX_MAPPING.md`): one genuine hit (SG-001/TR-001, proxy), six
+honest `NO-RTM-ID` transport-contract gaps, one control.
 
 > Built with **g++ + rustc directly (no cargo)**. The Rust judge is a `no_std`
 > `staticlib` — dependency-free, mirroring the QNX cross-compile shape.
@@ -44,22 +46,31 @@ built `--crate-type staticlib -C panic=abort` and linked into the C++ executable
 
 ## The fault matrix (gate = verdict correctness only)
 
-Eight rows, each named for **exactly** what it injects. Host run:
+Eight rows, each named for **exactly** what it injects, each carrying its grounded
+**RTM** mapping (the `row` column is the LOCAL harness index, **not** an RTM id —
+the `rtm` column is the bridge). Host run:
 
 ```
-id     fault class            ok     verdict             p50(ns)    p99(ns)    max(ns)
-----------------------------------------------------------------------------------
-SG-00  valid                  PASS   Ok                      501        520      20784
-SG-01  bad-magic              PASS   StaleHeader             500        517      22050
-SG-02  sequence-regress       PASS   SequenceRegress         503        529      34489
-SG-03  deadline-missed        PASS   DeadlineMissed          500        517      23915
-SG-04  payload-corrupt (CRC)  PASS   PayloadCorrupt          503        524      19721
-SG-05  payload-oversize       PASS   PayloadOversize          39         55      17133
-SG-06  over-envelope          PASS   KinematicLimit          504        525      17045
-SG-07  replay (seq==last)     PASS   SequenceRegress         500        519      29045
+row    fault class            rtm            ok     verdict             p50(ns)    p99(ns)    max(ns)
+-------------------------------------------------------------------------------------------------
+SG-00  valid                  CONTROL        PASS   Ok                      500        645      19318
+SG-01  bad-magic              NO-RTM-ID      PASS   StaleHeader             500        692     141615
+SG-02  sequence-regress       NO-RTM-ID      PASS   SequenceRegress         500        522      58236
+SG-03  deadline-missed        NO-RTM-ID      PASS   DeadlineMissed          501        524      23158
+SG-04  payload-corrupt (CRC)  NO-RTM-ID      PASS   PayloadCorrupt          499        647      64000
+SG-05  payload-oversize       NO-RTM-ID      PASS   PayloadOversize          38         61       4815
+SG-06  over-envelope          SG-001/TR-001  PASS   KinematicLimit          500        635      69192
+SG-07  replay (seq==last)     NO-RTM-ID      PASS   SequenceRegress         500        531      40385
 
 GATE (verdict correctness): PASS
 ```
+
+The RTM mapping is **grounded** in `docs/safety/{SAFETY_GOALS,REQUIREMENTS_TRACEABILITY}.md`
+(read-only). Only **over-envelope** has a genuine kernel TR home — **SG-001/TR-001**,
+qualified as PROXY (proxy bound, reject-not-clamp). The other six transport-contract
+fault classes are honest **`NO-RTM-ID`** gaps (candidate new TRs for the EPIC #270
+lane), and the valid row is the clean-accept **`CONTROL`**. Full per-row
+justification + the surfaced coverage gaps: **`QNX_MAPPING.md`**.
 
 - **SG-07 Replay** (`sequence == last_accepted`) is its **own row** and PASSes
   with `SequenceRegress`. The judge's rule is the corrected
@@ -99,5 +110,7 @@ imports it, and its number must never be read as a certified bound.
 ## QNX
 
 `CMakeLists.txt` notes the QNX cross-compile hook as a comment; the real
-cross-compile + on-target FDIT/WCET work is **#274**. The SG-0N → real-RTM-ID
-mapping is **#272** — see `QNX_MAPPING.md`.
+cross-compile + on-target FDIT/WCET work is **#274**. The harness→kernel-RTM
+tracing (**#272**, done) is in `QNX_MAPPING.md`; **adding the candidate `NO-RTM-ID`
+TRs to the RTM itself is a separate `docs/safety/**` change with its own review —
+not part of #272**, which only traces against the RTM as it stands.
