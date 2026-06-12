@@ -121,6 +121,7 @@ impl GrantIngest {
         store: &mut VerifierStore,
         public_key_b64: &str,
         counter: &RejectionCounter,
+        now_ms: u64,
     ) -> Result<i64, RejectReason> {
         let sample = self
             .subscriber
@@ -134,7 +135,7 @@ impl GrantIngest {
                 counter.record(&r);
                 r
             })?;
-        ingest_clearance_grant(store, &grant, public_key_b64, counter)
+        ingest_clearance_grant(store, &grant, public_key_b64, counter, now_ms)
     }
 }
 
@@ -297,7 +298,7 @@ mod transport_tests {
         let counter = RejectionCounter::new();
         let rowid = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            ingest.recv_and_ingest(&mut store, &pk, &counter),
+            ingest.recv_and_ingest(&mut store, &pk, &counter, 1_001),
         )
         .await
         .expect("recv timed out")

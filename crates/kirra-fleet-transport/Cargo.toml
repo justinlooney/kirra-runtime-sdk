@@ -42,9 +42,11 @@ serde_json = "1"
 # payload; verify against the controller's registered public key).
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
+# Per-grant nonce minting on the signing side (#322 replay defense): 16 random
+# bytes → hex, burned exactly once at ingest (verify-AND-consume).
+rand = "0.8"
 
 [dev-dependencies]
 # zenoh is async; the in-process two-session round-trip tests need a runtime.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tempfile = "3"
-rand = "0.8"
