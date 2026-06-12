@@ -79,6 +79,14 @@ pub enum RejectReason {
     Decode(String),
     /// The payload decoded but is structurally invalid (e.g. empty node/operator).
     Malformed(String),
+    /// The signature verified but the grant's freshness window has closed
+    /// (`now_ms >= expires_at_ms`). A stale-but-authentic grant replayed off the
+    /// carrier outside its TTL — rejected fail-closed.
+    Expired,
+    /// The signature verified and the grant is fresh, but its nonce was already
+    /// burned — i.e. this exact grant has been ingested before. A replay of a
+    /// captured, still-in-window grant — rejected fail-closed (verify-AND-consume).
+    Replayed,
     /// A verified grant could not be written to the store (fail-closed).
     StoreError(String),
 }
@@ -92,6 +100,8 @@ impl RejectReason {
             RejectReason::BadSignature => "bad_signature",
             RejectReason::Decode(_) => "decode_error",
             RejectReason::Malformed(_) => "malformed",
+            RejectReason::Expired => "expired",
+            RejectReason::Replayed => "replayed",
             RejectReason::StoreError(_) => "store_error",
         }
     }
@@ -105,6 +115,8 @@ pub struct RejectionCounter {
     bad_signature: AtomicU64,
     decode_error: AtomicU64,
     malformed: AtomicU64,
+    expired: AtomicU64,
+    replayed: AtomicU64,
     store_error: AtomicU64,
     accepted: AtomicU64,
 }
@@ -122,6 +134,8 @@ impl RejectionCounter {
             RejectReason::BadSignature => &self.bad_signature,
             RejectReason::Decode(_) => &self.decode_error,
             RejectReason::Malformed(_) => &self.malformed,
+            RejectReason::Expired => &self.expired,
+            RejectReason::Replayed => &self.replayed,
             RejectReason::StoreError(_) => &self.store_error,
         };
         slot.fetch_add(1, Ordering::Relaxed);
@@ -139,6 +153,8 @@ impl RejectionCounter {
             bad_signature: self.bad_signature.load(Ordering::Relaxed),
             decode_error: self.decode_error.load(Ordering::Relaxed),
             malformed: self.malformed.load(Ordering::Relaxed),
+            expired: self.expired.load(Ordering::Relaxed),
+            replayed: self.replayed.load(Ordering::Relaxed),
             store_error: self.store_error.load(Ordering::Relaxed),
             accepted: self.accepted.load(Ordering::Relaxed),
         }
@@ -148,7 +164,8 @@ impl RejectionCounter {
     #[must_use]
     pub fn total_rejected(&self) -> u64 {
         let s = self.snapshot();
-        s.unsigned + s.bad_signature + s.decode_error + s.malformed + s.store_error
+        s.unsigned + s.bad_signature + s.decode_error + s.malformed + s.expired + s.replayed
+            + s.store_error
     }
 }
 
@@ -159,6 +176,8 @@ pub struct RejectionSnapshot {
     pub bad_signature: u64,
     pub decode_error: u64,
     pub malformed: u64,
+    pub expired: u64,
+    pub replayed: u64,
     pub store_error: u64,
     pub accepted: u64,
 }
@@ -222,6 +241,15 @@ pub fn accept_report(
 // Signed clearance grant (the down lane) — reuses the federation Ed25519 pattern
 // ---------------------------------------------------------------------------
 
+/// Freshness window for a signed clearance grant (ms). A grant is valid from
+/// `granted_at_ms` until `granted_at_ms + FLEET_GRANT_TTL_MS`; after that an
+/// otherwise-authentic grant replayed off the carrier is rejected as `Expired`.
+/// Two minutes accommodates a cellular ops→vehicle hop while bounding the window in
+/// which a captured grant could be replayed before its nonce burn (the nonce burn is
+/// the hard, single-use defense; the TTL bounds the worst case and lets the vehicle
+/// reject obviously-stale traffic without a store round-trip).
+pub const FLEET_GRANT_TTL_MS: u64 = 120_000;
+
 /// An operator clearance grant signed by the issuing controller for transport over
 /// the untrusted fleet carrier. The vehicle verifies the signature against the
 /// controller's registered public key BEFORE writing it to the store.
@@ -229,26 +257,47 @@ pub fn accept_report(
 /// The signature is over a canonical payload of the *semantic* fields
 /// ([`canonical_grant_payload`]), NOT the wire bytes — so the codec is independent
 /// of the trust root (mirrors `canonical_federation_payload_v2`).
+///
+/// **Replay defense (#322).** Both the `nonce_hex` (a per-grant unique token) and
+/// `expires_at_ms` (the freshness deadline) are inside the signed payload, so an
+/// attacker on the untrusted carrier cannot mint a fresh nonce or extend the TTL
+/// without invalidating the signature. The vehicle enforces both at ingest:
+/// verify-AND-consume burns the nonce exactly once, and the TTL bounds the window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedClearanceGrant {
     pub node_id: String,
     pub operator_id: String,
     pub granted_at_ms: u64,
+    /// Freshness deadline (ms, same clock domain as `granted_at_ms`). Signed.
+    pub expires_at_ms: u64,
+    /// Per-grant unique nonce (hex). Burned exactly once at ingest. Signed.
+    pub nonce_hex: String,
     pub signature_b64: String,
 }
 
-/// The canonical bytes an Ed25519 signature covers for a clearance grant.
+/// The canonical bytes an Ed25519 signature covers for a clearance grant. Includes
+/// the replay-defense fields (`expires_at_ms`, `nonce_hex`) so they are tamper-evident.
 #[must_use]
-pub fn canonical_grant_payload(node_id: &str, operator_id: &str, granted_at_ms: u64) -> String {
+pub fn canonical_grant_payload(
+    node_id: &str,
+    operator_id: &str,
+    granted_at_ms: u64,
+    expires_at_ms: u64,
+    nonce_hex: &str,
+) -> String {
     serde_json::json!({
         "node_id": node_id,
         "operator_id": operator_id,
         "granted_at_ms": granted_at_ms,
+        "expires_at_ms": expires_at_ms,
+        "nonce_hex": nonce_hex,
     })
     .to_string()
 }
 
-/// Sign a clearance grant with the issuing controller's key (ops/cloud side).
+/// Sign a clearance grant with the issuing controller's key (ops/cloud side). Mints a
+/// fresh random `nonce_hex` and sets `expires_at_ms = granted_at_ms + FLEET_GRANT_TTL_MS`,
+/// then signs over both — so the grant is single-use and time-bounded on the wire.
 #[must_use]
 pub fn sign_clearance_grant(
     signing_key: &SigningKey,
@@ -256,14 +305,31 @@ pub fn sign_clearance_grant(
     operator_id: &str,
     granted_at_ms: u64,
 ) -> SignedClearanceGrant {
-    let payload = canonical_grant_payload(node_id, operator_id, granted_at_ms);
+    let mut nonce = [0u8; 16];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut nonce);
+    let nonce_hex = hex_encode(&nonce);
+    let expires_at_ms = granted_at_ms.saturating_add(FLEET_GRANT_TTL_MS);
+    let payload =
+        canonical_grant_payload(node_id, operator_id, granted_at_ms, expires_at_ms, &nonce_hex);
     let sig: Signature = signing_key.sign(payload.as_bytes());
     SignedClearanceGrant {
         node_id: node_id.to_string(),
         operator_id: operator_id.to_string(),
         granted_at_ms,
+        expires_at_ms,
+        nonce_hex,
         signature_b64: B64.encode(sig.to_bytes()),
     }
+}
+
+/// Lowercase-hex encode (small, dependency-free — avoids pulling the `hex` crate
+/// into this leaf for a 16-byte nonce).
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// Verify a clearance grant's Ed25519 signature against `public_key_b64`. Fail-closed
@@ -276,7 +342,13 @@ pub fn verify_clearance_grant(grant: &SignedClearanceGrant, public_key_b64: &str
     let Ok(sig_array) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else { return false };
     let Ok(key) = VerifyingKey::from_bytes(&pk_array) else { return false };
     let sig = Signature::from_bytes(&sig_array);
-    let payload = canonical_grant_payload(&grant.node_id, &grant.operator_id, grant.granted_at_ms);
+    let payload = canonical_grant_payload(
+        &grant.node_id,
+        &grant.operator_id,
+        grant.granted_at_ms,
+        grant.expires_at_ms,
+        &grant.nonce_hex,
+    );
     key.verify(payload.as_bytes(), &sig).is_ok()
 }
 
@@ -284,14 +356,22 @@ pub fn verify_clearance_grant(grant: &SignedClearanceGrant, public_key_b64: &str
 /// Phase-A store path as a `PENDING-NODE-TRANSPORT` row — the same row Phase-B's
 /// `take_pending_clearance_grant` consumes. No new schema, no second release path.
 ///
-/// Verify-FIRST, fail-closed: an unsigned / bad-signature / structurally-malformed
-/// grant is rejected + counted and NEVER reaches the store. Returns the store rowid
-/// on success.
+/// Verify-FIRST, fail-closed: an unsigned / bad-signature / structurally-malformed /
+/// expired / replayed grant is rejected + counted and NEVER reaches the store.
+/// Returns the store rowid on success.
+///
+/// **Replay defense (#322).** After the signature verifies, the grant must be both
+/// FRESH (`now_ms < expires_at_ms`, else [`RejectReason::Expired`]) and UNSEEN — the
+/// nonce is burned via [`VerifierStore::burn_federation_nonce`] in one atomic
+/// verify-AND-consume step; a nonce already on record means the same grant was
+/// ingested before ([`RejectReason::Replayed`]). The burn happens BEFORE the store
+/// write so a replay can never land a duplicate PENDING row.
 pub fn ingest_clearance_grant(
     store: &mut VerifierStore,
     grant: &SignedClearanceGrant,
     public_key_b64: &str,
     counter: &RejectionCounter,
+    now_ms: u64,
 ) -> Result<i64, RejectReason> {
     if grant.signature_b64.trim().is_empty() {
         let r = RejectReason::Unsigned;
@@ -303,13 +383,41 @@ pub fn ingest_clearance_grant(
         counter.record(&r);
         return Err(r);
     }
+    if grant.nonce_hex.trim().is_empty() {
+        let r = RejectReason::Malformed("empty nonce_hex".into());
+        counter.record(&r);
+        return Err(r);
+    }
     if !verify_clearance_grant(grant, public_key_b64) {
         let r = RejectReason::BadSignature;
         counter.record(&r);
         return Err(r);
     }
-    // Verified → the existing Phase-A path (writes the PENDING row + signed audit
-    // event). Phase-B picks it up unchanged.
+    // Authentic — now enforce freshness BEFORE consuming the nonce, so a stale grant
+    // never burns a nonce slot.
+    if now_ms >= grant.expires_at_ms {
+        let r = RejectReason::Expired;
+        counter.record(&r);
+        return Err(r);
+    }
+    // Verify-AND-consume: atomically claim the nonce. `Ok(false)` = already burned =
+    // a replay of a still-fresh captured grant. Burn BEFORE the store write so a
+    // replay can never produce a duplicate PENDING row.
+    match store.burn_federation_nonce(&grant.nonce_hex) {
+        Ok(true) => {} // first use — proceed
+        Ok(false) => {
+            let r = RejectReason::Replayed;
+            counter.record(&r);
+            return Err(r);
+        }
+        Err(e) => {
+            let r = RejectReason::StoreError(e.to_string());
+            counter.record(&r);
+            return Err(r);
+        }
+    }
+    // Verified, fresh, first-use → the existing Phase-A path (writes the PENDING row +
+    // signed audit event). Phase-B picks it up unchanged.
     match store.save_clearance_grant_chained(&grant.node_id, &grant.operator_id, grant.granted_at_ms) {
         Ok(rowid) => {
             counter.record_accepted();
@@ -425,7 +533,7 @@ mod core_tests {
         let mut store = VerifierStore::new(":memory:").unwrap();
 
         let grant = sign_clearance_grant(&sk, "robot-01", "alice", 1_000);
-        let rowid = ingest_clearance_grant(&mut store, &grant, &pk, &counter).unwrap();
+        let rowid = ingest_clearance_grant(&mut store, &grant, &pk, &counter, 1_001).unwrap();
         assert!(rowid > 0);
         assert_eq!(counter.snapshot().accepted, 1);
 
@@ -448,10 +556,74 @@ mod core_tests {
         let mut grant = sign_clearance_grant(&sk, "robot-01", "alice", 1_000);
         // Tamper: change the operator AFTER signing → signature no longer matches.
         grant.operator_id = "mallory".into();
-        let err = ingest_clearance_grant(&mut store, &grant, &pk, &counter).unwrap_err();
+        let err = ingest_clearance_grant(&mut store, &grant, &pk, &counter, 1_001).unwrap_err();
         assert_eq!(err, RejectReason::BadSignature);
         assert_eq!(counter.snapshot().bad_signature, 1);
         // Nothing was written — Phase-B finds no pending row.
         assert!(store.take_pending_clearance_grant("robot-01", 2_000).unwrap().is_none());
+    }
+
+    #[test]
+    fn replayed_grant_is_rejected_and_lands_no_second_row() {
+        // #322 — THE REPLAY PROOF: the SAME signed grant, captured off the
+        // untrusted carrier and re-delivered while still fresh, is rejected on the
+        // second ingest (its nonce is already burned) and writes NO second row.
+        let (sk, pk) = keypair();
+        let counter = RejectionCounter::new();
+        let mut store = VerifierStore::new(":memory:").unwrap();
+
+        let grant = sign_clearance_grant(&sk, "robot-07", "alice", 1_000);
+
+        // First delivery — accepted, lands the PENDING row.
+        let rowid = ingest_clearance_grant(&mut store, &grant, &pk, &counter, 1_001).unwrap();
+        assert!(rowid > 0);
+        assert_eq!(counter.snapshot().accepted, 1);
+
+        // Verbatim replay (same bytes, still inside the TTL) — rejected as Replayed.
+        let err = ingest_clearance_grant(&mut store, &grant, &pk, &counter, 1_002).unwrap_err();
+        assert_eq!(err, RejectReason::Replayed);
+        assert_eq!(counter.snapshot().replayed, 1);
+        assert_eq!(counter.snapshot().accepted, 1, "the replay must NOT count as accepted");
+
+        // Exactly one row reached Phase-B — the replay produced no duplicate.
+        assert!(store.take_pending_clearance_grant("robot-07", 1_500).unwrap().is_some());
+        assert!(store.take_pending_clearance_grant("robot-07", 1_600).unwrap().is_none());
+    }
+
+    #[test]
+    fn expired_grant_is_rejected_and_burns_no_nonce() {
+        // An authentic-but-stale grant replayed past its TTL is rejected as Expired
+        // and — crucially — does NOT burn its nonce, so a legitimate re-issue of the
+        // same logical grant is unaffected.
+        let (sk, pk) = keypair();
+        let counter = RejectionCounter::new();
+        let mut store = VerifierStore::new(":memory:").unwrap();
+
+        let grant = sign_clearance_grant(&sk, "robot-08", "alice", 1_000);
+        // now_ms past expires_at_ms (1_000 + FLEET_GRANT_TTL_MS).
+        let stale_now = 1_000 + FLEET_GRANT_TTL_MS + 1;
+        let err = ingest_clearance_grant(&mut store, &grant, &pk, &counter, stale_now).unwrap_err();
+        assert_eq!(err, RejectReason::Expired);
+        assert_eq!(counter.snapshot().expired, 1);
+
+        // Nothing written, and the nonce was never burned (freshness gates before burn).
+        assert!(store.take_pending_clearance_grant("robot-08", stale_now).unwrap().is_none());
+        assert!(
+            store.burn_federation_nonce(&grant.nonce_hex).unwrap(),
+            "nonce must still be free → first burn returns true"
+        );
+    }
+
+    #[test]
+    fn grant_with_empty_nonce_is_malformed() {
+        let (sk, pk) = keypair();
+        let counter = RejectionCounter::new();
+        let mut store = VerifierStore::new(":memory:").unwrap();
+
+        let mut grant = sign_clearance_grant(&sk, "robot-09", "alice", 1_000);
+        grant.nonce_hex = String::new(); // strip the nonce
+        let err = ingest_clearance_grant(&mut store, &grant, &pk, &counter, 1_001).unwrap_err();
+        assert_eq!(err, RejectReason::Malformed("empty nonce_hex".into()));
+        assert_eq!(counter.snapshot().malformed, 1);
     }
 }

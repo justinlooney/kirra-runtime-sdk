@@ -1682,6 +1682,33 @@ impl VerifierStore {
         Ok(count > 0)
     }
 
+    /// Atomically *burn* a nonce: claim it on first use, reject it on replay.
+    ///
+    /// Returns `Ok(true)` if the nonce was newly recorded (first time seen →
+    /// the caller may proceed) and `Ok(false)` if it was already present (a
+    /// replay → the caller must reject). This is the verify-AND-consume primitive
+    /// the untrusted fleet carrier needs: a single `INSERT OR IGNORE` against the
+    /// `nonce_hex PRIMARY KEY` makes the claim atomic — there is no check-then-act
+    /// window for two concurrent ingests of the same captured payload to both win.
+    ///
+    /// The write rides the `synchronous=FULL` durable connection (same as the
+    /// federation report nonce burn), falling back to the main connection for an
+    /// in-memory store. The `seen_at_ms` column is diagnostic only — replay
+    /// correctness depends solely on the primary-key conflict, never on the clock.
+    pub fn burn_federation_nonce(&self, nonce_hex: &str) -> Result<bool> {
+        let seen_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let changed = self.durable_ref().execute(
+            "INSERT OR IGNORE INTO federation_report_nonces
+                 (nonce_hex, source_controller_id, seen_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![nonce_hex, "fleet-grant-lane", seen_at_ms],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn load_federated_reports_for_asset(
         &self,
         asset_id: &str,
