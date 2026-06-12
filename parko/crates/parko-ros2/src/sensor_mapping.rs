@@ -2878,7 +2878,7 @@ mod radar_tests {
         // [F=5, N=2]: feature f of detection 0 is at index f*2 + 0.
         let r = t(&out);
         assert_eq!(r.len(), 5 * 2);
-        assert_eq!(r[0 * 2], 10.0); // range
+        assert_eq!(r[0], 10.0); // range (feature 0 of detection 0: index 0*2)
         assert_eq!(r[2], 0.2);  // az
         assert_eq!(r[3 * 2], 4.0);  // velocity (Doppler)
         // detection-1 slots (odd indices) are padding.
