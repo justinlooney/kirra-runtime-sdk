@@ -121,6 +121,9 @@ impl ParkoNodeConfig {
     pub fn impact_cfg(&self) -> parko_core::ImpactCfg {
         parko_core::ImpactCfg {
             spike_threshold_mps2: self.spike_threshold_mps2,
+            // #321: M/N confirmation defaults (single-tick) come from the default;
+            // the node-config surface only tunes the threshold today.
+            ..parko_core::ImpactCfg::default()
         }
     }
 }
