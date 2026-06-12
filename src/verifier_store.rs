@@ -82,6 +82,24 @@ pub struct PendingClearanceGrant {
     pub granted_at_ms: u64,
 }
 
+/// A registered operator (#314 Phase 1). `pubkey_pem` is the PUBLIC key only.
+#[derive(Debug, Clone)]
+pub struct OperatorRecord {
+    pub operator_id: String,
+    pub pubkey_pem: String,
+    pub registered_at_ms: u64,
+    /// `None` = active; `Some(ms)` = revoked at that time (cannot clear grants).
+    pub revoked_at_ms: Option<u64>,
+}
+
+impl OperatorRecord {
+    /// True iff the operator is registered and not revoked.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.revoked_at_ms.is_none()
+    }
+}
+
 /// The latest clearance grant's delivery state for a node (console read surface).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ClearanceGrantState {
@@ -399,6 +417,12 @@ impl VerifierStore {
             "ALTER TABLE clearance_grants ADD COLUMN consumed_at_ms INTEGER",
             "ALTER TABLE clearance_grants ADD COLUMN outcome TEXT",
             "ALTER TABLE clearance_grants ADD COLUMN outcome_detail TEXT",
+            // #314 Phase 1 — operator-proven identity. ADDITIVE: how the grant was
+            // authorized ("operator-signed" / "supervisor-break-glass" /
+            // "unspecified") and WHICH operator key signed it (fingerprint). Phase-B
+            // `take_pending_clearance_grant` does not read these — delivery unchanged.
+            "ALTER TABLE clearance_grants ADD COLUMN auth_method TEXT",
+            "ALTER TABLE clearance_grants ADD COLUMN operator_key_fingerprint TEXT",
         ] {
             if let Err(e) = conn.execute(col_sql, []) {
                 if !e.to_string().contains("duplicate column name") {
@@ -406,6 +430,20 @@ impl VerifierStore {
                 }
             }
         }
+
+        // #314 Phase 1 — registered operators (per-operator Ed25519 identity).
+        // `pubkey_pem` is the operator's PUBLIC key only (no private material ever
+        // touches the server). `revoked_at_ms` NULL = active; a revoked operator
+        // can never clear a grant. Mirrors the `nodes` registry shape.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS operators (
+                operator_id       TEXT    PRIMARY KEY,
+                pubkey_pem        TEXT    NOT NULL,
+                registered_at_ms  INTEGER NOT NULL,
+                revoked_at_ms     INTEGER
+            )",
+            [],
+        )?;
 
         // AV subsystem metadata: confidence floors, telemetry timestamps, recovery streak.
         conn.execute(
@@ -1309,19 +1347,52 @@ impl VerifierStore {
         operator_id: &str,
         granted_at_ms: u64,
     ) -> Result<i64> {
+        // Backward-compatible: existing callers (Phase-B tests, the fleet relay,
+        // the demo seed) record with auth_method = "unspecified". The auth-aware
+        // path below is what the upgraded console route uses.
+        self.save_clearance_grant_chained_with_auth(
+            node_id, operator_id, granted_at_ms, "unspecified", None,
+        )
+    }
+
+    /// Record a clearance grant with its **authorization provenance** (#314 Phase
+    /// 1) — `auth_method` (`operator-signed` / `supervisor-break-glass` /
+    /// `unspecified`) and the signing operator's key `fingerprint`. Both are
+    /// written to the (additive) grant columns AND embedded in the
+    /// `OperatorClearanceGrantIssued` chain event — the non-repudiation payoff: the
+    /// signed ledger records WHO authorized the release and with WHICH key. The
+    /// `PENDING-NODE-TRANSPORT` row + the columns Phase-B reads are unchanged.
+    pub fn save_clearance_grant_chained_with_auth(
+        &mut self,
+        node_id: &str,
+        operator_id: &str,
+        granted_at_ms: u64,
+        auth_method: &str,
+        operator_key_fingerprint: Option<&str>,
+    ) -> Result<i64> {
         let payload = serde_json::json!({
             "node_id": node_id,
             "operator_id": operator_id,
             "granted_at_ms": granted_at_ms,
             "delivery": "PENDING-NODE-TRANSPORT",
+            "auth_method": auth_method,
+            "operator_key_fingerprint": operator_key_fingerprint,
         })
         .to_string();
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO clearance_grants
-             (node_id, operator_id, granted_at_ms, delivery, created_at_ms)
-             VALUES (?1, ?2, ?3, 'PENDING-NODE-TRANSPORT', ?4)",
-            params![node_id, operator_id, granted_at_ms as i64, granted_at_ms as i64],
+             (node_id, operator_id, granted_at_ms, delivery, created_at_ms,
+              auth_method, operator_key_fingerprint)
+             VALUES (?1, ?2, ?3, 'PENDING-NODE-TRANSPORT', ?4, ?5, ?6)",
+            params![
+                node_id,
+                operator_id,
+                granted_at_ms as i64,
+                granted_at_ms as i64,
+                auth_method,
+                operator_key_fingerprint,
+            ],
         )?;
         let id = tx.last_insert_rowid();
         crate::audit_chain::AuditChainLinker::append_audit_event_tx(
@@ -1333,6 +1404,60 @@ impl VerifierStore {
         )?;
         tx.commit()?;
         Ok(id)
+    }
+
+    // --- #314 Phase 1 — operator registry -----------------------------------
+
+    /// Register (or re-register / rotate) an operator's Ed25519 PUBLIC key.
+    /// Re-registration overwrites the key and CLEARS any prior revocation (a fresh
+    /// key for an operator is an active operator). Admin-gated at the route layer.
+    pub fn register_operator(
+        &mut self,
+        operator_id: &str,
+        pubkey_pem: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO operators (operator_id, pubkey_pem, registered_at_ms, revoked_at_ms)
+             VALUES (?1, ?2, ?3, NULL)
+             ON CONFLICT(operator_id) DO UPDATE SET
+                 pubkey_pem = excluded.pubkey_pem,
+                 registered_at_ms = excluded.registered_at_ms,
+                 revoked_at_ms = NULL",
+            params![operator_id, pubkey_pem, now_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Revoke an operator (sets `revoked_at_ms`). Returns `true` if an ACTIVE
+    /// operator was revoked, `false` if absent or already revoked.
+    pub fn revoke_operator(&mut self, operator_id: &str, now_ms: u64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE operators SET revoked_at_ms = ?2
+             WHERE operator_id = ?1 AND revoked_at_ms IS NULL",
+            params![operator_id, now_ms as i64],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Load an operator record (active or revoked), or `None` if unregistered.
+    pub fn load_operator(&self, operator_id: &str) -> Result<Option<OperatorRecord>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT operator_id, pubkey_pem, registered_at_ms, revoked_at_ms
+                 FROM operators WHERE operator_id = ?1",
+                params![operator_id],
+                |row| {
+                    Ok(OperatorRecord {
+                        operator_id: row.get(0)?,
+                        pubkey_pem: row.get(1)?,
+                        registered_at_ms: row.get::<_, i64>(2)? as u64,
+                        revoked_at_ms: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                    })
+                },
+            )
+            .optional()
     }
 
     /// Append a signed, hash-chained console audit event with **no** other table

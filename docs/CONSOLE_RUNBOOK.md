@@ -84,6 +84,87 @@ A fresh `KIRRA_DB_PATH` re-seeds cleanly (step 2).
 
 ---
 
+## Operator onboarding (#314 Phase 1 — operator-proven identity)
+
+The console's primary clearance path is **operator-signed**: a registered operator
+proves possession of their Ed25519 private key by signing a server challenge, so a
+grant becomes **non-repudiable chain evidence** (the signed ledger records *which
+key* authorized the release), not a self-reported string. The attestation pattern,
+applied to humans.
+
+(`$KIRRA_ADMIN_TOKEN` is exported in step 1; `$BASE` is the running service.)
+
+```sh
+export BASE="http://127.0.0.1:8090"
+```
+
+### 1. Generate an operator keypair (the private key NEVER leaves the operator)
+
+```sh
+openssl genpkey -algorithm ed25519 -out operator_priv.pem      # PRIVATE — keep secret
+openssl pkey -in operator_priv.pem -pubout -out operator_pub.pem  # PUBLIC — to register
+```
+
+### 2. Register the operator's PUBLIC key (admin-gated — a SEPARATE power from the supervisor key)
+
+```sh
+jq -n --arg op alice --arg pem "$(cat operator_pub.pem)" \
+   '{operator_id:$op, ed25519_pubkey_pem:$pem}' \
+ | curl -s -X POST "$BASE/console/operators" \
+     -H "authorization: Bearer $KIRRA_ADMIN_TOKEN" \
+     -H "content-type: application/json" --data-binary @-
+# → {"operator_id":"alice","operator_key_fingerprint":"...","status":"registered"}
+```
+
+Revoke with `POST $BASE/console/operators/alice/revoke` (also admin-gated). A revoked
+operator can never clear a grant.
+
+### 3. Sign a grant — in the browser (primary)
+
+In the grant card, enter the node id + operator id, **paste the operator private key
+PEM** (held in memory for the session only — never `localStorage`, never sent; the
+page signs locally via WebCrypto Ed25519), and submit. The page fetches a one-time
+challenge, signs the canonical payload, and posts the signature. The grant card shows
+the **auth method** + the **key fingerprint**.
+
+### 3-alt. Sign a grant — CLI (when WebCrypto Ed25519 is unavailable)
+
+The console feature-detects WebCrypto Ed25519; if the browser lacks it the in-page
+form is replaced with a pointer here (it does **not** silently fall back to
+break-glass). Sign from the CLI instead — this Python snippet mirrors the server's
+canonical payload exactly:
+
+```python
+import base64, struct, json, urllib.request
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+BASE, op, node = "http://127.0.0.1:8090", "alice", "robot-01"
+priv = load_pem_private_key(open("operator_priv.pem","rb").read(), None)
+nonce = json.load(urllib.request.urlopen(
+    f"{BASE}/console/clearance-challenge?operator_id={op}&node_id={node}"))["nonce"]
+lp = lambda s: struct.pack("<Q", len(s.encode())) + s.encode()        # u64-LE length prefix
+payload = b"KIRRA-OPERATOR-GRANT-v1" + lp(op) + lp(node) + lp(nonce)   # == operator_grant_signing_payload
+sig = base64.b64encode(priv.sign(payload)).decode()
+req = urllib.request.Request(f"{BASE}/console/clearance-grants", method="POST",
+    data=json.dumps({"node_id":node,"operator_id":op,"nonce":nonce,"signature_b64":sig}).encode(),
+    headers={"content-type":"application/json"})
+print(urllib.request.urlopen(req).read().decode())
+```
+
+### Break-glass policy (the named, audited supervisor fallback)
+
+The shared supervisor key (`KIRRA_SUPERVISOR_RESET_KEY`, #255) **remains** as an
+explicitly-named **break-glass** path — recorded distinctly as
+`auth_method="supervisor-break-glass"` and logged loudly — **because a fleet locked
+out of recovery by a lost operator key is its own safety failure**. It is the
+console's *secondary* affordance (a collapsed "Break-glass" panel), never the
+primary. **Deployments that don't want it disable it by unsetting
+`KIRRA_SUPERVISOR_RESET_KEY`** (the route then fail-closes 503 for break-glass while
+operator-signed grants keep working). Use it only when an operator key is genuinely
+unavailable; every use is auditable and visibly distinct from operator-signed grants.
+
+---
+
 ## What you're looking at (one pane at a time)
 
 For a first-time viewer — each pane is a window onto a **real** mechanism, not a

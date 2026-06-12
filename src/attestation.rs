@@ -137,7 +137,7 @@ pub fn attestation_signing_payload(node_id: &str, nonce: u64) -> Vec<u8> {
 /// stripped here as plain text; the resulting DER is parsed by the vetted
 /// `spki` parser via `VerifyingKey::from_public_key_der`. Returns `None` on
 /// any malformation — callers fail closed.
-fn parse_ed25519_public_pem(pem: &str) -> Option<VerifyingKey> {
+pub fn parse_ed25519_public_pem(pem: &str) -> Option<VerifyingKey> {
     let der_b64: String = pem
         .lines()
         .map(str::trim)
@@ -145,6 +145,62 @@ fn parse_ed25519_public_pem(pem: &str) -> Option<VerifyingKey> {
         .collect();
     let der = B64.decode(der_b64.as_bytes()).ok()?;
     VerifyingKey::from_public_key_der(&der).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Operator-proven identity (#314 Phase 1) — the attestation pattern applied to
+// HUMANS. A registered operator proves possession of their Ed25519 private key
+// by signing a challenge, exactly as a node proves possession of its AK. REUSES
+// the same PEM parser, the same domain-separated/length-prefixed canonicalization
+// style, and `verify_strict`.
+// ---------------------------------------------------------------------------
+
+/// Domain tag for an operator clearance-grant signature. Distinct from
+/// [`ATTESTATION_DOMAIN`] so an operator signature can never be cross-replayed as
+/// a node attestation (or vice versa).
+pub const OPERATOR_GRANT_DOMAIN: &[u8] = b"KIRRA-OPERATOR-GRANT-v1";
+
+/// The exact byte payload an operator signs (with their private key) and the
+/// verifier reconstructs, for a clearance grant on `(operator_id, node_id, nonce)`.
+///
+/// Domain-separated and **length-prefixed on every field** (u64 LE length, then
+/// the field bytes) — the same anti-collision discipline as
+/// [`attestation_signing_payload`], extended to three fields. The browser
+/// (WebCrypto) and the server MUST construct this identically. `nonce` is the
+/// challenge nonce as the hex string the server issued (a string, not a u64, so the
+/// in-browser flow never loses precision on a > 2^53 value).
+#[must_use]
+pub fn operator_grant_signing_payload(operator_id: &str, node_id: &str, nonce: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(OPERATOR_GRANT_DOMAIN.len() + 24
+        + operator_id.len() + node_id.len() + nonce.len());
+    payload.extend_from_slice(OPERATOR_GRANT_DOMAIN);
+    for field in [operator_id, node_id, nonce] {
+        let b = field.as_bytes();
+        payload.extend_from_slice(&(b.len() as u64).to_le_bytes());
+        payload.extend_from_slice(b);
+    }
+    payload
+}
+
+/// Verify an Ed25519 signature over `payload` against a PEM-encoded public key.
+/// Fail-closed: a malformed key, a non-64-byte signature, or a bad signature all
+/// return `false`. Uses `verify_strict` (the same path as node attestation).
+#[must_use]
+pub fn verify_ed25519_pem_signature(pem: &str, payload: &[u8], signature_bytes: &[u8]) -> bool {
+    let Some(vk) = parse_ed25519_public_pem(pem) else { return false };
+    let Ok(sig_array) = <[u8; ED25519_SIGNATURE_LEN]>::try_from(signature_bytes) else {
+        return false;
+    };
+    vk.verify_strict(payload, &Signature::from_bytes(&sig_array)).is_ok()
+}
+
+/// A short, stable fingerprint for a PEM-encoded Ed25519 public key — the
+/// `audit_chain::verifying_key_id` convention reused for operators. `None` if the
+/// PEM is not a valid Ed25519 SPKI key. Recorded with each grant for
+/// non-repudiation (WHICH key signed it).
+#[must_use]
+pub fn operator_key_fingerprint(pem: &str) -> Option<String> {
+    parse_ed25519_public_pem(pem).map(|vk| crate::audit_chain::verifying_key_id(&vk))
 }
 
 /// Verify a node attestation proof (issue #73).

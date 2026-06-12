@@ -50,6 +50,18 @@ pub struct ChallengeEntry {
     pub expires_at_ms: u64,
 }
 
+/// Volatile operator clearance-challenge entry (#314 Phase 1). The human analogue
+/// of [`ChallengeEntry`]: a one-time nonce an operator must sign to prove key
+/// possession before a grant is recorded. The nonce is a HEX STRING (not a u64) so
+/// the in-browser WebCrypto flow never loses precision on a > 2^53 value. Same
+/// volatility discipline as `pending_challenges` (INVARIANT #5): never persisted,
+/// TTL-bounded, single-use.
+#[derive(Debug, Clone)]
+pub struct ClearanceChallengeEntry {
+    pub nonce_hex: String,
+    pub expires_at_ms: u64,
+}
+
 /// Flap-detection result for a node over the last 5 minutes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlapStatus {
@@ -178,6 +190,10 @@ pub struct AppState {
     pub dependency_graph: DashMap<String, Vec<String>>,
     /// Volatile in-memory challenge map — nonces are never persisted to SQLite.
     pub pending_challenges: DashMap<String, ChallengeEntry>,
+    /// Volatile operator clearance-challenge map (#314 Phase 1) — keyed by
+    /// `"{operator_id}|{node_id}"`. Same volatility discipline as
+    /// `pending_challenges` (INVARIANT #5): never persisted, TTL-bounded, single-use.
+    pub pending_clearance_challenges: DashMap<String, ClearanceChallengeEntry>,
     /// Durable store for nodes and dependency graph (write-through, read on boot).
     pub store: Arc<Mutex<VerifierStore>>,
     /// Runtime-mutable operational mode.
@@ -260,6 +276,7 @@ impl AppState {
             nodes: DashMap::new(),
             dependency_graph: DashMap::new(),
             pending_challenges: DashMap::new(),
+            pending_clearance_challenges: DashMap::new(),
             store: Arc::new(Mutex::new(store)),
             mode_active: Arc::new(AtomicBool::new(mode == VerifierOperationMode::Active)),
             held_epoch: Arc::new(AtomicU64::new(0)),
@@ -472,6 +489,32 @@ impl AppState {
             nonce,
             expires_at_ms: now_ms + CHALLENGE_TTL_MS,
         });
+    }
+
+    /// Issue an operator clearance-challenge nonce, keyed by `(operator_id,
+    /// node_id)` (#314 Phase 1). Mirrors [`issue_challenge`](Self::issue_challenge):
+    /// prunes expired entries, per-key overwrite, TTL-bounded.
+    pub fn issue_clearance_challenge(&self, key: &str, nonce_hex: String, now_ms: u64) {
+        self.pending_clearance_challenges
+            .retain(|_, e| now_ms <= e.expires_at_ms);
+        self.pending_clearance_challenges.insert(
+            key.to_string(),
+            ClearanceChallengeEntry { nonce_hex, expires_at_ms: now_ms + CHALLENGE_TTL_MS },
+        );
+    }
+
+    /// Consume an operator clearance-challenge nonce — the VERIFY-THEN-CONSUME
+    /// half (the caller verifies the signature FIRST). Atomic `remove` so a
+    /// replay finds nothing. Returns false if absent, expired, or mismatched.
+    pub fn consume_clearance_challenge(&self, key: &str, nonce_hex: &str, now_ms: u64) -> bool {
+        let entry = match self.pending_clearance_challenges.remove(key) {
+            Some((_, e)) => e,
+            None => return false,
+        };
+        if now_ms > entry.expires_at_ms {
+            return false;
+        }
+        entry.nonce_hex == nonce_hex
     }
 }
 

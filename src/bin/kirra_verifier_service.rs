@@ -2801,89 +2801,311 @@ fn check_supervisor_key(headers: &HeaderMap) -> Result<(), StatusCode> {
     supervisor_key_ok(provided, configured.as_deref())
 }
 
+// ---------------------------------------------------------------------------
+// #314 Phase 1 — operator-proven identity (the attestation pattern for humans)
+// ---------------------------------------------------------------------------
+
+/// Audit a clearance-grant rejection (never records key bytes / signatures).
+fn audit_grant_rejection(
+    app: &kirra_runtime_sdk::verifier::AppState,
+    reason: &str,
+    node_id: &str,
+    operator_id: &str,
+    now: u64,
+) {
+    if let Ok(mut store) = app.store.lock() {
+        let _ = store.append_clearance_audit_event(
+            "OperatorClearanceGrantRejected",
+            &json!({ "reason": reason, "node_id": node_id, "operator_id": operator_id }).to_string(),
+            now,
+        );
+    }
+}
+
+#[derive(Deserialize)]
+struct RegisterOperatorRequest {
+    operator_id: String,
+    ed25519_pubkey_pem: String,
+}
+
+/// POST /console/operators — register (or rotate) an operator's Ed25519 PUBLIC key
+/// (#314 Phase 1). **ADMIN-token-gated** (the node-registration precedent). Admin
+/// and supervisor are SEPARATE powers: this route lives behind
+/// `require_admin_token`, so the **supervisor key cannot register operators**. The
+/// private key NEVER reaches the server — only the public key is stored.
+async fn register_operator(
+    State(svc): State<Arc<ServiceState>>,
+    Json(req): Json<RegisterOperatorRequest>,
+) -> impl IntoResponse {
+    let operator_id = req.operator_id.trim();
+    if operator_id.is_empty() {
+        return (StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": "operator_id must be non-empty" }))).into_response();
+    }
+    // Fail-closed: the PEM must parse as a valid Ed25519 SPKI public key.
+    let fingerprint = match kirra_runtime_sdk::attestation::operator_key_fingerprint(
+        &req.ed25519_pubkey_pem,
+    ) {
+        Some(fp) => fp,
+        None => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({
+            "error": "ed25519_pubkey_pem is not a valid Ed25519 SubjectPublicKeyInfo PEM"
+        }))).into_response(),
+    };
+    let now = now_ms();
+    match svc.app.store.lock() {
+        Ok(mut store) => {
+            if store.register_operator(operator_id, &req.ed25519_pubkey_pem, now).is_err() {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "persist failed" }))).into_response();
+            }
+            let _ = store.append_clearance_audit_event(
+                "OperatorRegistered",
+                &json!({ "operator_id": operator_id, "operator_key_fingerprint": fingerprint })
+                    .to_string(),
+                now,
+            );
+            (StatusCode::CREATED, Json(json!({
+                "operator_id": operator_id,
+                "operator_key_fingerprint": fingerprint,
+                "status": "registered",
+            }))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+}
+
+/// POST /console/operators/{operator_id}/revoke — revoke an operator (#314).
+/// ADMIN-token-gated. A revoked operator can never clear a grant.
+async fn revoke_operator(
+    State(svc): State<Arc<ServiceState>>,
+    Path(operator_id): Path<String>,
+) -> impl IntoResponse {
+    let now = now_ms();
+    match svc.app.store.lock() {
+        Ok(mut store) => match store.revoke_operator(&operator_id, now) {
+            Ok(true) => {
+                let _ = store.append_clearance_audit_event(
+                    "OperatorRevoked",
+                    &json!({ "operator_id": operator_id }).to_string(),
+                    now,
+                );
+                (StatusCode::OK, Json(json!({ "operator_id": operator_id, "status": "revoked" })))
+                    .into_response()
+            }
+            Ok(false) => (StatusCode::NOT_FOUND,
+                          Json(json!({ "error": "operator not found or already revoked" })))
+                .into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                       Json(json!({ "error": "persist failed" }))).into_response(),
+        },
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(json!({ "error": "store lock poisoned" }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ClearanceChallengeQuery {
+    operator_id: String,
+    node_id: String,
+}
+
+/// GET /console/clearance-challenge?operator_id=&node_id= — issue a one-time nonce
+/// the operator signs to prove key possession (#314 Phase 1; the attestation
+/// challenge-issuance pattern). Unauthenticated (the nonce alone grants nothing —
+/// only a valid signature over it does); we 403 unknown/revoked operators so a
+/// challenge is never issued to a non-operator. Short TTL; stored volatile for
+/// verify-then-consume at grant time.
+async fn clearance_challenge(
+    State(svc): State<Arc<ServiceState>>,
+    Query(q): Query<ClearanceChallengeQuery>,
+) -> impl IntoResponse {
+    if !svc.app.is_active() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "instance is in passive standby mode" }))).into_response();
+    }
+    let operator_id = q.operator_id.trim();
+    let node_id = q.node_id.trim();
+    if operator_id.is_empty() || node_id.is_empty() {
+        return (StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": "operator_id and node_id are required" }))).into_response();
+    }
+    let active = match svc.app.store.lock() {
+        Ok(store) => store
+            .load_operator(operator_id)
+            .ok()
+            .flatten()
+            .map(|o| o.is_active())
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    if !active {
+        return (StatusCode::FORBIDDEN,
+                Json(json!({ "error": "unknown or revoked operator" }))).into_response();
+    }
+    // Hex string (not a u64) so the in-browser signing flow never loses precision.
+    let nonce_hex = format!("{:016x}", kirra_runtime_sdk::verifier::generate_challenge_nonce());
+    let key = format!("{operator_id}|{node_id}");
+    svc.app.issue_clearance_challenge(&key, nonce_hex.clone(), now_ms());
+    (StatusCode::OK, Json(json!({
+        "operator_id": operator_id,
+        "node_id": node_id,
+        "nonce": nonce_hex,
+        "ttl_ms": 30_000,
+    }))).into_response()
+}
+
 #[derive(Deserialize)]
 struct ClearanceGrantRequest {
     node_id: String,
     operator_id: String,
+    /// Operator-signed path: the challenge nonce (as issued) + the base64 Ed25519
+    /// signature over `operator_grant_signing_payload(operator_id, node_id, nonce)`.
+    #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
+    signature_b64: Option<String>,
 }
 
-/// POST /console/clearance-grants — the ONE inbound console affordance.
+/// POST /console/clearance-grants — the ONE inbound console affordance, upgraded
+/// to operator-proven identity (#314 Phase 1).
 ///
-/// **RECORD-ONLY (Phase A):** records + signs a supervisor clearance grant; it
-/// does NOT release the node (delivery to the node `ClearanceLoop` is Phase B).
-/// Auth = the #255 supervisor key (`x-kirra-supervisor-key`). The server stamps
-/// `granted_at_ms` from ITS clock — the client never supplies a timestamp (a
-/// client time would re-open the future-dating hole the loop's validation
-/// closes). Never mutates posture.
+/// **RECORD-ONLY (Phase A):** records + signs a clearance grant; it does NOT
+/// release the node (delivery to the node `ClearanceLoop` is Phase B). The server
+/// stamps `granted_at_ms` from ITS clock (no client time → no future-dating).
+/// Never mutates posture.
+///
+/// Two auth paths:
+///   * **operator-signed (PRIMARY):** a registered operator proves key possession
+///     by signing the challenge nonce. Handler order mirrors `verify_attestation`:
+///     load operator (unknown/revoked → 403) → VERIFY signature → CONSUME nonce
+///     (verify-then-consume; replay → 401) → well-formedness → record with
+///     `auth_method="operator-signed"` + the key fingerprint, BOTH embedded in the
+///     signed chain event (the non-repudiation payoff).
+///   * **supervisor-break-glass (NAMED FALLBACK):** the shared `KIRRA_SUPERVISOR_
+///     RESET_KEY` (#255) REMAINS as an explicitly-named break-glass path —
+///     `auth_method="supervisor-break-glass"`, audited distinctly and loudly —
+///     because a fleet locked out of recovery by a lost operator key is its OWN
+///     safety failure. Deployments disable it by unsetting the env. The console UI
+///     presents operator-signed as the primary flow.
 async fn console_clearance_grant(
     State(svc): State<Arc<ServiceState>>,
     headers: HeaderMap,
     Json(req): Json<ClearanceGrantRequest>,
 ) -> impl IntoResponse {
     let now = now_ms();
+    let operator_id = req.operator_id.trim().to_string();
+    let node_id = req.node_id.trim().to_string();
 
-    // 1. Supervisor authorization (reused #255 mechanism).
-    if let Err(code) = check_supervisor_key(&headers) {
-        // A *provided-but-rejected* attempt (401) is audited; a server-misconfig
-        // (503, key unset) is not an operator attempt. Never record key bytes.
-        if code == StatusCode::UNAUTHORIZED {
-            let payload = json!({
-                "reason": "unauthorized",
-                "node_id": req.node_id,
-                "operator_id": req.operator_id,
-            })
-            .to_string();
-            if let Ok(mut store) = svc.app.store.lock() {
-                let _ = store.append_clearance_audit_event(
-                    "OperatorClearanceGrantRejected", &payload, now);
+    let operator_signed = req.signature_b64.as_deref().is_some_and(|s| !s.is_empty());
+
+    let (auth_method, fingerprint): (&str, Option<String>) = if operator_signed {
+        // === OPERATOR-SIGNED PATH — verify-then-consume (mirrors verify_attestation).
+        let nonce = req.nonce.clone().unwrap_or_default();
+        let sig_b64 = req.signature_b64.clone().unwrap_or_default();
+        if nonce.is_empty() {
+            audit_grant_rejection(&svc.app, "missing_nonce", &node_id, &operator_id, now);
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({
+                "status": "rejected", "reason": "nonce required for an operator-signed grant"
+            }))).into_response();
+        }
+        // 1. Load operator — unknown / revoked → 403, audited.
+        let operator = match svc.app.store.lock().ok().and_then(|s| s.load_operator(&operator_id).ok().flatten()) {
+            Some(op) if op.is_active() => op,
+            Some(_) => {
+                audit_grant_rejection(&svc.app, "revoked_operator", &node_id, &operator_id, now);
+                return (StatusCode::FORBIDDEN, Json(json!({
+                    "status": "rejected", "reason": "operator is revoked"
+                }))).into_response();
             }
+            None => {
+                audit_grant_rejection(&svc.app, "unknown_operator", &node_id, &operator_id, now);
+                return (StatusCode::FORBIDDEN, Json(json!({
+                    "status": "rejected", "reason": "operator is not registered"
+                }))).into_response();
+            }
+        };
+        // 2. VERIFY signature FIRST (before the nonce is consumed).
+        use base64::{engine::general_purpose::STANDARD as b64e, Engine as _};
+        let sig_bytes = match b64e.decode(sig_b64.trim()) {
+            Ok(b) => b,
+            Err(_) => {
+                audit_grant_rejection(&svc.app, "malformed_signature", &node_id, &operator_id, now);
+                return (StatusCode::UNAUTHORIZED, Json(json!({
+                    "status": "rejected", "reason": "signature is not valid base64"
+                }))).into_response();
+            }
+        };
+        let payload = kirra_runtime_sdk::attestation::operator_grant_signing_payload(
+            &operator_id, &node_id, &nonce,
+        );
+        if !kirra_runtime_sdk::attestation::verify_ed25519_pem_signature(
+            &operator.pubkey_pem, &payload, &sig_bytes,
+        ) {
+            audit_grant_rejection(&svc.app, "bad_signature", &node_id, &operator_id, now);
+            return (StatusCode::UNAUTHORIZED, Json(json!({
+                "status": "rejected", "reason": "signature verification failed"
+            }))).into_response();
         }
-        return (code,
-                Json(json!({ "status": "rejected", "reason": "supervisor authorization failed" })))
-            .into_response();
-    }
+        // 3. CONSUME the nonce (verify-then-consume; replay/expired → 401, audited).
+        let key = format!("{operator_id}|{node_id}");
+        if !svc.app.consume_clearance_challenge(&key, &nonce, now) {
+            audit_grant_rejection(&svc.app, "nonce_replay_or_expired", &node_id, &operator_id, now);
+            return (StatusCode::UNAUTHORIZED, Json(json!({
+                "status": "rejected",
+                "reason": "challenge nonce absent, expired, or already used (replay rejected)"
+            }))).into_response();
+        }
+        let fp = kirra_runtime_sdk::attestation::operator_key_fingerprint(&operator.pubkey_pem);
+        ("operator-signed", fp)
+    } else {
+        // === BREAK-GLASS PATH — the named, distinctly-audited supervisor fallback.
+        if let Err(code) = check_supervisor_key(&headers) {
+            if code == StatusCode::UNAUTHORIZED {
+                audit_grant_rejection(&svc.app, "supervisor_unauthorized", &node_id, &operator_id, now);
+            }
+            return (code, Json(json!({
+                "status": "rejected",
+                "reason": "no operator signature and supervisor authorization failed"
+            }))).into_response();
+        }
+        tracing::warn!(node_id = %node_id, operator_id = %operator_id,
+            "BREAK-GLASS clearance grant via supervisor key — operator-signed path bypassed \
+             (auth_method=supervisor-break-glass; audited distinctly)");
+        ("supervisor-break-glass", None)
+    };
 
-    // 2. Well-formedness, server-side (mirrors OperatorClearanceGrant::is_well_formed).
-    let operator_id = req.operator_id.trim();
+    // Shared well-formedness (mirrors OperatorClearanceGrant::is_well_formed).
     if operator_id.is_empty() {
-        let payload = json!({ "reason": "empty_operator_id", "node_id": req.node_id }).to_string();
-        if let Ok(mut store) = svc.app.store.lock() {
-            let _ = store.append_clearance_audit_event(
-                "OperatorClearanceGrantRejected", &payload, now);
-        }
-        return (StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "status": "rejected", "reason": "operator_id must be non-empty" })))
-            .into_response();
+        audit_grant_rejection(&svc.app, "empty_operator_id", &node_id, &operator_id, now);
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({
+            "status": "rejected", "reason": "operator_id must be non-empty"
+        }))).into_response();
     }
     let registered = match svc.app.store.lock() {
-        Ok(store) => store.node_exists(&req.node_id).unwrap_or(false),
+        Ok(store) => store.node_exists(&node_id).unwrap_or(false),
         Err(_) => false,
     };
     if !registered {
-        let payload = json!({
-            "reason": "unregistered_node",
-            "node_id": req.node_id,
-            "operator_id": operator_id,
-        })
-        .to_string();
-        if let Ok(mut store) = svc.app.store.lock() {
-            let _ = store.append_clearance_audit_event(
-                "OperatorClearanceGrantRejected", &payload, now);
-        }
-        return (StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "status": "rejected", "reason": "node_id is not a registered node" })))
-            .into_response();
+        audit_grant_rejection(&svc.app, "unregistered_node", &node_id, &operator_id, now);
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({
+            "status": "rejected", "reason": "node_id is not a registered node"
+        }))).into_response();
     }
 
-    // 3. Record + sign — RECORD-ONLY. Delivery is Phase B; posture is untouched.
+    // Record + sign — RECORD-ONLY. Delivery is Phase B; posture is untouched.
     match svc.app.store.lock() {
-        Ok(mut store) => match store.save_clearance_grant_chained(&req.node_id, operator_id, now) {
+        Ok(mut store) => match store.save_clearance_grant_chained_with_auth(
+            &node_id, &operator_id, now, auth_method, fingerprint.as_deref(),
+        ) {
             Ok(_id) => (StatusCode::OK, Json(json!({
                 "status": "recorded",
                 "delivery": "pending-phase-b",
-                "node_id": req.node_id,
+                "node_id": node_id,
                 "operator_id": operator_id,
                 "granted_at_ms": now,
+                "auth_method": auth_method,
+                "operator_key_fingerprint": fingerprint,
                 "note": "grant recorded and signed; the vehicle is NOT released — delivery to the node ClearanceLoop is Phase B",
             }))).into_response(),
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
@@ -2929,6 +3151,10 @@ fn build_app(svc_state: Arc<ServiceState>) -> Router {
         .route("/system/audit/rotate-signing-key", post(handle_audit_rotate_key))
         .route("/federation/controllers/register", post(register_federation_controller))
         .route("/attestation/identity/register", post(register_node_identity))
+        // #314 Phase 1 — operator registry. ADMIN-gated (separate power from the
+        // supervisor key); posture-exempt by the /console/ path prefix.
+        .route("/console/operators", post(register_operator))
+        .route("/console/operators/{operator_id}/revoke", post(revoke_operator))
         .route("/fabric/assets/register", post(handle_register_fabric_asset))
         .route("/fabric/assets", get(handle_list_fabric_assets))
         .route("/fabric/state", get(handle_fabric_state))
@@ -2978,6 +3204,9 @@ fn build_app(svc_state: Arc<ServiceState>) -> Router {
         .route("/console/fleet", get(console_fleet))
         .route("/console/audit", get(console_audit))
         .route("/console/escalations", get(console_escalations))
+        // #314 Phase 1 — operator clearance-challenge (unauthenticated; the nonce
+        // alone grants nothing — only a valid signature over it does).
+        .route("/console/clearance-challenge", get(clearance_challenge))
         .route("/console/clearance-grants", post(console_clearance_grant));
 
     Router::new()
@@ -3927,6 +4156,7 @@ mod systemd_notify_tests {
 mod console_phase_a_tests {
     use super::{build_app, supervisor_key_ok};
 
+    use serde_json::json;
     use std::sync::Arc;
 
     use axum::body::{to_bytes, Body};
@@ -4122,5 +4352,208 @@ mod console_phase_a_tests {
             expected_pcr16_digest_hex: None,
         };
         app.persist_and_insert_node(node).expect("seed node");
+    }
+
+    // ===================================================================
+    // #314 Phase 1 — operator-proven identity. The operator-signed flow uses
+    // NO env (no admin / supervisor key), so it is fully exercisable here; the
+    // operator is seeded via the store directly (the admin route's gating is
+    // proved separately, since INV-13 forbids set_var in a multithread test).
+    // ===================================================================
+
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// A deterministic test operator keypair + its SPKI PEM (reuses the in-repo
+    /// RFC-8410 prefix convention from `attestation_nonce_handler_tests`).
+    fn operator_keypair(seed: u8) -> (SigningKey, String) {
+        use base64::{engine::general_purpose::STANDARD as b64e, Engine as _};
+        const ED25519_SPKI_PREFIX: [u8; 12] =
+            [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let mut der = ED25519_SPKI_PREFIX.to_vec();
+        der.extend_from_slice(sk.verifying_key().as_bytes());
+        let pem = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            b64e.encode(&der)
+        );
+        (sk, pem)
+    }
+
+    fn sign_grant_b64(sk: &SigningKey, operator_id: &str, node_id: &str, nonce: &str) -> String {
+        use base64::{engine::general_purpose::STANDARD as b64e, Engine as _};
+        let payload = kirra_runtime_sdk::attestation::operator_grant_signing_payload(
+            operator_id, node_id, nonce,
+        );
+        b64e.encode(sk.sign(&payload).to_bytes())
+    }
+
+    fn register_op(svc: &Arc<ServiceState>, operator_id: &str, pem: &str) {
+        svc.app.store.lock().unwrap().register_operator(operator_id, pem, 1).unwrap();
+    }
+
+    fn parse_nonce(body: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(body)
+            .unwrap()
+            .get("nonce")
+            .and_then(|x| x.as_str())
+            .expect("challenge body has a nonce")
+            .to_string()
+    }
+
+    async fn post_json(
+        svc: Arc<ServiceState>,
+        path: &str,
+        body: String,
+        supervisor_key: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut rb = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(k) = supervisor_key {
+            rb = rb.header("x-kirra-supervisor-key", k);
+        }
+        let resp = build_app(svc).oneshot(rb.body(Body::from(body)).unwrap()).await.expect("router");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// HAPPY PATH + the ADDITIVE PROOF: an operator-signed grant records with the
+    /// key fingerprint in the signed chain, and the EXISTING Phase-B
+    /// `take_pending_clearance_grant` consumes the new row shape unchanged.
+    #[tokio::test]
+    async fn operator_signed_grant_records_fingerprint_and_phase_b_consumes() {
+        let svc = build_state();
+        seed_node(&svc, "robot-01");
+        let (sk, pem) = operator_keypair(7);
+        register_op(&svc, "alice", &pem);
+
+        let (cs, cb) = get(svc.clone(),
+            "/console/clearance-challenge?operator_id=alice&node_id=robot-01").await;
+        assert_eq!(cs, StatusCode::OK, "challenge issued; body={cb}");
+        let nonce = parse_nonce(&cb);
+
+        let sig = sign_grant_b64(&sk, "alice", "robot-01", &nonce);
+        let body = json!({"node_id":"robot-01","operator_id":"alice","nonce":nonce,"signature_b64":sig}).to_string();
+        let (gs, gb) = post_json(svc.clone(), "/console/clearance-grants", body, None).await;
+        assert_eq!(gs, StatusCode::OK, "operator-signed grant recorded; body={gb}");
+        assert!(gb.contains("operator-signed"), "auth_method in response");
+        let fp = kirra_runtime_sdk::attestation::operator_key_fingerprint(&pem).unwrap();
+        assert!(gb.contains(&fp), "response carries the key fingerprint");
+
+        let (_s, ab) = get(svc.clone(), "/console/audit?limit=50").await;
+        assert!(ab.contains("OperatorClearanceGrantIssued"));
+        assert!(ab.contains("operator-signed"), "chain event carries auth_method");
+        assert!(ab.contains(&fp), "chain event carries the fingerprint (non-repudiation)");
+
+        // THE ADDITIVE PROOF — Phase-B pickup is unchanged by the new columns.
+        let picked = svc.app.store.lock().unwrap()
+            .take_pending_clearance_grant("robot-01", 9_999_999_999_999).unwrap()
+            .expect("Phase-B consumes the operator-signed grant row");
+        assert_eq!(picked.operator_id, "alice");
+    }
+
+    /// VERIFY-THEN-CONSUME: a replayed nonce is rejected on the second use.
+    #[tokio::test]
+    async fn nonce_replay_is_rejected_and_audited() {
+        let svc = build_state();
+        seed_node(&svc, "robot-01");
+        let (sk, pem) = operator_keypair(8);
+        register_op(&svc, "alice", &pem);
+        let (_c, cb) = get(svc.clone(),
+            "/console/clearance-challenge?operator_id=alice&node_id=robot-01").await;
+        let nonce = parse_nonce(&cb);
+        let sig = sign_grant_b64(&sk, "alice", "robot-01", &nonce);
+        let body = json!({"node_id":"robot-01","operator_id":"alice","nonce":nonce,"signature_b64":sig}).to_string();
+
+        let (s1, _) = post_json(svc.clone(), "/console/clearance-grants", body.clone(), None).await;
+        assert_eq!(s1, StatusCode::OK, "first use accepted");
+        let (s2, b2) = post_json(svc.clone(), "/console/clearance-grants", body, None).await;
+        assert_eq!(s2, StatusCode::UNAUTHORIZED, "replayed nonce rejected; body={b2}");
+        let (_s, ab) = get(svc.clone(), "/console/audit?limit=50").await;
+        assert!(ab.contains("nonce_replay_or_expired"), "the replay is audited");
+    }
+
+    /// BAD SIGNATURE (signed by the wrong key) → 401, audited. Verify happens
+    /// before the nonce is consumed.
+    #[tokio::test]
+    async fn bad_signature_is_rejected_and_audited() {
+        let svc = build_state();
+        seed_node(&svc, "robot-01");
+        let (_sk, pem) = operator_keypair(9);
+        register_op(&svc, "alice", &pem);
+        let (_c, cb) = get(svc.clone(),
+            "/console/clearance-challenge?operator_id=alice&node_id=robot-01").await;
+        let nonce = parse_nonce(&cb);
+        let (wrong, _wpem) = operator_keypair(99);
+        let sig = sign_grant_b64(&wrong, "alice", "robot-01", &nonce);
+        let body = json!({"node_id":"robot-01","operator_id":"alice","nonce":nonce,"signature_b64":sig}).to_string();
+        let (s, b) = post_json(svc.clone(), "/console/clearance-grants", body, None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "wrong-key signature rejected; body={b}");
+        let (_s, ab) = get(svc.clone(), "/console/audit?limit=50").await;
+        assert!(ab.contains("bad_signature"));
+    }
+
+    /// UNKNOWN operator → 403, audited (load operator fails before anything else).
+    #[tokio::test]
+    async fn unknown_operator_is_rejected_403_audited() {
+        let svc = build_state();
+        seed_node(&svc, "robot-01");
+        let body = json!({"node_id":"robot-01","operator_id":"ghost","nonce":"00","signature_b64":"AAAA"}).to_string();
+        let (s, b) = post_json(svc.clone(), "/console/clearance-grants", body, None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "unknown operator rejected; body={b}");
+        let (_s, ab) = get(svc.clone(), "/console/audit?limit=50").await;
+        assert!(ab.contains("unknown_operator"));
+    }
+
+    /// REVOKED operator → 403, audited.
+    #[tokio::test]
+    async fn revoked_operator_is_rejected_403_audited() {
+        let svc = build_state();
+        seed_node(&svc, "robot-01");
+        let (sk, pem) = operator_keypair(11);
+        register_op(&svc, "alice", &pem);
+        svc.app.store.lock().unwrap().revoke_operator("alice", 2).unwrap();
+        let sig = sign_grant_b64(&sk, "alice", "robot-01", "00");
+        let body = json!({"node_id":"robot-01","operator_id":"alice","nonce":"00","signature_b64":sig}).to_string();
+        let (s, b) = post_json(svc.clone(), "/console/clearance-grants", body, None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "revoked operator rejected; body={b}");
+        let (_s, ab) = get(svc.clone(), "/console/audit?limit=50").await;
+        assert!(ab.contains("revoked_operator"));
+    }
+
+    /// SEPARATE POWERS: operator registration is ADMIN-gated, NOT supervisor-gated.
+    /// A supervisor key alone (no admin token) cannot register an operator. (Env
+    /// unset → require_admin_token 503; with the env set it would be 401 — the
+    /// admin_token_ok decision is unit-tested elsewhere. Either way: never 2xx.)
+    #[tokio::test]
+    async fn supervisor_key_cannot_register_operators_admin_gated() {
+        let svc = build_state();
+        let (_sk, pem) = operator_keypair(12);
+        let body = json!({"operator_id":"alice","ed25519_pubkey_pem":pem}).to_string();
+        let (s, _b) = post_json(svc, "/console/operators", body, Some("a-supervisor-value")).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE,
+            "operator registration is admin-gated — the supervisor key does not open it");
+    }
+
+    /// BREAK-GLASS is DISTINCTLY audited. The success path needs the supervisor env
+    /// (INV-13 forbids set_var here), so prove the distinct-audit property at the
+    /// store level: the auth_method "supervisor-break-glass" lands in the signed
+    /// chain, visibly different from "operator-signed".
+    #[test]
+    fn break_glass_auth_method_is_distinct_in_the_chain() {
+        let store = VerifierStore::new(":memory:").expect("store");
+        let app = AppState::new(store, VerifierOperationMode::Active);
+        {
+            let mut s = app.store.lock().unwrap();
+            s.save_clearance_grant_chained_with_auth(
+                "robot-01", "alice", 1_700_000_000_000, "supervisor-break-glass", None,
+            ).unwrap();
+        }
+        let page = app.store.lock().unwrap().load_audit_chain_page(50, 0, None).unwrap();
+        let blob = serde_json::to_string(&page.entries).unwrap();
+        assert!(blob.contains("supervisor-break-glass"),
+            "break-glass auth_method recorded distinctly in the signed chain");
     }
 }
