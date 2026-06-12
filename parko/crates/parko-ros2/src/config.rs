@@ -51,6 +51,27 @@ pub struct ParkoNodeConfig {
     /// from this one value, so their thread counts cannot diverge (the #152
     /// cross-backend asymmetry guard).
     pub num_threads: usize,
+
+    /// SG6 (#309) optional IMU topic (`sensor_msgs/Imu`). When set, the node
+    /// subscribes and feeds the per-tick deceleration spike into the clearance
+    /// loop's impact detection. `None` → no IMU source: the decel trigger is
+    /// inactive (reduced detection coverage, logged at startup — never a
+    /// fabricated spike).
+    pub imu_topic: Option<String>,
+
+    /// SG6 (#309) optional contact-sensor topic (`std_msgs/Bool`). When set, a
+    /// `true` reading is a definitive impact and latches the loop. `None` → no
+    /// contact source: that trigger is inactive (reduced coverage, logged).
+    pub contact_topic: Option<String>,
+
+    /// SG6 (#309) IMU deceleration-spike threshold (m/s²) — the
+    /// [`parko_core::ImpactCfg`] `spike_threshold_mps2`. **Deployment-tunable,
+    /// VALIDATION-PENDING** (parko-core default 30.0 m/s² — a hard,
+    /// collision-grade decel, NOT a certified value). The tick reads the IMU
+    /// linear-acceleration vector magnitude (gravity-inclusive) and latches when
+    /// it exceeds this; the default sits well above the ~9.81 m/s² gravity
+    /// baseline, so a static vehicle never latches. Tune on track-test / SOTIF.
+    pub spike_threshold_mps2: f64,
 }
 
 /// Placeholder for an MRC fallback override. Today's MRC is always
@@ -69,6 +90,12 @@ impl Default for ParkoNodeConfig {
             sensor_staleness_budget_ms: 200,
             mrc_command: OutgoingTwistDefaults,
             num_threads: 1,
+            // SG6 detection sources default OFF — a missing sensor is reduced
+            // coverage, stated loudly at startup, never fabricated.
+            imu_topic: None,
+            contact_topic: None,
+            // parko-core ImpactCfg default (VALIDATION-PENDING, deployment-tunable).
+            spike_threshold_mps2: parko_core::ImpactCfg::default().spike_threshold_mps2,
         }
     }
 }
@@ -85,6 +112,16 @@ impl ParkoNodeConfig {
     #[must_use]
     pub fn inference_threads(&self) -> parko_core::InferenceThreads {
         parko_core::InferenceThreads::new(self.num_threads)
+    }
+
+    /// The SG6 [`parko_core::ImpactCfg`] this node uses for impact fusion,
+    /// built from the (deployment-tunable) `spike_threshold_mps2`. One source,
+    /// so the tick and any diagnostics read the same threshold.
+    #[must_use]
+    pub fn impact_cfg(&self) -> parko_core::ImpactCfg {
+        parko_core::ImpactCfg {
+            spike_threshold_mps2: self.spike_threshold_mps2,
+        }
     }
 }
 
@@ -115,6 +152,25 @@ mod tests {
         assert_eq!(cfg.inference_threads().num_threads, 4);
         assert!(!cfg.inference_threads().bitwise_reproducible(),
             "raising threads gives up bitwise reproducibility");
+    }
+
+    #[test]
+    fn sg6_detection_sources_default_off_and_threshold_is_parko_core_default() {
+        let cfg = ParkoNodeConfig::default();
+        assert!(cfg.imu_topic.is_none(), "IMU source off by default (reduced coverage, stated)");
+        assert!(cfg.contact_topic.is_none(), "contact source off by default");
+        // The threshold mirrors parko-core's ImpactCfg default, and impact_cfg()
+        // round-trips it.
+        let core_default = parko_core::ImpactCfg::default().spike_threshold_mps2;
+        assert!((cfg.spike_threshold_mps2 - core_default).abs() < 1e-9);
+        assert!((cfg.impact_cfg().spike_threshold_mps2 - core_default).abs() < 1e-9);
+    }
+
+    #[test]
+    fn impact_cfg_reflects_a_tuned_threshold() {
+        let cfg = ParkoNodeConfig { spike_threshold_mps2: 22.5, ..ParkoNodeConfig::default() };
+        assert!((cfg.impact_cfg().spike_threshold_mps2 - 22.5).abs() < 1e-9,
+            "impact_cfg() must carry the deployment-tuned threshold");
     }
 
     #[test]

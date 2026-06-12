@@ -20,17 +20,19 @@
 //     next-milestone deliverable. For M2 the node accepts a posture
 //     parameter (CLI / env) and defaults to `Nominal`.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use parko_core::backend::InferenceBackend;
 use parko_core::safety::SafetyPosture;
 use parko_core::scheduler::InferenceLoop;
 use tokio::sync::Mutex;
 
-use crate::clearance_gate::{run_pipeline_tick_with_clearance, NodeClearance};
+use crate::clearance_gate::{run_pipeline_tick_with_clearance, ImpactInputs, NodeClearance};
 use crate::command_mapping::OutgoingTwist;
 use crate::config::ParkoNodeConfig;
-use crate::sensor_mapping::SensorInputMapping;
+use crate::imu_shim::imu_msg_to_sample;
+use crate::sensor_mapping::{ImuSample, SensorInputMapping};
 use crate::tick_pipeline::TickError;
 use parko_kirra::clearance_delivery::DeliveryOutcome;
 
@@ -88,10 +90,78 @@ where
         r2r::QosProfile::default(),
     )?;
 
+    // --- SG6 impact-detection sources (#309) --------------------------
+    //
+    // Optional IMU (decel) + contact subscriptions feed the per-tick
+    // `ImpactInputs`. Each runs a background drain task that writes the
+    // LATEST reading into a shared cell; the tick reads them. A missing
+    // source is REDUCED detection coverage, logged loudly — never a
+    // fabricated reading (absent IMU → no decel; absent contact → `false`).
+    // Detection only matters when the clearance gate is active.
+    let detection_enabled = clearance.is_some();
+    let latest_imu: Arc<StdMutex<Option<ImuSample>>> = Arc::new(StdMutex::new(None));
+    let contact_state: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    if detection_enabled {
+        match &config.imu_topic {
+            Some(topic) => {
+                let imu_stream =
+                    node.subscribe::<r2r::sensor_msgs::msg::Imu>(topic, r2r::QosProfile::default())?;
+                let cell = Arc::clone(&latest_imu);
+                tokio::spawn(async move {
+                    use futures::StreamExt;
+                    let mut s = imu_stream;
+                    while let Some(msg) = s.next().await {
+                        let sample = imu_msg_to_sample(&msg);
+                        if let Ok(mut g) = cell.lock() {
+                            *g = Some(sample);
+                        }
+                    }
+                    tracing::warn!("parko-ros2: IMU stream closed — decel detection now inactive");
+                });
+                tracing::info!(topic = %topic,
+                    "parko-ros2: SG6 decel detection ARMED (IMU → spike-magnitude latch)");
+            }
+            None => tracing::warn!(
+                "parko-ros2: SG6 decel detection NOT wired (no imu_topic) — REDUCED detection \
+                 coverage; the clearance loop will not latch on hard deceleration."
+            ),
+        }
+        match &config.contact_topic {
+            Some(topic) => {
+                let contact_stream =
+                    node.subscribe::<r2r::std_msgs::msg::Bool>(topic, r2r::QosProfile::default())?;
+                let cell = Arc::clone(&contact_state);
+                tokio::spawn(async move {
+                    use futures::StreamExt;
+                    let mut s = contact_stream;
+                    while let Some(msg) = s.next().await {
+                        cell.store(msg.data, Ordering::Relaxed);
+                    }
+                    tracing::warn!("parko-ros2: contact stream closed — contact detection now inactive");
+                });
+                tracing::info!(topic = %topic, "parko-ros2: SG6 contact detection ARMED");
+            }
+            None => tracing::warn!(
+                "parko-ros2: SG6 contact detection NOT wired (no contact_topic) — REDUCED detection \
+                 coverage; the clearance loop will not latch on a contact-sensor hit."
+            ),
+        }
+        // The vanished-object trigger needs an AgentScene per tick; no scene
+        // source flows through the M2 tick yet (the #309 remainder). The node
+        // passes `scene = None`; the detector stays unfed.
+        tracing::warn!(
+            "parko-ros2: SG6 vanished-object detection NOT wired (no AgentScene source in the \
+             tick) — REDUCED detection coverage; tracked as the remainder of #309."
+        );
+    }
+
     // --- Drain task: consume the sensor stream, tick, publish ---------
     let drain_config  = Arc::clone(&config);
     let drain_infer   = Arc::clone(&infer);
     let drain_mapping = Arc::clone(&mapping);
+    let drain_imu     = Arc::clone(&latest_imu);
+    let drain_contact = Arc::clone(&contact_state);
 
     let drain_task = tokio::spawn(async move {
         use futures::StreamExt;
@@ -119,12 +189,22 @@ where
                 .unwrap_or(0);
             frame_id = frame_id.saturating_add(1);
             let frame = drain_mapping.to_frame(frame_id, stamp_ms, &sample_vec);
+
+            // Assemble this tick's SG6 evidence from the latest sensor readings.
+            // Absent sources read as their no-signal defaults (no fabrication).
+            let impact_inputs = ImpactInputs {
+                imu: drain_imu.lock().ok().and_then(|g| *g),
+                contact: drain_contact.load(Ordering::Relaxed),
+            };
+
             let cleared = run_pipeline_tick_with_clearance(
                 &drain_config,
                 Arc::clone(&drain_infer),
                 frame,
                 posture,
                 clearance.as_mut(),
+                &impact_inputs,
+                None, // AgentScene source deferred (#309 remainder)
             ).await;
             let outcome = cleared.tick;
 

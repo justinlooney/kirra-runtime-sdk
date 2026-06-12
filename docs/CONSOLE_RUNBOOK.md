@@ -151,6 +151,13 @@ export KIRRA_SUPERVISOR_RESET_KEY="$(cat /etc/kirra/supervisor_key)"   # service
 # Node-only — THIS vehicle's node id. REQUIRED to enable delivery; no default
 # (a wrong-node grant pickup must be impossible).
 export KIRRA_NODE_ID="KIRRA-DEMO-03"
+
+# Node-only — SG6 impact-detection sources (#309). OPTIONAL; each unset topic is
+# REDUCED detection coverage, logged loudly at startup (never a fabricated latch):
+export PARKO_IMU_TOPIC="/imu/data"          # sensor_msgs/Imu  → decel-spike trigger
+export PARKO_CONTACT_TOPIC="/bumper/contact" # std_msgs/Bool    → contact trigger
+# Deployment-tunable decel threshold (m/s²); VALIDATION-PENDING, default 30.0:
+export PARKO_IMPACT_SPIKE_THRESHOLD_MPS2="30.0"
 ```
 
 The node reads `KIRRA_DB_PATH` first, falling back to the divergence sink's
@@ -181,9 +188,31 @@ node id).
    lifts and motion resumes. A `ClearanceDelivered` row appears in the same
    signed chain. No manual `deliver_clearance` run.
 
-> **Scope note (what's wired here vs. next):** this path wires the *delivery* and
-> the *stop tie-in* — a grant releases the loop, and an immobilized loop forces a
-> stop. **Feeding the loop from live collision detection** (so the node *enters*
-> the immobilized state on a real impact, not only in tests) is the named
-> follow-up; until it lands, the node-owned loop is exercised by the delivery
-> path and the test harness.
+### What latches the loop for real (#309)
+
+The node now **arms itself** from live evidence each tick — it no longer needs an
+external driver to enter the post-collision hold:
+
+- **Decel (IMU).** When `PARKO_IMU_TOPIC` is set, the node reads the IMU
+  linear-acceleration magnitude per tick; a value above
+  `PARKO_IMPACT_SPIKE_THRESHOLD_MPS2` (default 30 m/s², well above the ~9.81 m/s²
+  gravity baseline) is a collision-grade impact → the loop latches and the
+  vehicle stops.
+- **Contact.** When `PARKO_CONTACT_TOPIC` is set, a `true` reading is a
+  definitive impact → latch.
+- **Vanished-object — NOT yet wired.** This trigger needs an `AgentScene` per
+  tick, and no scene source flows through the node's tick yet. It is the **named
+  remainder of #309**; until it lands, a person-under-vehicle *disappearance* does
+  not latch from the tick (decel + contact still do).
+
+A **missing** IMU or contact topic is **reduced detection coverage**, stated
+loudly at startup — never a fabricated latch. Once latched (by any armed
+trigger), recovery is exactly the delivery flow above: record a grant → the
+node's own tick delivers it → the hold lifts.
+
+> **Held line (delivery before detection):** within a tick the node delivers a
+> pending grant *before* it runs detection. A grant consumed on a tick is matched
+> against the loop state at pickup; it can never clear an impact that latches on
+> that *same* tick. If both happen at once, the grant clears the old escalation,
+> detection re-latches on the new evidence, the vehicle stays stopped, and the
+> operator re-issues against the new escalation.
