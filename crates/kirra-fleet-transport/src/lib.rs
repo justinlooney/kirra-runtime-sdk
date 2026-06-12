@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use kirra_runtime_sdk::federation_reconciliation::{
     verify_federated_report_signature_v2, FederatedTrustReportV2,
 };
+use kirra_runtime_sdk::key_registry::{KeyRegistry, KeyRole};
 use kirra_runtime_sdk::verifier::FleetPosture;
 use kirra_runtime_sdk::verifier_store::VerifierStore;
 
@@ -237,6 +238,29 @@ pub fn accept_report(
     Ok(report)
 }
 
+/// Registry-backed [`accept_report`] (#329) — the **fleet-deployment** path. Resolves
+/// the controller's key from the unified [`KeyRegistry`] (grounded in a STORED
+/// registration, not a caller-supplied `public_key_b64` string), then delegates to
+/// [`accept_report`]. The `&str` variant remains for test/spike callers without a
+/// store. Fail-closed: an unresolvable principal (unknown controller / malformed
+/// stored key) is a counted [`RejectReason::BadSignature`] reject — the report is
+/// untrusted, never accepted by default.
+pub fn accept_report_from_registry(
+    bytes: &[u8],
+    principal_id: &str,
+    registry: &KeyRegistry,
+    counter: &RejectionCounter,
+) -> Result<FederatedTrustReportV2, RejectReason> {
+    let key_b64 = match registry.resolve_ed25519_pubkey(principal_id, KeyRole::FederationController) {
+        Ok(Some(k)) => B64.encode(k),
+        _ => {
+            counter.record(&RejectReason::BadSignature);
+            return Err(RejectReason::BadSignature);
+        }
+    };
+    accept_report(bytes, &key_b64, counter)
+}
+
 // ---------------------------------------------------------------------------
 // Signed clearance grant (the down lane) — reuses the federation Ed25519 pattern
 // ---------------------------------------------------------------------------
@@ -429,6 +453,37 @@ pub fn ingest_clearance_grant(
             Err(r)
         }
     }
+}
+
+/// Registry-backed [`ingest_clearance_grant`] (#329) — the **fleet-deployment** path.
+/// Resolves the grant signer's key from the unified [`KeyRegistry`] (the
+/// [`KeyRole::FleetGrant`] registry), then delegates to [`ingest_clearance_grant`].
+///
+/// Takes `principal_id` rather than a `&KeyRegistry` ON PURPOSE: the registry borrows
+/// the store IMMUTABLY but `ingest_clearance_grant` needs it MUTABLY (it burns the
+/// nonce + writes the row), so the two borrows cannot coexist. The key is resolved in
+/// a scoped immutable borrow that ends BEFORE the mutating store path. The `&str`
+/// variant remains the test/spike path. Fail-closed: an unresolvable signer is a
+/// counted [`RejectReason::BadSignature`] reject.
+pub fn ingest_clearance_grant_from_registry(
+    store: &mut VerifierStore,
+    grant: &SignedClearanceGrant,
+    principal_id: &str,
+    counter: &RejectionCounter,
+    now_ms: u64,
+) -> Result<i64, RejectReason> {
+    let key_b64 = {
+        let registry = KeyRegistry::new(store);
+        match registry.resolve_ed25519_pubkey(principal_id, KeyRole::FleetGrant) {
+            Ok(Some(k)) => B64.encode(k),
+            _ => {
+                counter.record(&RejectReason::BadSignature);
+                return Err(RejectReason::BadSignature);
+            }
+        }
+        // the registry's immutable borrow of `store` ends here
+    };
+    ingest_clearance_grant(store, grant, &key_b64, counter, now_ms)
 }
 
 #[cfg(test)]
@@ -645,5 +700,41 @@ mod core_tests {
         // Neither node sees a pending row — the cross-node grant reached no store.
         assert!(store.take_pending_clearance_grant("robot-A", 2_000).unwrap().is_none());
         assert!(store.take_pending_clearance_grant("robot-B", 2_000).unwrap().is_none());
+    }
+
+    /// #329 — THE REGISTRY COMPOSITION PROOF: the fleet-deployment ingest resolves the
+    /// grant signer's key from the unified `KeyRegistry` (a STORED federation-controller
+    /// registration), not a caller-supplied string. A registered signer's grant lands
+    /// the PENDING row Phase-B consumes; an unregistered signer is fail-closed.
+    #[test]
+    fn e2e_fleet_ingest_via_registry() {
+        let (sk, pk_b64) = keypair(); // pk_b64 = raw-32 verifying key (the controller registry format)
+        let counter = RejectionCounter::new();
+        let mut store = VerifierStore::new(":memory:").unwrap();
+        // Register the fleet-grant signer in the trusted-controller registry.
+        store.save_trusted_federation_controller("ops-controller", &pk_b64, 1).unwrap();
+
+        // Sign + ingest THROUGH THE REGISTRY (no caller-supplied key string).
+        let grant = sign_clearance_grant(&sk, "robot-77", "alice", 1_000);
+        let rowid =
+            ingest_clearance_grant_from_registry(&mut store, &grant, "ops-controller", &counter, 1_001)
+                .unwrap();
+        assert!(rowid > 0);
+        assert_eq!(counter.snapshot().accepted, 1);
+
+        // The registry-resolved verification produced the EXISTING Phase-B pending row.
+        let picked = store
+            .take_pending_clearance_grant("robot-77", 1_500)
+            .unwrap()
+            .expect("registry-ingested grant is a pending row Phase-B consumes");
+        assert_eq!(picked.operator_id, "alice");
+
+        // An UNREGISTERED signer principal is fail-closed (BadSignature) — nothing written.
+        let grant2 = sign_clearance_grant(&sk, "robot-78", "bob", 2_000);
+        let err =
+            ingest_clearance_grant_from_registry(&mut store, &grant2, "no-such-controller", &counter, 2_001)
+                .unwrap_err();
+        assert_eq!(err, RejectReason::BadSignature, "an unresolvable signer is fail-closed");
+        assert!(store.take_pending_clearance_grant("robot-78", 2_500).unwrap().is_none());
     }
 }
