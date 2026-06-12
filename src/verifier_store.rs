@@ -1061,6 +1061,35 @@ impl VerifierStore {
         rows.collect()
     }
 
+    /// Load a single registered node by id, or `None` if unregistered. Additive
+    /// single-row loader (mirrors [`load_operator`] / `load_trusted_federation_controller_key`)
+    /// — the targeted lookup [`crate::key_registry::KeyRegistry`] uses to resolve a
+    /// node's `ak_public_pem` without scanning the whole registry.
+    pub fn load_node(&self, node_id: &str) -> Result<Option<RegisteredNode>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT node_id, status_json, registered_at_ms, last_trust_update_ms,
+                        ak_public_pem, expected_pcr16_digest_hex
+                 FROM nodes WHERE node_id = ?1",
+                params![node_id],
+                |row| {
+                    let status_json: String = row.get(1)?;
+                    let status: NodeTrustState =
+                        serde_json::from_str(&status_json).unwrap_or(NodeTrustState::Unknown);
+                    Ok(RegisteredNode {
+                        node_id: row.get(0)?,
+                        status,
+                        registered_at_ms: row.get::<_, i64>(2)? as u64,
+                        last_trust_update_ms: row.get::<_, i64>(3)? as u64,
+                        ak_public_pem: row.get(4)?,
+                        expected_pcr16_digest_hex: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
     pub fn save_dependencies(&self, node_id: &str, deps: &[String]) -> Result<()> {
         self.conn.execute(
             "DELETE FROM dependencies WHERE node_id = ?1",
