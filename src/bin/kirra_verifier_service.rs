@@ -2657,17 +2657,18 @@ async fn console_html() -> impl IntoResponse {
 /// (`load_nodes`). QM read. `note` is the Untrusted reason carried on the node's
 /// trust state (the latest trust note); `null` for Trusted/Unknown.
 async fn console_fleet(State(svc): State<Arc<ServiceState>>) -> impl IntoResponse {
-    let nodes = match svc.app.store.lock() {
-        Ok(store) => match store.load_nodes() {
-            Ok(n) => n,
-            Err(_) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": "load_nodes failed" }))).into_response()
-            }
-        },
+    let store = match svc.app.store.lock() {
+        Ok(s) => s,
         Err(_) => {
             return (StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": "store lock poisoned" }))).into_response()
+        }
+    };
+    let nodes = match store.load_nodes() {
+        Ok(n) => n,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "load_nodes failed" }))).into_response()
         }
     };
     let fleet: Vec<_> = nodes
@@ -2678,11 +2679,16 @@ async fn console_fleet(State(svc): State<Arc<ServiceState>>) -> impl IntoRespons
                 NodeTrustState::Untrusted(reason) => ("Untrusted", Some(reason.clone())),
                 NodeTrustState::Unknown => ("Unknown", None),
             };
+            // Phase B: the latest clearance grant's delivery state (or null). The
+            // UI derives the lifecycle label (pending / delivered:Cleared /
+            // delivery-rejected:reason) from these raw columns — no invented state.
+            let clearance = store.latest_clearance_grant(&n.node_id).ok().flatten();
             json!({
                 "node_id": n.node_id,
                 "posture": posture,
                 "note": note,
                 "last_seen_ms": n.last_trust_update_ms,
+                "clearance": clearance,
             })
         })
         .collect();

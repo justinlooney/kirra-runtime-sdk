@@ -71,6 +71,29 @@ pub struct AuditExportPage {
     pub chain_intact: bool,
 }
 
+/// A pending clearance grant taken for delivery (operator-console Phase B, #304).
+#[derive(Debug, Clone)]
+pub struct PendingClearanceGrant {
+    pub rowid: i64,
+    pub node_id: String,
+    pub operator_id: String,
+    /// The verifier's RECORD time (Phase A), NOT the pickup time. The
+    /// `ClearanceLoop` ages the grant against this at delivery (checkpoint 2).
+    pub granted_at_ms: u64,
+}
+
+/// The latest clearance grant's delivery state for a node (console read surface).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClearanceGrantState {
+    pub granted_at_ms: u64,
+    /// Set once the grant has been taken for delivery (the one-shot consume).
+    pub consumed_at_ms: Option<u64>,
+    /// `"Cleared"` on success, else the loop's rejection reason code. `None`
+    /// while still pending delivery.
+    pub outcome: Option<String>,
+    pub outcome_detail: Option<String>,
+}
+
 // --- HA epoch fence — fail-closed outcomes (issue #79) ----------------------
 
 /// Why the in-transaction HA epoch fence rejected a top-tier durable write.
@@ -360,10 +383,29 @@ impl VerifierStore {
                 operator_id    TEXT    NOT NULL,
                 granted_at_ms  INTEGER NOT NULL,
                 delivery       TEXT    NOT NULL DEFAULT 'PENDING-NODE-TRANSPORT',
-                created_at_ms  INTEGER NOT NULL
+                created_at_ms  INTEGER NOT NULL,
+                consumed_at_ms INTEGER,
+                outcome        TEXT,
+                outcome_detail TEXT
             )",
             [],
         )?;
+        // Phase-B delivery columns (additive, idempotent — upgrade a Phase-A
+        // clearance_grants table that predates these). `consumed_at_ms` is the
+        // one-shot consume marker; `outcome`/`outcome_detail` are the
+        // ClearanceLoop verdict at delivery. Mirrors the audit_log_chain
+        // ADD-COLUMN migration convention below.
+        for col_sql in [
+            "ALTER TABLE clearance_grants ADD COLUMN consumed_at_ms INTEGER",
+            "ALTER TABLE clearance_grants ADD COLUMN outcome TEXT",
+            "ALTER TABLE clearance_grants ADD COLUMN outcome_detail TEXT",
+        ] {
+            if let Err(e) = conn.execute(col_sql, []) {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(e);
+                }
+            }
+        }
 
         // AV subsystem metadata: confidence floors, telemetry timestamps, recovery streak.
         conn.execute(
@@ -1312,6 +1354,104 @@ impl VerifierStore {
             self.signing_key.as_ref(),
         )?;
         tx.commit()
+    }
+
+    /// **THE ONE-SHOT CONSUME** (operator-console Phase B). In a SINGLE atomic
+    /// `UPDATE … RETURNING`, marks the OLDEST unconsumed grant for `node_id`
+    /// consumed (`consumed_at_ms = now_ms`) and returns it. A grant can be taken
+    /// **exactly once, ever** — double-pickup is impossible by the
+    /// `consumed_at_ms IS NULL` guard combined with the atomic single-statement
+    /// update (SQLite serializes writers), NOT by convention. This is the
+    /// store-level verify-then-consume pattern — the same single-use discipline
+    /// as the attestation nonce (`AppState::consume_challenge`, `src/verifier.rs`:
+    /// atomically removes the pending entry so a replay finds nothing). Returns
+    /// `None` when no pending grant exists (idempotent-empty pickup).
+    pub fn take_pending_clearance_grant(
+        &self,
+        node_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<PendingClearanceGrant>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "UPDATE clearance_grants
+                    SET consumed_at_ms = ?2
+                  WHERE id = (
+                    SELECT id FROM clearance_grants
+                     WHERE node_id = ?1 AND consumed_at_ms IS NULL
+                     ORDER BY id ASC LIMIT 1)
+                  RETURNING id, node_id, operator_id, granted_at_ms",
+                params![node_id, now_ms as i64],
+                |row| {
+                    Ok(PendingClearanceGrant {
+                        rowid: row.get(0)?,
+                        node_id: row.get(1)?,
+                        operator_id: row.get(2)?,
+                        granted_at_ms: row.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Record a delivered grant's OUTCOME (operator-console Phase B): the
+    /// `ClearanceLoop` verdict at delivery, plus the chained audit event — ONE
+    /// signed transaction, same shape as Phase A's writes. `outcome == "Cleared"`
+    /// → a `ClearanceDelivered` event; any other `outcome` (a rejection reason
+    /// code) → a `ClearanceDeliveryRejected` event. `now_ms` is supplied (no
+    /// `SystemTime::now()` in the store).
+    pub fn record_grant_outcome(
+        &mut self,
+        grant_rowid: i64,
+        outcome: &str,
+        detail: Option<&str>,
+        now_ms: u64,
+    ) -> Result<()> {
+        let event_type = if outcome == "Cleared" {
+            "ClearanceDelivered"
+        } else {
+            "ClearanceDeliveryRejected"
+        };
+        let payload = serde_json::json!({
+            "grant_rowid": grant_rowid,
+            "outcome": outcome,
+            "detail": detail,
+        })
+        .to_string();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE clearance_grants SET outcome = ?2, outcome_detail = ?3 WHERE id = ?1",
+            params![grant_rowid, outcome, detail],
+        )?;
+        crate::audit_chain::AuditChainLinker::append_audit_event_tx(
+            &tx,
+            event_type,
+            &payload,
+            now_ms as i64,
+            self.signing_key.as_ref(),
+        )?;
+        tx.commit()
+    }
+
+    /// The most recent clearance grant's delivery state for `node_id` (console
+    /// read surface, Phase B). `None` if the node has no grants.
+    pub fn latest_clearance_grant(&self, node_id: &str) -> Result<Option<ClearanceGrantState>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT granted_at_ms, consumed_at_ms, outcome, outcome_detail
+                   FROM clearance_grants WHERE node_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![node_id],
+                |row| {
+                    Ok(ClearanceGrantState {
+                        granted_at_ms: row.get::<_, i64>(0)? as u64,
+                        consumed_at_ms: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+                        outcome: row.get(2)?,
+                        outcome_detail: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
     }
 
     pub fn save_federated_report_chained(

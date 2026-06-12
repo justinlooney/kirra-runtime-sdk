@@ -56,9 +56,11 @@ use parko_core::{
 
 pub mod angular_bound;
 pub mod audit_sink;
+pub mod clearance_delivery;
 pub mod comparator;
 pub mod diverse;
 pub use angular_bound::{AngularVelocityBound, PlatformParams, ROLLOVER_MIN_LINEAR_VELOCITY_MPS};
+pub use clearance_delivery::{ClearanceDelivery, DeliveryOutcome};
 pub use audit_sink::{
     select_divergence_sink, select_impact_sink, AuditChainLinkerDivergenceSink, FatalAuditConfig,
     ImpactAuditSink, ImpactClearanceRejectedPayload, ImpactClearedPayload, ImpactDetectedPayload,
