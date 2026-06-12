@@ -1,0 +1,50 @@
+# crates/kirra-fleet-transport/Cargo.toml
+#
+# #296 — the FLEET-LANE transport spike (vehicle ↔ ops/cloud). STRICTLY QM:
+# Zenoh never appears in the safety partition or the boundary channel (ADR-0006
+# Clause 2; ADR-0007). This crate is a LEAF consumer that depends on the SDK;
+# nothing under src/gateway/ or any safety path may depend on it.
+#
+# TLS DELIBERATELY OFF (the toolchain-wall mitigation + the trust model): zenoh's
+# default TLS/QUIC stack pulls an rcgen/time chain that does not compile on the
+# bench toolchain (rustc 1.94.1, E0119). We disable it — and trust does NOT come
+# from transport TLS anyway (it comes from Ed25519 payload signatures, ADR-0007
+# Clause 1), so dropping TLS costs no trust. `transport_tcp` gives the localhost
+# peer transport the in-process tests use. If a future transitive dep ever breaks
+# the resolve, the `zenoh-pinned-deps-1-75` lockdown is the escape hatch.
+[package]
+name = "kirra-fleet-transport"
+version = "0.1.0"
+edition = "2021"
+description = "Fleet-lane (QM) Zenoh transport spike for KIRRA — untrusted carrier; trust is Ed25519 payload signatures; grants terminate at the verifier store (#296). Not a safety artifact."
+license-file = "../../COPYRIGHT"
+publish = false  # proprietary (see COPYRIGHT) — not for crates.io
+
+[dependencies]
+# The SDK is the source of truth for the fleet payload types + their verification:
+# FederatedTrustReportV2 / verify_federated_report_signature_v2 / FleetPosture and
+# the Phase-A clearance-grant store path. This crate adds NO new payload trust
+# logic of its own beyond a grant envelope that reuses the same Ed25519 pattern.
+kirra-runtime-sdk = { path = "../.." }
+
+# The fleet carrier. default-features OFF (no TLS/QUIC — see the manifest note);
+# `transport_tcp` = the localhost peer transport; `unstable` only for the explicit
+# endpoint config the deterministic in-process tests wire (not the data path).
+zenoh = { version = "1", default-features = false, features = ["transport_tcp", "unstable"] }
+
+serde = { version = "1", features = ["derive"] }
+# JSON on the fleet wire (NOT bincode like kirra-wire-client's governor hot path):
+# the fleet lane is a debuggable ops/cloud hop and trust is anchored in the
+# Ed25519 signature over the canonical payload, not the codec — so JSON costs no
+# trust and buys cross-tooling debuggability.
+serde_json = "1"
+# The grant envelope reuses the federation Ed25519 pattern (sign a canonical
+# payload; verify against the controller's registered public key).
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+base64 = "0.22"
+
+[dev-dependencies]
+# zenoh is async; the in-process two-session round-trip tests need a runtime.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tempfile = "3"
+rand = "0.8"
