@@ -144,7 +144,7 @@ fn resolve_one_store_db() -> Option<String> {
 /// The node NEVER reads `KIRRA_SUPERVISOR_RESET_KEY` — operator authentication is
 /// the SERVICE's job (the #255 grant form); the node only delivers what the
 /// verifier already recorded + signed.
-fn build_node_clearance() -> Option<NodeClearance> {
+fn build_node_clearance(config: &ParkoNodeConfig) -> Option<NodeClearance> {
     let db = resolve_one_store_db();
     let key = std::env::var("KIRRA_LOG_SIGNING_KEY").ok().filter(|s| !s.is_empty());
 
@@ -178,11 +178,14 @@ fn build_node_clearance() -> Option<NodeClearance> {
         Ok(c) => {
             tracing::info!(
                 node_id = %node_id, db = %db,
+                spike_threshold_mps2 = config.spike_threshold_mps2,
                 "parko-ros2: clearance delivery ENABLED — console-recorded operator grants are \
                  delivered on this node's own tick (poll_and_deliver per tick); the post-collision \
-                 loop holds the vehicle stopped until a grant clears it."
+                 loop holds the vehicle stopped until a grant clears it. SG6 detection armed per \
+                 the configured impact threshold (see the IMU/contact ARMED lines)."
             );
-            Some(c)
+            // #309: thread the (deployment-tunable) impact-fusion config into the gate.
+            Some(c.with_impact_cfg(config.impact_cfg()))
         }
         Err(e) => {
             tracing::error!(
@@ -261,11 +264,39 @@ async fn install_shutdown_handler() {
     }
 }
 
+/// Build the node config from env, overriding the SG6 detection knobs (#309):
+///   - `PARKO_IMU_TOPIC`     — `sensor_msgs/Imu` topic (decel trigger).
+///   - `PARKO_CONTACT_TOPIC` — `std_msgs/Bool` topic (contact trigger).
+///   - `PARKO_IMPACT_SPIKE_THRESHOLD_MPS2` — decel threshold (deployment-tunable,
+///     VALIDATION-PENDING; parko-core default 30 m/s²). A non-numeric value is
+///     ignored with a warning (the safe default stands).
+fn build_config() -> ParkoNodeConfig {
+    let imu_topic = std::env::var("PARKO_IMU_TOPIC").ok().filter(|s| !s.is_empty());
+    let contact_topic = std::env::var("PARKO_CONTACT_TOPIC").ok().filter(|s| !s.is_empty());
+    let mut config = ParkoNodeConfig {
+        imu_topic,
+        contact_topic,
+        ..ParkoNodeConfig::default()
+    };
+    if let Ok(raw) = std::env::var("PARKO_IMPACT_SPIKE_THRESHOLD_MPS2") {
+        match raw.trim().parse::<f64>() {
+            Ok(v) if v.is_finite() && v > 0.0 => config.spike_threshold_mps2 = v,
+            _ => tracing::warn!(
+                value = %raw,
+                "parko-ros2: PARKO_IMPACT_SPIKE_THRESHOLD_MPS2 is not a positive finite number — \
+                 keeping the default {} m/s²",
+                config.spike_threshold_mps2
+            ),
+        }
+    }
+    config
+}
+
 #[tokio::main]
 async fn main() {
     init_tracing();
 
-    let config = Arc::new(ParkoNodeConfig::default());
+    let config = Arc::new(build_config());
     tracing::info!(?config, "parko_ros2_node starting");
 
     // Pick a backend. Today's binary only carries the MockBackend
@@ -287,8 +318,9 @@ async fn main() {
     let mapping = Arc::new(VectorMapping::new("observation"));
 
     // #304 Phase-B: the node-owned clearance gate (delivery + the SG6 stop
-    // tie-in). `None` when delivery is not configured (the dev lane).
-    let clearance = build_node_clearance();
+    // tie-in). #309: armed with the live impact-detection config. `None` when
+    // delivery is not configured (the dev lane).
+    let clearance = build_node_clearance(&config);
 
     let run_task = {
         let config = Arc::clone(&config);
