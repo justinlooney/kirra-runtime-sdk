@@ -110,3 +110,10 @@ path = "src/bin/kirra_verifier_service.rs"
 [[bin]]
 name = "kirra_carla_client"
 path = "src/bin/kirra_carla_client.rs"
+
+# Dev-only operator-console demo seed (NOT a production-service mode). See
+# docs/CONSOLE_RUNBOOK.md. Writes a KIRRA-DEMO-* fleet through the real signed
+# store APIs; refuses any non-empty store; requires KIRRA_LOG_SIGNING_KEY.
+[[bin]]
+name = "kirra_console_demo_seed"
+path = "src/bin/kirra_console_demo_seed.rs"
