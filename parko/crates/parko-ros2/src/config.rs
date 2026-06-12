@@ -72,6 +72,16 @@ pub struct ParkoNodeConfig {
     /// it exceeds this; the default sits well above the ~9.81 m/s² gravity
     /// baseline, so a static vehicle never latches. Tune on track-test / SOTIF.
     pub spike_threshold_mps2: f64,
+
+    /// SG6 (#324) IMU staleness window, ms. When an IMU source IS configured
+    /// (`imu_topic.is_some()`), a sample older than this — or no sample yet — is a
+    /// SENSOR FAULT: the gate forces the MRC (stop), since it cannot detect a
+    /// hard-decel impact without fresh IMU. The IMU analogue of
+    /// `sensor_staleness_budget_ms` (which gates the sensor FRAME). Default 500 ms
+    /// (≈10 ticks @ 20 Hz) — VALIDATION-PENDING; tighten per the real IMU rate. No
+    /// effect when no `imu_topic` is set (an UNCONFIGURED IMU is reduced coverage,
+    /// never a forced stop — the watchdog is not armed).
+    pub imu_staleness_window_ms: u64,
 }
 
 /// Placeholder for an MRC fallback override. Today's MRC is always
@@ -96,6 +106,9 @@ impl Default for ParkoNodeConfig {
             contact_topic: None,
             // parko-core ImpactCfg default (VALIDATION-PENDING, deployment-tunable).
             spike_threshold_mps2: parko_core::ImpactCfg::default().spike_threshold_mps2,
+            // SG6 (#324) IMU staleness window (VALIDATION-PENDING; only armed when
+            // an imu_topic is configured).
+            imu_staleness_window_ms: 500,
         }
     }
 }

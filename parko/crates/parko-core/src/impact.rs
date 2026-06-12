@@ -311,14 +311,16 @@ pub enum ClearanceState {
 /// [`OperatorClearanceGrant`]. Clean evidence never clears (the inner latch
 /// guarantees this; the wrapper preserves it).
 ///
-/// Lifecycle: `Normal` --impact--> `Latched` --next observe--> `EscalationRaised`
-/// --well-formed grant--> `Normal`. The `Latched → EscalationRaised` edge is the
-/// distinct, once-per-incident RAISED signal ([`escalation_pending`]).
+/// Lifecycle: `Normal` --impact--> `EscalationRaised` --well-formed grant-->
+/// `Normal` (#328: the latch and the once-per-incident RAISED signal
+/// ([`escalation_pending`]) occur in a SINGLE `observe`, no intermediate tick).
+/// `Latched` is retained in the enum (defensive / `is_immobilized`) but is no
+/// longer the resting state after a latching `observe`.
 ///
 /// THE INVARIANT: there is NO method, evidence pattern, or path that leaves
 /// `Latched` / `EscalationRaised` for `Normal` except `try_clear` with a
 /// well-formed grant.
-// SAFETY: SG6 | REQ: clearance-confirmation-loop | TEST: test_clean_evidence_never_clears_loop,test_malformed_grants_rejected_still_immobilized,test_well_formed_grant_clears,test_escalation_raised_once_per_incident,test_reimpact_during_escalation_no_second_raise,test_cleared_then_new_impact_raises_again,test_grant_on_normal_rejected,test_veto_active_in_both_latched_states,test_grant_age_boundary_inclusive,test_future_dated_grant_malformed
+// SAFETY: SG6 | REQ: clearance-confirmation-loop | TEST: test_clean_evidence_never_clears_loop,test_malformed_grants_rejected_still_immobilized,test_well_formed_grant_clears,test_escalation_raised_once_per_incident,test_latch_and_escalation_raised_in_one_observe,test_reimpact_during_escalation_no_second_raise,test_cleared_then_new_impact_raises_again,test_grant_on_normal_rejected,test_veto_active_from_latch_until_grant,test_grant_age_boundary_inclusive,test_future_dated_grant_malformed
 #[derive(Debug, Clone)]
 pub struct ClearanceLoop {
     latch: ImpactLatch,
@@ -364,9 +366,15 @@ impl ClearanceLoop {
     }
 
     /// Observe one tick. Delegates fusion to the inner [`ImpactLatch`]:
-    /// * `Normal` + fused impact → `Latched` (a new incident).
-    /// * `Latched` → `EscalationRaised` (raise the once-per-incident edge),
-    ///   whether or not this tick also fused (the latch stays latched regardless).
+    /// * `Normal` + fused impact → `EscalationRaised` in the SAME observation
+    ///   (#328): the latch and the once-per-incident escalation edge are raised
+    ///   atomically, closing the prior one-tick `Latched → EscalationRaised` gap.
+    ///   `is_immobilized()` already held in `Latched`, so the motion-veto timing is
+    ///   UNCHANGED; only the operator-escalation edge now fires on the latching tick
+    ///   instead of the next one — strictly earlier, i.e. safety-positive.
+    /// * `Latched` → `EscalationRaised` (retained as a defensive transition; the
+    ///   loop no longer rests in `Latched` via `observe`, but if ever in it the next
+    ///   observation escalates).
     /// * `EscalationRaised` → stays (no double-raise on re-impact).
     ///
     /// `now_ms` is accepted for signature symmetry / future use; fusion itself is
@@ -376,12 +384,14 @@ impl ClearanceLoop {
         match self.state {
             ClearanceState::Normal => {
                 if self.latch.is_latched() {
-                    self.state = ClearanceState::Latched;
-                    self.escalation_emitted = false;
+                    // #328 — latch AND raise the escalation in one atomic step.
+                    self.state = ClearanceState::EscalationRaised;
+                    self.escalation_emitted = true;
                 }
             }
             ClearanceState::Latched => {
-                // The transient Latched state escalates on the next observation.
+                // Defensive: not reached via `observe` after #328, but a loop somehow
+                // in `Latched` escalates on the next observation.
                 self.state = ClearanceState::EscalationRaised;
                 self.escalation_emitted = true;
             }
@@ -789,11 +799,12 @@ mod tests {
     fn grant(now: u64, age_ms: u64) -> OperatorClearanceGrant {
         OperatorClearanceGrant { operator_id: "op-7".into(), granted_at_ms: now - age_ms }
     }
-    /// Drive a fresh loop into EscalationRaised (impact, then one more tick).
+    /// Drive a fresh loop into EscalationRaised. Post-#328 the first latching
+    /// observe escalates in one step; a second clean observe is a harmless no-op.
     fn escalated() -> ClearanceLoop {
         let mut l = ClearanceLoop::new();
-        l.observe(&contact(), &cfg(), 1_000); // Normal → Latched
-        l.observe(&clean(), &cfg(), 1_001); // Latched → EscalationRaised
+        l.observe(&contact(), &cfg(), 1_000); // Normal → EscalationRaised (one step)
+        l.observe(&clean(), &cfg(), 1_001); // stays EscalationRaised
         assert_eq!(l.state(), ClearanceState::EscalationRaised);
         l
     }
@@ -839,22 +850,32 @@ mod tests {
         assert!(!l.escalation_pending());
     }
 
-    /// Escalation is a once-per-incident rising edge: it raises exactly once,
-    /// then stays pending across many immobilized ticks.
+    /// Escalation is a once-per-incident rising edge: post-#328 it raises on the
+    /// LATCHING observe (one step), then stays pending across many immobilized ticks.
     #[test]
     fn test_escalation_raised_once_per_incident() {
         let mut l = ClearanceLoop::new();
         assert!(!l.escalation_pending());
         l.observe(&contact(), &cfg(), 1_000);
-        assert_eq!(l.state(), ClearanceState::Latched);
-        assert!(!l.escalation_pending(), "not yet raised in the transient Latched tick");
-        l.observe(&clean(), &cfg(), 1_001);
-        assert!(l.escalation_pending(), "raised on the next observation");
-        // stays pending, no oscillation
+        assert_eq!(l.state(), ClearanceState::EscalationRaised, "#328: latch raises escalation in one step");
+        assert!(l.escalation_pending(), "raised on the latching observe — no one-tick gap");
+        // stays pending, no oscillation, no second raise
         for t in 0..10 {
             l.observe(&clean(), &cfg(), 1_100 + t);
             assert!(l.escalation_pending());
         }
+    }
+
+    /// #328 — THE GAP-CLOSE PROOF: a SINGLE observe with latching evidence reaches
+    /// EscalationRaised (not the old intermediate Latched), with the veto and the
+    /// escalation edge both live in that one call.
+    #[test]
+    fn test_latch_and_escalation_raised_in_one_observe() {
+        let mut l = ClearanceLoop::new();
+        l.observe(&contact(), &cfg(), 1_000);
+        assert_eq!(l.state(), ClearanceState::EscalationRaised, "one latching observe → EscalationRaised");
+        assert!(l.is_immobilized(), "veto live on the latching tick");
+        assert!(l.escalation_pending(), "escalation raised on the latching tick (no next-tick wait)");
     }
 
     /// Re-impact while EscalationRaised does not raise a second time.
@@ -873,10 +894,10 @@ mod tests {
         let mut l = escalated();
         l.try_clear(&grant(now, 10), now, MAX_AGE).unwrap();
         assert_eq!(l.state(), ClearanceState::Normal);
-        // New incident.
+        // New incident — post-#328 the latching observe raises the fresh escalation
+        // in one step.
         l.observe(&contact(), &cfg(), now + 1_000);
-        assert_eq!(l.state(), ClearanceState::Latched);
-        l.observe(&clean(), &cfg(), now + 1_001);
+        assert_eq!(l.state(), ClearanceState::EscalationRaised);
         assert!(l.escalation_pending(), "a new impact after clearance raises a fresh escalation");
     }
 
@@ -892,18 +913,18 @@ mod tests {
         assert_eq!(l.state(), ClearanceState::Normal);
     }
 
-    /// The veto (is_immobilized) is active in BOTH Latched and EscalationRaised,
-    /// and released only after a grant.
+    /// The veto (is_immobilized) goes live on the latching tick and stays live
+    /// through escalation, released only after a grant. Post-#328 the latching
+    /// observe lands directly in EscalationRaised (the veto never lags the latch).
     #[test]
-    fn test_veto_active_in_both_latched_states() {
+    fn test_veto_active_from_latch_until_grant() {
         let mut l = ClearanceLoop::new();
         assert!(!l.is_immobilized()); // Normal
         l.observe(&contact(), &cfg(), 1_000);
-        assert_eq!(l.state(), ClearanceState::Latched);
-        assert!(l.is_immobilized(), "veto active in Latched");
+        assert_eq!(l.state(), ClearanceState::EscalationRaised, "#328: one step to EscalationRaised");
+        assert!(l.is_immobilized(), "veto active immediately on the latching tick");
         l.observe(&clean(), &cfg(), 1_001);
-        assert_eq!(l.state(), ClearanceState::EscalationRaised);
-        assert!(l.is_immobilized(), "veto active in EscalationRaised");
+        assert!(l.is_immobilized(), "veto stays active across immobilized ticks");
         let now = 2_000u64;
         l.try_clear(&grant(now, 10), now, MAX_AGE).unwrap();
         assert!(!l.is_immobilized(), "released only after the grant");

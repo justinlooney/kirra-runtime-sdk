@@ -1928,13 +1928,13 @@ mod scene_rss_tests {
         let contact = ImpactEvidence { imu_accel_spike_mps2: 0.5, contact_sensor: true, vanished_object: false };
         let clean = ImpactEvidence { imu_accel_spike_mps2: 0.5, contact_sensor: false, vanished_object: false };
 
-        // Latched → Deny.
+        // Latching observe → immobilized (post-#328: EscalationRaised in one step) → Deny.
         l.observe(&contact, &ImpactCfg::default(), 1_000);
-        assert_eq!(l.state(), ClearanceState::Latched);
+        assert_eq!(l.state(), ClearanceState::EscalationRaised);
         let d1 = gov.evaluate_with_clearance_loop(&cmd(8.0), Some(&cmd(8.0)), 0.05, SafetyPosture::Nominal, &l);
-        assert!(matches!(d1, EnforcementAction::Deny { .. }), "Latched must immobilize, got {d1:?}");
+        assert!(matches!(d1, EnforcementAction::Deny { .. }), "the latching tick must immobilize, got {d1:?}");
 
-        // EscalationRaised → still Deny; clean evidence never resumes.
+        // Still EscalationRaised on a clean tick → still Deny; clean evidence never resumes.
         l.observe(&clean, &ImpactCfg::default(), 1_001);
         assert_eq!(l.state(), ClearanceState::EscalationRaised);
         let d2 = gov.evaluate_with_clearance_loop(&cmd(8.0), Some(&cmd(8.0)), 0.05, SafetyPosture::Nominal, &l);
