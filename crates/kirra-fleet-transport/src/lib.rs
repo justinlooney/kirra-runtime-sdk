@@ -1,0 +1,457 @@
+//! # kirra-fleet-transport — the FLEET-LANE (QM) Zenoh transport spike (#296)
+//!
+//! Vehicle ↔ ops/cloud transport for cellular / distributed fleets. The decision
+//! and its three clauses live in `docs/adr/0007-fleet-transport-zenoh.md`; this
+//! crate is the spike. Restated:
+//!
+//! 1. **Untrusted carrier (the trust rule).** Zenoh is an UNTRUSTED CARRIER.
+//!    Trust derives from **Ed25519 payload signatures** — federation reports via
+//!    [`kirra_runtime_sdk::federation_reconciliation::verify_federated_report_signature_v2`],
+//!    grants via [`verify_clearance_grant`] — **never** from transport identity, a
+//!    topic name, or Zenoh's own auth. Every ingest **verifies before use**;
+//!    unsigned / bad-signature / malformed payloads are rejected and **counted**
+//!    ([`RejectionCounter`]).
+//! 2. **Strictly QM (the domain rule).** This crate is a LEAF consumer that
+//!    depends on the SDK. **Nothing under `src/gateway/` or any safety path may
+//!    depend on it** (ADR-0006 Clause 2's boundary asymmetry is the parent rule).
+//! 3. **Grants terminate at the store (the grant rule).** The remote grant lane
+//!    writes a *verified* grant through the **existing** Phase-A store path
+//!    ([`VerifierStore::save_clearance_grant_chained`]) as a `PENDING` row;
+//!    Phase-B's one-shot pickup + two-checkpoint delivery proceed UNCHANGED. No
+//!    new store schema, no second release path.
+//!
+//! This module ([`lib`](self)) is the **transport-free trust + codec core** — the
+//! load-bearing safety logic, unit-tested without any Zenoh session. The Zenoh
+//! pub/sub edge is in [`transport`].
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+
+use kirra_runtime_sdk::federation_reconciliation::{
+    verify_federated_report_signature_v2, FederatedTrustReportV2,
+};
+use kirra_runtime_sdk::verifier::FleetPosture;
+use kirra_runtime_sdk::verifier_store::VerifierStore;
+
+pub mod transport;
+
+// ---------------------------------------------------------------------------
+// Namespace — versioned key expressions
+// ---------------------------------------------------------------------------
+//
+// Up (vehicle → ops/cloud): trust reports + posture summaries.
+// Down (ops/cloud → vehicle): clearance grants.
+// The `v1` segment is the wire-contract version; a breaking change bumps it.
+
+/// Key expression for a node's signed trust report (vehicle → fleet).
+#[must_use]
+pub fn key_trust_report(node_id: &str) -> String {
+    format!("kirra/v1/fleet/{node_id}/trust-report")
+}
+
+/// Key expression for a node's posture summary (vehicle → fleet).
+#[must_use]
+pub fn key_posture(node_id: &str) -> String {
+    format!("kirra/v1/fleet/{node_id}/posture")
+}
+
+/// Key expression for a node's clearance grant (ops/cloud → vehicle).
+#[must_use]
+pub fn key_clearance_grant(node_id: &str) -> String {
+    format!("kirra/v1/ops/{node_id}/clearance-grant")
+}
+
+// ---------------------------------------------------------------------------
+// Rejection accounting (surfaced for ops)
+// ---------------------------------------------------------------------------
+
+/// Why a received payload was rejected BEFORE use. Surfaced via [`RejectionCounter`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectReason {
+    /// The payload carried no signature (empty `signature_b64`).
+    Unsigned,
+    /// The Ed25519 signature did not verify against the expected key.
+    BadSignature,
+    /// The payload could not be decoded from the wire bytes.
+    Decode(String),
+    /// The payload decoded but is structurally invalid (e.g. empty node/operator).
+    Malformed(String),
+    /// A verified grant could not be written to the store (fail-closed).
+    StoreError(String),
+}
+
+impl RejectReason {
+    /// A short, stable code for ops dashboards / logs.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            RejectReason::Unsigned => "unsigned",
+            RejectReason::BadSignature => "bad_signature",
+            RejectReason::Decode(_) => "decode_error",
+            RejectReason::Malformed(_) => "malformed",
+            RejectReason::StoreError(_) => "store_error",
+        }
+    }
+}
+
+/// Operator-observable rejected-payload counters. An untrusted carrier WILL deliver
+/// junk and tampered payloads; this makes the rejections visible rather than silent.
+#[derive(Debug, Default)]
+pub struct RejectionCounter {
+    unsigned: AtomicU64,
+    bad_signature: AtomicU64,
+    decode_error: AtomicU64,
+    malformed: AtomicU64,
+    store_error: AtomicU64,
+    accepted: AtomicU64,
+}
+
+impl RejectionCounter {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a rejection by reason.
+    pub fn record(&self, reason: &RejectReason) {
+        let slot = match reason {
+            RejectReason::Unsigned => &self.unsigned,
+            RejectReason::BadSignature => &self.bad_signature,
+            RejectReason::Decode(_) => &self.decode_error,
+            RejectReason::Malformed(_) => &self.malformed,
+            RejectReason::StoreError(_) => &self.store_error,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an accepted (verified) payload.
+    pub fn record_accepted(&self) {
+        self.accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> RejectionSnapshot {
+        RejectionSnapshot {
+            unsigned: self.unsigned.load(Ordering::Relaxed),
+            bad_signature: self.bad_signature.load(Ordering::Relaxed),
+            decode_error: self.decode_error.load(Ordering::Relaxed),
+            malformed: self.malformed.load(Ordering::Relaxed),
+            store_error: self.store_error.load(Ordering::Relaxed),
+            accepted: self.accepted.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Total rejected across all reasons.
+    #[must_use]
+    pub fn total_rejected(&self) -> u64 {
+        let s = self.snapshot();
+        s.unsigned + s.bad_signature + s.decode_error + s.malformed + s.store_error
+    }
+}
+
+/// A point-in-time copy of [`RejectionCounter`] for ops surfacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RejectionSnapshot {
+    pub unsigned: u64,
+    pub bad_signature: u64,
+    pub decode_error: u64,
+    pub malformed: u64,
+    pub store_error: u64,
+    pub accepted: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Fleet posture summary (a small vehicle → fleet status payload)
+// ---------------------------------------------------------------------------
+
+/// A compact, *unsigned* posture summary for the fleet dashboard. Posture is
+/// advisory telemetry, not an authority signal — the authoritative, signed path is
+/// the [`FederatedTrustReportV2`]. (A future hardening may sign these too; for the
+/// spike they are debug/telemetry only and never drive a safety decision.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PostureSummary {
+    pub node_id: String,
+    pub posture: FleetPosture,
+    pub generated_at_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Report codec (JSON — fleet-lane debuggability; trust is in the signature)
+// ---------------------------------------------------------------------------
+
+/// Encode a signed trust report for the fleet wire (JSON).
+pub fn encode_report(report: &FederatedTrustReportV2) -> Result<Vec<u8>, RejectReason> {
+    serde_json::to_vec(report).map_err(|e| RejectReason::Decode(e.to_string()))
+}
+
+/// Decode + **verify** a trust report from wire bytes against `public_key_b64`.
+/// **Verification happens BEFORE the report is surfaced to any caller** — an
+/// unsigned / bad-signature / malformed payload is rejected and the `counter` is
+/// incremented; only a verified report is returned.
+pub fn accept_report(
+    bytes: &[u8],
+    public_key_b64: &str,
+    counter: &RejectionCounter,
+) -> Result<FederatedTrustReportV2, RejectReason> {
+    let report: FederatedTrustReportV2 = match serde_json::from_slice(bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            let reason = RejectReason::Decode(e.to_string());
+            counter.record(&reason);
+            return Err(reason);
+        }
+    };
+    if report.signature_b64.trim().is_empty() {
+        counter.record(&RejectReason::Unsigned);
+        return Err(RejectReason::Unsigned);
+    }
+    // THE TRUST RULE — verify the Ed25519 signature over the canonical payload
+    // BEFORE the report is used. Trust is the signature, never the carrier.
+    if !verify_federated_report_signature_v2(&report, public_key_b64) {
+        counter.record(&RejectReason::BadSignature);
+        return Err(RejectReason::BadSignature);
+    }
+    counter.record_accepted();
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Signed clearance grant (the down lane) — reuses the federation Ed25519 pattern
+// ---------------------------------------------------------------------------
+
+/// An operator clearance grant signed by the issuing controller for transport over
+/// the untrusted fleet carrier. The vehicle verifies the signature against the
+/// controller's registered public key BEFORE writing it to the store.
+///
+/// The signature is over a canonical payload of the *semantic* fields
+/// ([`canonical_grant_payload`]), NOT the wire bytes — so the codec is independent
+/// of the trust root (mirrors `canonical_federation_payload_v2`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedClearanceGrant {
+    pub node_id: String,
+    pub operator_id: String,
+    pub granted_at_ms: u64,
+    pub signature_b64: String,
+}
+
+/// The canonical bytes an Ed25519 signature covers for a clearance grant.
+#[must_use]
+pub fn canonical_grant_payload(node_id: &str, operator_id: &str, granted_at_ms: u64) -> String {
+    serde_json::json!({
+        "node_id": node_id,
+        "operator_id": operator_id,
+        "granted_at_ms": granted_at_ms,
+    })
+    .to_string()
+}
+
+/// Sign a clearance grant with the issuing controller's key (ops/cloud side).
+#[must_use]
+pub fn sign_clearance_grant(
+    signing_key: &SigningKey,
+    node_id: &str,
+    operator_id: &str,
+    granted_at_ms: u64,
+) -> SignedClearanceGrant {
+    let payload = canonical_grant_payload(node_id, operator_id, granted_at_ms);
+    let sig: Signature = signing_key.sign(payload.as_bytes());
+    SignedClearanceGrant {
+        node_id: node_id.to_string(),
+        operator_id: operator_id.to_string(),
+        granted_at_ms,
+        signature_b64: B64.encode(sig.to_bytes()),
+    }
+}
+
+/// Verify a clearance grant's Ed25519 signature against `public_key_b64`. Fail-closed
+/// on any malformed key / signature.
+#[must_use]
+pub fn verify_clearance_grant(grant: &SignedClearanceGrant, public_key_b64: &str) -> bool {
+    let Ok(pk_bytes) = B64.decode(public_key_b64) else { return false };
+    let Ok(sig_bytes) = B64.decode(grant.signature_b64.as_bytes()) else { return false };
+    let Ok(pk_array) = <[u8; 32]>::try_from(pk_bytes.as_slice()) else { return false };
+    let Ok(sig_array) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else { return false };
+    let Ok(key) = VerifyingKey::from_bytes(&pk_array) else { return false };
+    let sig = Signature::from_bytes(&sig_array);
+    let payload = canonical_grant_payload(&grant.node_id, &grant.operator_id, grant.granted_at_ms);
+    key.verify(payload.as_bytes(), &sig).is_ok()
+}
+
+/// **THE GRANT RULE.** Verify a received grant, then write it through the EXISTING
+/// Phase-A store path as a `PENDING-NODE-TRANSPORT` row — the same row Phase-B's
+/// `take_pending_clearance_grant` consumes. No new schema, no second release path.
+///
+/// Verify-FIRST, fail-closed: an unsigned / bad-signature / structurally-malformed
+/// grant is rejected + counted and NEVER reaches the store. Returns the store rowid
+/// on success.
+pub fn ingest_clearance_grant(
+    store: &mut VerifierStore,
+    grant: &SignedClearanceGrant,
+    public_key_b64: &str,
+    counter: &RejectionCounter,
+) -> Result<i64, RejectReason> {
+    if grant.signature_b64.trim().is_empty() {
+        let r = RejectReason::Unsigned;
+        counter.record(&r);
+        return Err(r);
+    }
+    if grant.node_id.trim().is_empty() || grant.operator_id.trim().is_empty() {
+        let r = RejectReason::Malformed("empty node_id or operator_id".into());
+        counter.record(&r);
+        return Err(r);
+    }
+    if !verify_clearance_grant(grant, public_key_b64) {
+        let r = RejectReason::BadSignature;
+        counter.record(&r);
+        return Err(r);
+    }
+    // Verified → the existing Phase-A path (writes the PENDING row + signed audit
+    // event). Phase-B picks it up unchanged.
+    match store.save_clearance_grant_chained(&grant.node_id, &grant.operator_id, grant.granted_at_ms) {
+        Ok(rowid) => {
+            counter.record_accepted();
+            Ok(rowid)
+        }
+        Err(e) => {
+            let r = RejectReason::StoreError(e.to_string());
+            counter.record(&r);
+            Err(r)
+        }
+    }
+}
+
+#[cfg(test)]
+mod core_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn keypair() -> (SigningKey, String) {
+        let mut seed = [0u8; 32];
+        rand::Rng::fill(&mut rand::thread_rng(), &mut seed);
+        let sk = SigningKey::from_bytes(&seed);
+        let pk_b64 = B64.encode(sk.verifying_key().to_bytes());
+        (sk, pk_b64)
+    }
+
+    /// A genuinely signed report, built the way the verifier signs (over the
+    /// canonical v2 payload).
+    fn signed_report(sk: &SigningKey, asset: &str, gen: Option<u64>) -> FederatedTrustReportV2 {
+        use kirra_runtime_sdk::federation_reconciliation::canonical_federation_payload_v2;
+        let mut report = FederatedTrustReportV2 {
+            source_controller_id: "controller-A".into(),
+            asset_id: asset.into(),
+            posture: FleetPosture::Nominal,
+            issued_at_ms: 1_000,
+            expires_at_ms: 6_000,
+            nonce_hex: "deadbeef".into(),
+            signature_b64: String::new(),
+            source_generation: gen,
+        };
+        let sig = sk.sign(canonical_federation_payload_v2(&report).as_bytes());
+        report.signature_b64 = B64.encode(sig.to_bytes());
+        report
+    }
+
+    #[test]
+    fn report_round_trips_and_verifies() {
+        let (sk, pk) = keypair();
+        let counter = RejectionCounter::new();
+        let report = signed_report(&sk, "robot-01", Some(7));
+        let bytes = encode_report(&report).unwrap();
+        let got = accept_report(&bytes, &pk, &counter).unwrap();
+        assert_eq!(got, report);
+        assert_eq!(counter.snapshot().accepted, 1);
+        assert_eq!(counter.total_rejected(), 0);
+    }
+
+    #[test]
+    fn tampered_report_is_rejected_and_counted() {
+        let (sk, pk) = keypair();
+        let counter = RejectionCounter::new();
+        let report = signed_report(&sk, "robot-01", Some(7));
+        let mut bytes = encode_report(&report).unwrap();
+        // Flip a byte in the asset_id region — the signature no longer matches the
+        // canonical payload. (Find the 'r' of "robot-01" and bump it.)
+        let pos = bytes.windows(8).position(|w| w == b"robot-01").expect("asset in json");
+        bytes[pos] ^= 0x01;
+        let err = accept_report(&bytes, &pk, &counter).unwrap_err();
+        assert_eq!(err, RejectReason::BadSignature, "tamper must be a bad-signature reject");
+        assert_eq!(counter.snapshot().bad_signature, 1);
+        assert_eq!(counter.snapshot().accepted, 0);
+    }
+
+    #[test]
+    fn unsigned_report_is_rejected_and_counted() {
+        let (_sk, pk) = keypair();
+        let counter = RejectionCounter::new();
+        let report = FederatedTrustReportV2 {
+            source_controller_id: "c".into(),
+            asset_id: "robot-01".into(),
+            posture: FleetPosture::Nominal,
+            issued_at_ms: 1,
+            expires_at_ms: 2,
+            nonce_hex: "00".into(),
+            signature_b64: String::new(), // UNSIGNED
+            source_generation: None,
+        };
+        let bytes = encode_report(&report).unwrap();
+        let err = accept_report(&bytes, &pk, &counter).unwrap_err();
+        assert_eq!(err, RejectReason::Unsigned);
+        assert_eq!(counter.snapshot().unsigned, 1);
+    }
+
+    #[test]
+    fn report_signed_by_wrong_key_is_bad_signature() {
+        let (sk, _pk) = keypair();
+        let (_other, attacker_pk) = keypair();
+        let counter = RejectionCounter::new();
+        let report = signed_report(&sk, "robot-01", None);
+        let bytes = encode_report(&report).unwrap();
+        // Verify against an UNRELATED key → bad signature, never accepted.
+        let err = accept_report(&bytes, &attacker_pk, &counter).unwrap_err();
+        assert_eq!(err, RejectReason::BadSignature);
+    }
+
+    #[test]
+    fn grant_relay_lands_a_pending_row_that_phase_b_consumes() {
+        // THE COMPOSITION PROOF: a verified grant goes through the EXISTING
+        // Phase-A store path and is then consumed by the EXISTING Phase-B
+        // one-shot pickup — no new schema, no new release path.
+        let (sk, pk) = keypair();
+        let counter = RejectionCounter::new();
+        let mut store = VerifierStore::new(":memory:").unwrap();
+
+        let grant = sign_clearance_grant(&sk, "robot-01", "alice", 1_000);
+        let rowid = ingest_clearance_grant(&mut store, &grant, &pk, &counter).unwrap();
+        assert!(rowid > 0);
+        assert_eq!(counter.snapshot().accepted, 1);
+
+        // Phase-B's EXISTING one-shot pickup finds exactly that PENDING row.
+        let picked = store.take_pending_clearance_grant("robot-01", 1_500).unwrap();
+        let picked = picked.expect("the relayed grant is a pending row Phase-B consumes");
+        assert_eq!(picked.node_id, "robot-01");
+        assert_eq!(picked.operator_id, "alice");
+        assert_eq!(picked.granted_at_ms, 1_000);
+        // Exactly once — a second pickup finds nothing.
+        assert!(store.take_pending_clearance_grant("robot-01", 1_600).unwrap().is_none());
+    }
+
+    #[test]
+    fn tampered_grant_never_reaches_the_store() {
+        let (sk, pk) = keypair();
+        let counter = RejectionCounter::new();
+        let mut store = VerifierStore::new(":memory:").unwrap();
+
+        let mut grant = sign_clearance_grant(&sk, "robot-01", "alice", 1_000);
+        // Tamper: change the operator AFTER signing → signature no longer matches.
+        grant.operator_id = "mallory".into();
+        let err = ingest_clearance_grant(&mut store, &grant, &pk, &counter).unwrap_err();
+        assert_eq!(err, RejectReason::BadSignature);
+        assert_eq!(counter.snapshot().bad_signature, 1);
+        // Nothing was written — Phase-B finds no pending row.
+        assert!(store.take_pending_clearance_grant("robot-01", 2_000).unwrap().is_none());
+    }
+}
