@@ -124,30 +124,86 @@ impl ContactCell {
     }
 }
 
-/// Convention-free deceleration proxy: the Euclidean magnitude of the IMU
-/// linear-acceleration vector (m/s²). We deliberately do NOT assume a forward
-/// axis or remove gravity — both would invent a convention the sample does not
-/// carry (gravity removal needs the orientation, which is `Option` and may be
-/// absent). `ImpactEvidence::imu_accel_spike_mps2` is a "spike MAGNITUDE", and
-/// the threshold (default 30 m/s²) sits well above the ~9.81 m/s² gravity
-/// baseline, so a static vehicle never crosses it; a collision-grade total
-/// acceleration crosses it regardless of impact direction.
+/// Standard gravity (m/s², ISO 80000-3 / CGPM). The decel-deviation baseline.
+const STANDARD_GRAVITY_MPS2: f64 = 9.80665;
+
+/// Gravity-deviation decel proxy (#321 / ADL-013): `| ‖a‖ − G |`, the absolute
+/// deviation of the accelerometer-vector magnitude from standard gravity. At rest
+/// `‖a‖ ≈ G` ⇒ ≈ 0, so **no class false-latches on gravity** (the H2 floor bug:
+/// the old raw-norm `‖a‖` read ~9.81 at rest, below the courier threshold).
+///
+/// RESIDUAL (named, not fixed here): because `‖a‖` combines the impulse with gravity
+/// vectorially, this under-represents a purely horizontal impulse
+/// (`√(c²+G²) − G < c`). The better convention subtracts the gravity VECTOR via the
+/// orientation quaternion (`‖a − R·g‖`), but that needs a *reliable* orientation
+/// (`ImuSample::orientation` is `Option` and a fabricated identity quaternion would
+/// assert a false attitude). Orientation-corrected projection is the named future
+/// improvement; the deviation convention is the floor-bug fix that ships now, with
+/// thresholds set conservatively to absorb the residual.
 #[must_use]
-fn decel_magnitude(imu: &ImuSample) -> f64 {
+fn decel_deviation(imu: &ImuSample) -> f64 {
     let a = imu.linear_acceleration;
-    ((a[0] as f64).powi(2) + (a[1] as f64).powi(2) + (a[2] as f64).powi(2)).sqrt()
+    let norm = ((a[0] as f64).powi(2) + (a[1] as f64).powi(2) + (a[2] as f64).powi(2)).sqrt();
+    (norm - STANDARD_GRAVITY_MPS2).abs()
 }
 
-/// Build the SG6 [`ImpactEvidence`] for one tick from the node's live inputs +
-/// the (already-evaluated) vanished flag. An absent IMU contributes `0.0` (a
-/// finite below-threshold value — "no spike observed", never a NaN or a
-/// fabricated spike).
-#[must_use]
-fn assemble_evidence(inputs: &ImpactInputs, vanished: bool) -> ImpactEvidence {
-    ImpactEvidence {
-        imu_accel_spike_mps2: inputs.imu.as_ref().map_or(0.0, decel_magnitude),
-        contact_sensor: inputs.contact,
-        vanished_object: vanished,
+/// Decel confirmation debounce (#321 / ADL-013): a detection is confirmed only on a
+/// run of `≥ M` **CONSECUTIVE** above-threshold ticks within the last `N`
+/// observations — a debounce against single-tick jolts (pothole/curb), NOT an
+/// M-of-N vote (so `T,F,T` does NOT confirm). Holds a `VecDeque<bool>` bounded at
+/// capacity `N`. `M=1/N=1` (the default cfg) = single-tick / frozen behavior.
+///
+/// Lives here (the default-lane tick harness, alongside [`ContactCell`]) so the
+/// stateful confirmation is CI-tested without ROS; `node.rs` stays a thin transport.
+#[derive(Debug, Default)]
+pub struct SpikeDebouncer {
+    window: std::collections::VecDeque<bool>,
+}
+
+impl SpikeDebouncer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one observation: `deviation > threshold` is a "hit". Evicts the
+    /// oldest if the window is at capacity `N`.
+    pub fn observe(&mut self, deviation: f64, cfg: &ImpactCfg) {
+        let n = cfg.confirmation_n.max(1) as usize;
+        self.window.push_back(deviation > cfg.spike_threshold_mps2);
+        while self.window.len() > n {
+            self.window.pop_front();
+        }
+    }
+
+    /// True iff the window holds a run of `≥ M` consecutive hits.
+    #[must_use]
+    pub fn is_confirmed(&self, cfg: &ImpactCfg) -> bool {
+        let m = cfg.confirmation_m.max(1) as usize;
+        let mut run = 0usize;
+        for &hit in &self.window {
+            if hit {
+                run += 1;
+                if run >= m {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        false
+    }
+
+    /// [`is_confirmed`](Self::is_confirmed), and on a `true` CONSUME it by resetting
+    /// the window (so one collision confirms once, and the next incident needs a
+    /// fresh run). Mirrors [`ContactCell::drain`]'s consume semantics — but only
+    /// resets on a confirm, so the window can ACCUMULATE across ticks toward `M`.
+    pub fn drain_confirmed(&mut self, cfg: &ImpactCfg) -> bool {
+        let confirmed = self.is_confirmed(cfg);
+        if confirmed {
+            self.window.clear();
+        }
+        confirmed
     }
 }
 
@@ -168,6 +224,9 @@ pub struct NodeClearance {
     vanished: Option<VanishedObjectDetector>,
     /// Config for the vanished detector (parko-core default until tuned).
     vanished_cfg: VanishedCfg,
+    /// Decel confirmation debounce (#321) — per-node stateful, M-of-N consecutive
+    /// from `cfg.confirmation_*`.
+    spike_debouncer: SpikeDebouncer,
 }
 
 impl NodeClearance {
@@ -185,6 +244,7 @@ impl NodeClearance {
             cfg: ImpactCfg::default(),
             vanished: None,
             vanished_cfg: VanishedCfg::default(),
+            spike_debouncer: SpikeDebouncer::new(),
         }
     }
 
@@ -263,7 +323,26 @@ impl NodeClearance {
             (Some(det), Some(sc)) => det.observe(sc, now_ms, &self.vanished_cfg),
             _ => false,
         };
-        let evidence = assemble_evidence(inputs, vanished);
+        // Decel (#321): gravity-DEVIATION through the M-of-N confirmation debounce.
+        // An absent IMU contributes NO decel and does not advance the window (never
+        // a fabricated spike). A confirmed run reports the deviation; else 0.0.
+        let imu_accel_spike_mps2 = match &inputs.imu {
+            Some(imu) => {
+                let dev = decel_deviation(imu);
+                self.spike_debouncer.observe(dev, &self.cfg);
+                if self.spike_debouncer.drain_confirmed(&self.cfg) {
+                    dev
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        };
+        let evidence = ImpactEvidence {
+            imu_accel_spike_mps2,
+            contact_sensor: inputs.contact,
+            vanished_object: vanished,
+        };
         self.clearance_loop.observe(&evidence, &self.cfg, now_ms);
     }
 
@@ -388,6 +467,78 @@ mod tests {
         cell.assert(true);
         assert!(cell.drain(), "first read sees the contact");
         assert!(!cell.drain(), "second read is reset — one event latches once");
+    }
+
+    // ---- #321: decel deviation convention + SpikeDebouncer --------------
+
+    fn imu_with(ax: f32, ay: f32, az: f32) -> ImuSample {
+        ImuSample { linear_acceleration: [ax, ay, az], angular_velocity: [0.0; 3], orientation: None }
+    }
+
+    /// A flat, RESTING IMU (gravity only) reads ≈ 0 deviation — the #321 fix: it is
+    /// FAR below the courier threshold (2.5), so a static courier never false-latches
+    /// (the old raw-norm read ~9.81 > 8.0 and latched on gravity alone).
+    #[test]
+    fn static_resting_imu_deviation_is_below_courier_threshold() {
+        let dev = decel_deviation(&imu_with(0.0, 0.0, 9.80665));
+        assert!(dev < 1e-3, "resting deviation must be ≈ 0, got {dev}");
+        let courier = parko_core::impact_cfg_for_class(parko_core::VehicleClass::Courier);
+        assert!(dev < courier.spike_threshold_mps2,
+            "resting deviation {dev} must be below the courier threshold {}", courier.spike_threshold_mps2);
+    }
+
+    /// Parametric deviation: a known acceleration vector → expected `|‖a‖ − G|`.
+    #[test]
+    fn decel_deviation_matches_formula() {
+        // ‖(40,0,0)‖ = 40 → |40 − 9.80665| = 30.19335
+        let dev = decel_deviation(&imu_with(40.0, 0.0, 0.0));
+        assert!((dev - (40.0 - 9.80665)).abs() < 1e-3, "got {dev}");
+        // free-fall ‖(0,0,0)‖ = 0 → |0 − G| = G (a secondary anomaly trigger)
+        let ff = decel_deviation(&imu_with(0.0, 0.0, 0.0));
+        assert!((ff - 9.80665).abs() < 1e-3, "free-fall deviation = G, got {ff}");
+    }
+
+    fn cfg_mn(threshold: f64, m: u8, n: u8) -> ImpactCfg {
+        ImpactCfg { spike_threshold_mps2: threshold, confirmation_m: m, confirmation_n: n }
+    }
+
+    /// M=2/N=3: one hit not confirmed; two CONSECUTIVE hits confirmed + drain
+    /// resets; the non-consecutive T,F,T never confirms; sub-threshold never confirms.
+    #[test]
+    fn spike_debouncer_m2_n3_requires_consecutive() {
+        let cfg = cfg_mn(2.5, 2, 3);
+        let mut d = SpikeDebouncer::new();
+
+        // one hit → not confirmed
+        d.observe(5.0, &cfg);
+        assert!(!d.drain_confirmed(&cfg), "single hit must not confirm M=2");
+        // a SECOND consecutive hit → confirmed, and drain resets the window
+        d.observe(5.0, &cfg);
+        assert!(d.drain_confirmed(&cfg), "two consecutive hits confirm M=2");
+        assert!(!d.is_confirmed(&cfg), "drain reset the window after a confirm");
+
+        // non-consecutive T,F,T → never confirms (the debounce, not a vote)
+        let mut d2 = SpikeDebouncer::new();
+        d2.observe(5.0, &cfg); assert!(!d2.drain_confirmed(&cfg));
+        d2.observe(0.0, &cfg); assert!(!d2.drain_confirmed(&cfg));
+        d2.observe(5.0, &cfg); assert!(!d2.drain_confirmed(&cfg), "T,F,T is non-consecutive → not confirmed");
+
+        // sub-threshold forever → never confirms
+        let mut d3 = SpikeDebouncer::new();
+        for _ in 0..10 { d3.observe(1.0, &cfg); assert!(!d3.drain_confirmed(&cfg)); }
+    }
+
+    /// M=1/N=1 (robotaxi / default): a single above-threshold tick confirms
+    /// immediately — the frozen single-tick behavior (zero regression).
+    #[test]
+    fn spike_debouncer_m1_n1_confirms_single_tick() {
+        let cfg = cfg_mn(22.0, 1, 1);
+        let mut d = SpikeDebouncer::new();
+        d.observe(25.0, &cfg);
+        assert!(d.drain_confirmed(&cfg), "M=1/N=1 confirms on one hit");
+        // a sub-threshold tick does not
+        d.observe(10.0, &cfg);
+        assert!(!d.drain_confirmed(&cfg));
     }
 
     use parko_core::backend::{BackendDescriptor, TensorBatch};

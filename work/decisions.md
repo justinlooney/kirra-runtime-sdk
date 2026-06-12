@@ -724,3 +724,79 @@ public download.
   confirmation all ride #36 / a #276 engagement).
 
 
+## ADL-013 — SG6 decel convention: gravity-deviation + M-of-N confirmation window (#321)
+
+**Date:** 2026-06-12
+**Status:** Decided — implemented in this PR. Thresholds are **VALIDATION-PENDING** (bench/SOTIF characterization rides the eventual hardware day); the *convention* and the *window mechanism* are decided.
+**Deciders:** Justin Looney
+**Source:** Code-review register #319 (finding H2+A1). The prior raw-norm proxy (`‖a‖`, gravity-inclusive) had a floor bug: at rest `‖a‖ ≈ 9.80665`, so the courier threshold of 8.0 was *below gravity* — a static, level courier latched on gravity alone — and a single-tick jolt permanently latched (human clearance required). Both are fixed here.
+**Cross-refs:** #321 (this fix), #319 (register), #311 (the raw-norm proxy this replaces), #312/#316 (the per-class contract family), `docs/CONTRACT_PROFILES.md` (the normative `*.impact_spike` rows + the convention row), `parko/crates/parko-core/src/impact.rs` (`ImpactCfg`), `parko/crates/parko-ros2/src/clearance_gate.rs` (`decel_deviation` / `SpikeDebouncer`).
+
+### 1. Convention — gravity-DEVIATION, not raw norm
+
+The IMU decel proxy is now the **absolute deviation of the accelerometer-vector
+magnitude from standard gravity**:
+
+> `decel_deviation = | ‖a‖ − G |`,  `G = 9.80665 m/s²` (ISO 80000-3 / CGPM standard gravity).
+
+At rest `‖a‖ ≈ G` ⇒ deviation ≈ 0, so **no threshold below gravity is needed and no
+class false-latches at rest** — the H2 floor bug is structurally removed. A
+collision-grade deceleration raises `‖a‖` ⇒ a large deviation; free-fall lowers `‖a‖`
+⇒ also a large deviation (a robot going off a curb edge is an anomaly worth latching —
+acceptable secondary trigger).
+
+**Named residual (orientation-corrected projection).** Because `‖a‖` combines the
+collision impulse with gravity *vectorially*, the deviation still under-represents a
+purely horizontal impulse (`√(c²+G²) − G < c`). The better convention subtracts the
+gravity vector using the orientation quaternion (`‖a − R·g‖`), but that requires a
+**reliable** orientation (`ImuSample::orientation` is `Option` and may be absent —
+and a fabricated identity quaternion would assert a false attitude, exactly the hazard
+`imu_shim` guards). So orientation-corrected projection is a **named future
+improvement**, gated on a trustworthy quaternion; the deviation convention is the
+floor-bug fix that ships now, with thresholds set conservatively to absorb the
+residual.
+
+### 2. Confirmation window — M consecutive of the last N (a debounce, not a vote)
+
+`ImpactCfg` gains `confirmation_m: u8` and `confirmation_n: u8`. A decel detection is
+**confirmed** only when the last `N` observations contain a run of **≥ M CONSECUTIVE**
+above-threshold ticks. This is a *debounce against a single-tick jolt* (pothole, curb
+strike), NOT an M-of-N vote: `T,F,T` does **not** confirm (no consecutive run) — a
+sustained deceleration is the signal, two scattered jolts are not. (`SpikeDebouncer`
+holds a `VecDeque<bool>` bounded at capacity `N`; `drain_confirmed` consumes the
+confirmation by resetting the window only when it fires.)
+
+**Defaults `M=1, N=1` ⇒ zero regression:** a single tick above threshold confirms
+immediately — bit-identical to the prior single-tick behavior. Every existing
+`is_impact` / latch test passes unchanged; that default IS the backward-compat proof.
+
+### 3. Revised per-class thresholds (deviation units; M-of-N) — all VALIDATION-PENDING
+
+| class | threshold (`|‖a‖−G|`, m/s²) | M / N | basis |
+|---|---|---|---|
+| Courier (sidewalk) | **2.5** | 2 / 3 | walking-pace (~1.5–3 m/s) collision is a small but distinct deviation; above ordinary curb/bump jolts, which M=2/N=3 debounces; a courier strikes curbs often. (replaces the old **8.0 raw-norm**, which was *below gravity*.) |
+| Delivery-AV (road pod) | **8.0** | 2 / 3 | ~11 m/s road-pod collision decelerates harder than a sidewalk hit, less than a full crash; mid deviation, debounced against road bumps. |
+| Robotaxi | **22.0** | 1 / 1 | full-speed collision-grade decel (~30 m/s² raw-norm ≈ 20–22 deviation once combined with gravity). **M=1/N=1: a highway crash is unambiguous in one tick and the FTTI is tight — no latency budget to wait for confirmation.** |
+| `ImpactCfg::default()` | 30.0 (unchanged) | 1 / 1 | the conservative fallback when no class is selected; threshold left at 30.0 so the convention change introduces zero regression in the default path. |
+
+**The latency-vs-false-latch tradeoff (the A1 decision):** lower-speed classes
+(courier / delivery-AV) accept a 2-of-3 confirmation delay (≤ ~150 ms at 20 Hz) to
+reject the frequent benign jolts of pedestrian/road-pod operation; the robotaxi class
+refuses that delay (M=1) because at highway speed the collision is unambiguous and the
+fault-tolerant time interval does not permit it. M/N is therefore a **per-class**
+parameter, not a global constant.
+
+### 4. Config-load validation
+
+`ImpactCfg::validate()` enforces `spike_threshold_mps2 > 1.0` (a deviation threshold ≤
+1 would trip on noise) ∧ `confirmation_m ≥ 1` ∧ `confirmation_n ≥ confirmation_m`. Every
+built-in `impact_cfg_for_class` profile is asserted valid; a future bad built-in trips
+in tests.
+
+### 5. Named residuals (not fixed here)
+- **Orientation-corrected projection** (§1) — gated on a reliable quaternion.
+- **Threshold + M/N certification** — all numbers are VALIDATION-PENDING placeholders;
+  bench characterization of low-speed collision decel signatures replaces them.
+- **Per-class wiring into the node binary** — selecting `impact_cfg_for_class(class)`
+  at runtime is the #312 remainder; until then the node uses the default (30.0, 1/1).
+

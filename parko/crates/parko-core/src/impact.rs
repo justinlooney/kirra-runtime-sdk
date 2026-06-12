@@ -34,18 +34,58 @@ pub struct ImpactEvidence {
 /// Fusion config. `spike_threshold_mps2` is a PARAMETER with a conservative
 /// **VALIDATION-PENDING** default — a track-test / SOTIF-derived value, NOT a
 /// certified constant (the same honesty as #98's water thresholds).
+///
+/// Since #321 (ADL-013) the IMU term is a **gravity-DEVIATION** threshold
+/// (`|‖a‖ − G|`), not a raw norm — so a static vehicle reads ≈ 0 and no class
+/// false-latches at rest. The decel detection is also debounced by an M-of-N
+/// **consecutive** confirmation window (`confirmation_m` / `confirmation_n`); the
+/// `M=1, N=1` default is the single-tick frozen behavior (zero regression).
 #[derive(Debug, Clone, Copy)]
 pub struct ImpactCfg {
-    /// IMU deceleration magnitude (m/s²) above which a *finite* spike is read as
-    /// a collision-grade impact.
+    /// IMU deceleration **deviation** (m/s², `|‖a‖ − G|`) above which a *finite*
+    /// observation is a collision-grade impact tick (#321 / ADL-013).
     pub spike_threshold_mps2: f64,
+    /// Confirmation window: a decel detection is confirmed only on a run of `≥ M`
+    /// CONSECUTIVE above-threshold ticks (a debounce against single-tick jolts —
+    /// NOT an M-of-N vote). `1` = single-tick (frozen behavior).
+    pub confirmation_m: u8,
+    /// Window size: the last `N` observations the confirmation run is sought in.
+    /// `N >= M`. `1` = single-tick.
+    pub confirmation_n: u8,
 }
 
 impl Default for ImpactCfg {
     fn default() -> Self {
         // VALIDATION-PENDING placeholder — a hard, collision-grade deceleration.
-        // NOT a certified value.
-        Self { spike_threshold_mps2: 30.0 }
+        // NOT a certified value. Threshold left at 30.0 across the #321 convention
+        // change so the default path has ZERO regression; M=1/N=1 = single-tick.
+        Self { spike_threshold_mps2: 30.0, confirmation_m: 1, confirmation_n: 1 }
+    }
+}
+
+impl ImpactCfg {
+    /// Config-load validation (#321 / ADL-013 §4). Fail-closed on a nonsensical
+    /// config: a deviation threshold `≤ 1.0` would trip on sensor noise; `M < 1`
+    /// can never confirm; `N < M` can never hold a run of `M`.
+    pub fn validate(&self) -> Result<(), String> {
+        // Fail-closed on any non-sane value: NaN/Inf (never a usable threshold) or
+        // <= 1.0 (would trip on sensor noise).
+        if !self.spike_threshold_mps2.is_finite() || self.spike_threshold_mps2 <= 1.0 {
+            return Err(format!(
+                "spike_threshold_mps2 must be a finite value > 1.0 (deviation units), got {}",
+                self.spike_threshold_mps2
+            ));
+        }
+        if self.confirmation_m < 1 {
+            return Err("confirmation_m must be >= 1".to_string());
+        }
+        if self.confirmation_n < self.confirmation_m {
+            return Err(format!(
+                "confirmation_n ({}) must be >= confirmation_m ({})",
+                self.confirmation_n, self.confirmation_m
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -81,21 +121,43 @@ pub enum VehicleClass {
 /// `docs/CONTRACT_PROFILES.md` (param `*.impact_spike`).
 #[must_use]
 pub fn impact_cfg_for_class(class: VehicleClass) -> ImpactCfg {
-    match class {
-        // Robotaxi = the frozen default (road-speed collision-grade decel, 30 m/s²).
-        VehicleClass::Robotaxi => ImpactCfg::default(),
-        // VALIDATION-PENDING: a road-pod collision at ~11 m/s decelerates less
-        // violently than a full-speed crash; a mid threshold pending bench data.
-        // (CONTRACT_PROFILES.md delivery-av.impact_spike)
-        VehicleClass::DeliveryAv => ImpactCfg { spike_threshold_mps2: 18.0 },
-        // VALIDATION-PENDING: a sidewalk collision at walking pace produces a SMALL
-        // decel signature — far below the road threshold — so the trigger must be
-        // more sensitive, but ABOVE ordinary curb/bump jolts. This value genuinely
-        // needs bench characterization of low-speed collision decel signatures; it
-        // is a flagged placeholder, NOT a guessed certified number.
-        // (CONTRACT_PROFILES.md courier.impact_spike)
-        VehicleClass::Courier => ImpactCfg { spike_threshold_mps2: 8.0 },
-    }
+    // All thresholds are DEVIATION (`|‖a‖ − G|`) units since #321 / ADL-013, and
+    // all are VALIDATION-PENDING. (CONTRACT_PROFILES.md `*.impact_spike` is the
+    // normative table; both this and the SDK gateway cite it.)
+    let cfg = match class {
+        // VALIDATION-PENDING: full-speed collision-grade decel (~30 m/s² raw-norm
+        // ≈ 20–22 deviation once combined with gravity). M=1/N=1 — a highway crash
+        // is unambiguous in one tick and the FTTI is tight (no confirmation delay).
+        // (NOTE: no longer == ImpactCfg::default(); the convention change moves the
+        // robotaxi number off the raw-norm 30.) (CONTRACT_PROFILES.md robotaxi.impact_spike)
+        VehicleClass::Robotaxi => ImpactCfg {
+            spike_threshold_mps2: 22.0,
+            confirmation_m: 1,
+            confirmation_n: 1,
+        },
+        // VALIDATION-PENDING: a road-pod collision at ~11 m/s decelerates harder
+        // than a sidewalk hit, less than a full crash; mid deviation, debounced
+        // 2-of-3 against road bumps. (CONTRACT_PROFILES.md delivery-av.impact_spike)
+        VehicleClass::DeliveryAv => ImpactCfg {
+            spike_threshold_mps2: 8.0,
+            confirmation_m: 2,
+            confirmation_n: 3,
+        },
+        // VALIDATION-PENDING: a sidewalk collision at walking pace (~1.5–3 m/s) is a
+        // SMALL but distinct deviation — above ordinary curb/bump jolts, which the
+        // 2-of-3 consecutive window debounces (a courier strikes curbs often).
+        // REPLACES the old 8.0 raw-norm, which was BELOW the ~9.81 gravity floor (a
+        // static courier latched on gravity alone — the #321 bug). Needs bench
+        // characterization. (CONTRACT_PROFILES.md courier.impact_spike)
+        VehicleClass::Courier => ImpactCfg {
+            spike_threshold_mps2: 2.5,
+            confirmation_m: 2,
+            confirmation_n: 3,
+        },
+    };
+    // The built-in profiles are compile-time constants and must always be valid.
+    debug_assert!(cfg.validate().is_ok(), "built-in {class:?} ImpactCfg invalid: {:?}", cfg.validate());
+    cfg
 }
 
 /// Conservative, fail-closed fusion: an impact is declared iff **ANY** signal
@@ -561,23 +623,53 @@ mod tests {
     }
 
     #[test]
-    fn robotaxi_impact_cfg_is_the_frozen_default_courier_differs() {
-        // Robotaxi delegates to the frozen default (zero new number).
-        assert_eq!(
-            impact_cfg_for_class(VehicleClass::Robotaxi).spike_threshold_mps2,
-            ImpactCfg::default().spike_threshold_mps2,
-            "robotaxi must be the frozen default threshold"
-        );
-        // Courier is more sensitive (lower threshold) — a sidewalk collision is a
-        // smaller decel signature; it must NOT equal the robotaxi/road value.
+    fn class_threshold_ordering_and_robotaxi_off_default() {
+        // Deviation-convention ordering (#321 / ADL-013): courier < delivery-av <
+        // robotaxi — a sidewalk collision is a smaller deviation than a road crash.
         let courier = impact_cfg_for_class(VehicleClass::Courier).spike_threshold_mps2;
-        let robotaxi = impact_cfg_for_class(VehicleClass::Robotaxi).spike_threshold_mps2;
-        assert!(courier != robotaxi, "courier threshold must differ from robotaxi");
-        assert!(courier < robotaxi, "courier (sidewalk) must be more sensitive than robotaxi (road)");
-        // Ordering sanity across the family: courier < delivery-av < robotaxi.
         let delivery = impact_cfg_for_class(VehicleClass::DeliveryAv).spike_threshold_mps2;
+        let robotaxi = impact_cfg_for_class(VehicleClass::Robotaxi).spike_threshold_mps2;
         assert!(courier < delivery && delivery < robotaxi,
             "threshold ordering courier {courier} < delivery-av {delivery} < robotaxi {robotaxi}");
+        // The #321 convention change moves robotaxi OFF the raw-norm default (30.0):
+        // it is now an explicit deviation threshold.
+        assert!((robotaxi - ImpactCfg::default().spike_threshold_mps2).abs() > f64::EPSILON,
+            "robotaxi deviation threshold ({robotaxi}) is no longer the raw-norm default (30.0)");
+        // The courier number is the #321 fix: ABOVE 1.0 (noise) and BELOW the ~9.81
+        // gravity floor (the old 8.0 raw-norm was below gravity → false-latched at rest).
+        assert!(courier > 1.0 && courier < 9.80665,
+            "courier deviation threshold {courier} sits between noise and gravity");
+    }
+
+    #[test]
+    fn impact_cfg_validate_rejects_nonsense() {
+        // threshold <= 1.0 → Err
+        assert!(ImpactCfg { spike_threshold_mps2: 1.0, confirmation_m: 1, confirmation_n: 1 }
+            .validate().is_err());
+        assert!(ImpactCfg { spike_threshold_mps2: 0.5, confirmation_m: 1, confirmation_n: 1 }
+            .validate().is_err());
+        // M < 1 → Err
+        assert!(ImpactCfg { spike_threshold_mps2: 5.0, confirmation_m: 0, confirmation_n: 1 }
+            .validate().is_err());
+        // N < M → Err
+        assert!(ImpactCfg { spike_threshold_mps2: 5.0, confirmation_m: 3, confirmation_n: 2 }
+            .validate().is_err());
+        // a sane cfg validates
+        assert!(ImpactCfg { spike_threshold_mps2: 2.5, confirmation_m: 2, confirmation_n: 3 }
+            .validate().is_ok());
+    }
+
+    #[test]
+    fn every_class_impact_cfg_passes_validation() {
+        // Exhaustive over the family (M <= N, threshold > 1.0) — the built-in
+        // profiles must always be valid.
+        for class in [VehicleClass::Courier, VehicleClass::DeliveryAv, VehicleClass::Robotaxi] {
+            let cfg = impact_cfg_for_class(class);
+            assert!(cfg.validate().is_ok(), "{class:?} cfg failed validation: {:?}", cfg.validate());
+            assert!(cfg.confirmation_m >= 1 && cfg.confirmation_n >= cfg.confirmation_m,
+                "{class:?} M/N invariant");
+        }
+        assert!(ImpactCfg::default().validate().is_ok());
     }
 
     #[test]

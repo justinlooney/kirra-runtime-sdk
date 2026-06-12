@@ -62,16 +62,30 @@ Units: speed/cap m/s; accel/brake/lat m/s²; steering deg; rate deg/s; distances
 | `*.lat_accel` | 1.5 | 2.5 | 3.5 | VALIDATION-PENDING |
 | `*.wheelbase` | 0.5 | 1.9 | 2.8 | VALIDATION-PENDING |
 | `*.footprint` (w×l, overhangs) | 0.6 × 0.9 (0.2/0.2) | 1.1 × 2.9 (0.5/0.5) | 1.85 × 4.8 (0.9/1.1) | VALIDATION-PENDING |
-| `*.impact_spike` (SG6, parko) | **8.0** | **18.0** | 30.0 (`ImpactCfg::default`) | VALIDATION-PENDING / INHERITED-FROZEN |
+| `*.impact_spike` (SG6, parko; **deviation** `\|‖a‖−G\|`, #321) | **2.5** | **8.0** | **22.0** | VALIDATION-PENDING |
+| `*.impact_confirm` (M / N consecutive, #321) | **2 / 3** | **2 / 3** | **1 / 1** | VALIDATION-PENDING |
+| **convention** (SG6 decel, #321 / ADL-013) | `\|‖a‖ − G\|`, `G = 9.80665 m/s²` (ISO 80000-3); confirm = M consecutive of last N | same | same | DECIDED (residual: orientation-corrected projection, named future) |
 
 **MRC fallback** (degraded posture) is a stricter sibling per class: every limit
 ≤ that class's Nominal limit, `follow` ≥ Nominal (the conservative direction), and
 the **footprint identical** (the vehicle does not shrink in degraded posture).
 These relations are asserted as structural invariants (see the validation gate).
 
+> **#321 / ADL-013 — `impact_spike` is now a gravity-DEVIATION threshold, not a raw
+> norm.** The old courier `8.0` was a **raw-norm** number BELOW the ~9.81 m/s² gravity
+> floor — a static, level courier read `‖a‖ ≈ 9.81 > 8.0` and **latched on gravity
+> alone**. The convention is now `\|‖a‖ − G\|` (≈ 0 at rest), debounced by an
+> **M-consecutive-of-N** window (a single-tick jolt does not latch; `M=1/N=1` =
+> single-tick / frozen behavior). Robotaxi moves off the raw-norm `30.0` default to a
+> `22.0` deviation (M=1/N=1 — a highway crash is unambiguous in one tick; the FTTI
+> permits no confirmation delay). `ImpactCfg::default()` keeps `30.0` (M=1/N=1) for
+> zero regression in the default path. Residual: the deviation under-represents a
+> purely horizontal impulse (vector combination with gravity); orientation-corrected
+> projection is the named future improvement, gated on a reliable quaternion.
+
 ### Ordering sanity (asserted)
 `courier.effective_cap (2.5) < delivery-av (11.0) < robotaxi (35.0)` and
-`courier.impact_spike (8.0) < delivery-av (18.0) < robotaxi (30.0)`.
+`courier.impact_spike (2.5) < delivery-av (8.0) < robotaxi (22.0)` (deviation units).
 
 ---
 
@@ -95,11 +109,14 @@ Every courier bound is shaped by that proximity:
   2.5 m/s plus the robot's short reaction).
 - **footprint** (0.6 × 0.9 m, 0.5 m wheelbase) — a small sidewalk robot; tight
   envelopes for pedestrian-space maneuvering. All dimensions strictly positive.
-- **`impact_spike` = 8.0 m/s² (parko / SG6)** — a sidewalk collision at walking pace
-  produces a **small** decel signature, far below a road crash, so the trigger is
-  more sensitive — but above ordinary curb/bump jolts. **This value genuinely needs
-  bench characterization of low-speed collision decel signatures**; it is a flagged
-  placeholder, not a guessed certified number.
+- **`impact_spike` = 2.5 m/s² DEVIATION, confirm 2-of-3 (parko / SG6, #321)** — a
+  sidewalk collision at walking pace produces a **small** decel deviation, far below a
+  road crash, so the trigger is more sensitive — but the **gravity-deviation
+  convention** (`\|‖a‖ − G\|`, ≈ 0 at rest) means it is no longer below the gravity
+  floor (the old `8.0` raw-norm was, and a static courier latched on gravity), and the
+  **2-of-3 consecutive** window debounces the curb/bump jolts a courier hits often.
+  **Still genuinely needs bench characterization of low-speed collision decel
+  signatures**; a flagged placeholder, not a guessed certified number. See ADL-013.
 
 ---
 
