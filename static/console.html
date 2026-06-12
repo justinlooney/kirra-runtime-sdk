@@ -43,6 +43,10 @@
   .pill.Trusted{ background:rgba(46,194,126,.15); color:var(--ok); }
   .pill.Untrusted{ background:rgba(224,165,43,.15); color:var(--warn); }
   .pill.Unknown{ background:rgba(124,138,160,.15); color:var(--pend); }
+  .clbadge { margin-top:5px; font-size:11px; padding:2px 7px; border-radius:9px; display:inline-block; }
+  .cl-pending { background:rgba(124,138,160,.15); color:var(--pend); }
+  .cl-cleared { background:rgba(46,194,126,.15); color:var(--ok); }
+  .cl-rejected { background:rgba(224,83,59,.15); color:var(--bad); }
   .feed { max-height:340px; overflow:auto; }
   .row { border-bottom:1px solid var(--line); padding:6px 0; font-size:12px; }
   .row .et { color:var(--accent); }
@@ -107,10 +111,13 @@
 <footer>
   <strong>QM domain.</strong> This console is a <em>read-only view</em> of the
   verifier's real store, plus <em>one</em> authenticated affordance: recording a
-  supervisor clearance grant. It does not — and in Phase A cannot — release a
-  vehicle: a grant is recorded and cryptographically signed into the audit chain;
-  delivery to the node's <code>ClearanceLoop</code> is Phase B. The governor
-  judges; this UI does not. Posture-exempt so it stays reachable during LockedOut.
+  supervisor clearance grant. The UI never claims a release the system hasn't made:
+  a grant is recorded and cryptographically signed, then <em>delivered</em> to the
+  node's <code>ClearanceLoop</code> (Phase B) — which re-validates it and is the
+  thing that actually clears. The card shows <code>RECORDED</code> until a real
+  delivery outcome (<code>CLEARED</code> / <code>REJECTED</code>) exists. The
+  governor judges; this UI does not. Posture-exempt so it stays reachable during
+  LockedOut.
 </footer>
 
 <script>
@@ -125,6 +132,15 @@ async function getJSON(path){
   return r.json();
 }
 
+// Lifecycle label derived ONLY from the real grant columns — the UI never claims
+// more than the row says. Pending stays pending until an outcome row exists.
+function clearanceLabel(c){
+  if(!c) return "";
+  if(c.outcome === "Cleared") return '<div class="clbadge cl-cleared">DELIVERED · CLEARED</div>';
+  if(c.outcome) return '<div class="clbadge cl-rejected">DELIVERY REJECTED · '+esc(c.outcome)+'</div>';
+  return '<div class="clbadge cl-pending">CLEARANCE RECORDED · DELIVERY PENDING</div>';
+}
+
 function renderFleet(d){
   const el = document.getElementById("fleet");
   const fleet = (d && d.fleet) || [];
@@ -135,7 +151,7 @@ function renderFleet(d){
     const seen = n.last_seen_ms ? new Date(Number(n.last_seen_ms)).toISOString().replace('T',' ').replace('Z','') : '—';
     return '<div class="tile p-'+p+'"><div class="nid">'+esc(n.node_id)+
            ' <span class="pill '+p+'">'+p+'</span></div>'+note+
-           '<div class="note">last seen: '+esc(seen)+'</div></div>';
+           '<div class="note">last seen: '+esc(seen)+'</div>'+clearanceLabel(n.clearance)+'</div>';
   }).join("");
 }
 
@@ -180,13 +196,39 @@ function renderAudit(d){
   }).join("");
 }
 
+// The most recent recorded grant this session (node_id only). The grant card
+// follows its REAL lifecycle from the fleet's clearance columns — it shows
+// nothing the system hasn't actually recorded.
+let lastGrant = null;
+
+function updateGrantCard(fleetData){
+  if(!lastGrant) return;
+  const node = ((fleetData && fleetData.fleet) || []).find(n => n.node_id === lastGrant.node_id);
+  const c = node && node.clearance;
+  if(!c || c.outcome == null) return; // still pending → leave the RECORDED label
+  const res = document.getElementById("grantresult");
+  if(c.outcome === "Cleared"){
+    // Recovery progress shown ONLY on a real Cleared outcome + a posture transition.
+    const recovered = node.posture === "Trusted";
+    res.className = "result recorded";
+    res.innerHTML = '<span class="pend" style="color:var(--ok)">DELIVERED · CLEARED</span>'+
+      ' — node <b>'+esc(lastGrant.node_id)+'</b>'+
+      (recovered ? '<br><span style="color:var(--ok)">node posture recovered → Trusted</span>' : '');
+  } else {
+    res.className = "result rejected";
+    res.innerHTML = 'DELIVERY REJECTED · '+esc(c.outcome)+' — node <b>'+esc(lastGrant.node_id)+'</b>'+
+      '<br>re-issue a fresh grant (a stale/dead grant is consumed, never retried).';
+  }
+  lastGrant = null; // terminal outcome — stop tracking
+}
+
 async function poll(){
   const conn = document.getElementById("conn");
   try {
     const [fleet, esc_, audit] = await Promise.all([
       getJSON("/console/fleet"), getJSON("/console/escalations"), getJSON("/console/audit?limit=50"),
     ]);
-    renderFleet(fleet); renderEscalations(esc_); renderAudit(audit);
+    renderFleet(fleet); renderEscalations(esc_); renderAudit(audit); updateGrantCard(fleet);
     conn.textContent = "updated " + new Date().toLocaleTimeString(); conn.classList.remove("err");
   } catch(e){ conn.textContent = "poll error: "+e.message; conn.classList.add("err"); }
 }
@@ -208,10 +250,11 @@ document.getElementById("grantform").addEventListener("submit", async (ev) => {
     const body = await r.json().catch(() => ({}));
     if(r.ok && body.status === "recorded"){
       res.className = "result recorded";
-      res.innerHTML = '<span class="pend">GRANT RECORDED — DELIVERY PENDING (PHASE B)</span><br>'+
+      res.innerHTML = '<span class="pend">GRANT RECORDED — DELIVERY PENDING</span><br>'+
         'node <b>'+esc(body.node_id)+'</b> · operator <b>'+esc(body.operator_id)+'</b> · '+
         'granted_at '+esc(body.granted_at_ms)+'<br>'+
         '<span style="color:var(--dim)">'+esc(body.note||"")+'</span>';
+      lastGrant = { node_id: body.node_id }; // follow its delivery lifecycle on poll
       document.getElementById("supkey").value = ""; // drop the key from the field
       poll();
     } else {
