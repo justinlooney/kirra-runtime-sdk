@@ -185,7 +185,19 @@ fn build_node_clearance(config: &ParkoNodeConfig) -> Option<NodeClearance> {
                  the configured impact threshold (see the IMU/contact ARMED lines)."
             );
             // #309: thread the (deployment-tunable) impact-fusion config into the gate.
-            Some(c.with_impact_cfg(config.impact_cfg()))
+            let mut c = c.with_impact_cfg(config.impact_cfg());
+            // #324: arm the IMU staleness watchdog ONLY when an IMU source is
+            // configured — a silent/stale configured IMU then forces the MRC, while
+            // an unconfigured IMU stays reduced-coverage (no forced stop).
+            if config.imu_topic.is_some() {
+                c = c.with_imu_staleness(config.imu_staleness_window_ms);
+                tracing::info!(
+                    window_ms = config.imu_staleness_window_ms,
+                    "parko-ros2: SG6 IMU staleness watchdog ARMED (#324) — a silent/stale IMU \
+                     forces the MRC (stop) until fresh samples resume."
+                );
+            }
+            Some(c)
         }
         Err(e) => {
             tracing::error!(
@@ -286,6 +298,18 @@ fn build_config() -> ParkoNodeConfig {
                 "parko-ros2: PARKO_IMPACT_SPIKE_THRESHOLD_MPS2 is not a positive finite number — \
                  keeping the default {} m/s²",
                 config.spike_threshold_mps2
+            ),
+        }
+    }
+    // SG6 (#324): IMU staleness window override (only effective when imu_topic set).
+    if let Ok(raw) = std::env::var("PARKO_IMU_STALENESS_WINDOW_MS") {
+        match raw.trim().parse::<u64>() {
+            Ok(v) if v > 0 => config.imu_staleness_window_ms = v,
+            _ => tracing::warn!(
+                value = %raw,
+                "parko-ros2: PARKO_IMU_STALENESS_WINDOW_MS is not a positive integer — keeping the \
+                 default {} ms",
+                config.imu_staleness_window_ms
             ),
         }
     }

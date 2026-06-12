@@ -2822,6 +2822,37 @@ fn audit_grant_rejection(
     }
 }
 
+/// #326 — the operator clearance-challenge map key. Length-prefixing the
+/// `operator_id` makes the `operator/node` split UNAMBIGUOUS regardless of any
+/// delimiter characters in either id: `("a|b","c")` → `"3:a|b:c"` and
+/// `("a","b|c")` → `"1:a:b|c"` are distinct, where the old `"{op}|{node}"` form
+/// collided to `"a|b|c"`. Issue and consume MUST use this single constructor.
+fn composite_challenge_key(operator_id: &str, node_id: &str) -> String {
+    format!("{}:{}:{}", operator_id.len(), operator_id, node_id)
+}
+
+/// #326 — reject a structurally-dangerous identifier: empty, the legacy `|`
+/// delimiter, or any control character (which could corrupt logs / keys). Charset
+/// validation is belt-and-suspenders alongside the length-prefixed key above.
+fn valid_identifier(s: &str) -> bool {
+    !s.is_empty() && !s.contains('|') && !s.chars().any(char::is_control)
+}
+
+/// #327 — a short, stable fingerprint of the presented admin bearer token, for
+/// attributing a sensitive admin action (operator reactivation) in the audit chain
+/// WITHOUT recording the token itself. `None` if no bearer token is present (the
+/// route is admin-gated, so in practice one always is).
+fn admin_token_fingerprint(headers: &HeaderMap) -> Option<String> {
+    use sha2::Digest;
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))?;
+    let mut h = sha2::Sha256::new();
+    h.update(token.as_bytes());
+    Some(hex::encode(&h.finalize()[..8]))
+}
+
 #[derive(Deserialize)]
 struct RegisterOperatorRequest {
     operator_id: String,
@@ -2835,12 +2866,19 @@ struct RegisterOperatorRequest {
 /// private key NEVER reaches the server — only the public key is stored.
 async fn register_operator(
     State(svc): State<Arc<ServiceState>>,
+    headers: HeaderMap,
     Json(req): Json<RegisterOperatorRequest>,
 ) -> impl IntoResponse {
     let operator_id = req.operator_id.trim();
     if operator_id.is_empty() {
         return (StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({ "error": "operator_id must be non-empty" }))).into_response();
+    }
+    // #326: reject the legacy `|` delimiter and control characters in the id.
+    if !valid_identifier(operator_id) {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": "operator_id must not contain '|' or control characters"
+        }))).into_response();
     }
     // Fail-closed: the PEM must parse as a valid Ed25519 SPKI public key.
     let fingerprint = match kirra_runtime_sdk::attestation::operator_key_fingerprint(
@@ -2854,21 +2892,48 @@ async fn register_operator(
     let now = now_ms();
     match svc.app.store.lock() {
         Ok(mut store) => {
+            // #327: detect a prior REVOKED row BEFORE registering — register_operator
+            // silently clears revoked_at, so reactivation would otherwise be
+            // invisible in the ledger. Record it as a distinct, attributed event.
+            let was_revoked = store
+                .load_operator(operator_id)
+                .ok()
+                .flatten()
+                .is_some_and(|o| o.revoked_at_ms.is_some());
             if store.register_operator(operator_id, &req.ed25519_pubkey_pem, now).is_err() {
                 return (StatusCode::INTERNAL_SERVER_ERROR,
                         Json(json!({ "error": "persist failed" }))).into_response();
             }
-            let _ = store.append_clearance_audit_event(
-                "OperatorRegistered",
-                &json!({ "operator_id": operator_id, "operator_key_fingerprint": fingerprint })
-                    .to_string(),
-                now,
-            );
-            (StatusCode::CREATED, Json(json!({
-                "operator_id": operator_id,
-                "operator_key_fingerprint": fingerprint,
-                "status": "registered",
-            }))).into_response()
+            if was_revoked {
+                // A previously-revoked operator is now active again — the
+                // reactivating admin is attributed by token fingerprint (#327).
+                let _ = store.append_clearance_audit_event(
+                    "OperatorReactivated",
+                    &json!({
+                        "operator_id": operator_id,
+                        "operator_key_fingerprint": fingerprint,
+                        "reactivated_by_admin_fingerprint": admin_token_fingerprint(&headers),
+                    }).to_string(),
+                    now,
+                );
+                (StatusCode::CREATED, Json(json!({
+                    "operator_id": operator_id,
+                    "operator_key_fingerprint": fingerprint,
+                    "status": "reactivated",
+                }))).into_response()
+            } else {
+                let _ = store.append_clearance_audit_event(
+                    "OperatorRegistered",
+                    &json!({ "operator_id": operator_id, "operator_key_fingerprint": fingerprint })
+                        .to_string(),
+                    now,
+                );
+                (StatusCode::CREATED, Json(json!({
+                    "operator_id": operator_id,
+                    "operator_key_fingerprint": fingerprint,
+                    "status": "registered",
+                }))).into_response()
+            }
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,
                    Json(json!({ "error": "store lock poisoned" }))).into_response(),
@@ -2913,9 +2978,12 @@ struct ClearanceChallengeQuery {
 /// GET /console/clearance-challenge?operator_id=&node_id= — issue a one-time nonce
 /// the operator signs to prove key possession (#314 Phase 1; the attestation
 /// challenge-issuance pattern). Unauthenticated (the nonce alone grants nothing —
-/// only a valid signature over it does); we 403 unknown/revoked operators so a
-/// challenge is never issued to a non-operator. Short TTL; stored volatile for
-/// verify-then-consume at grant time.
+/// only a valid signature over it does). #325: NO enumeration oracle — every
+/// well-formed request returns a uniform 200 with a nonce-shaped body, so an
+/// unknown/revoked operator is indistinguishable from a known one. A real challenge
+/// is stored ONLY for an ACTIVE operator (verify-then-consume at grant time); anyone
+/// else gets a DECOY nonce that is never stored (no map growth) and that a grant
+/// attempt still rejects at the unchanged grant-time operator check.
 async fn clearance_challenge(
     State(svc): State<Arc<ServiceState>>,
     Query(q): Query<ClearanceChallengeQuery>,
@@ -2939,14 +3007,15 @@ async fn clearance_challenge(
             .unwrap_or(false),
         Err(_) => false,
     };
-    if !active {
-        return (StatusCode::FORBIDDEN,
-                Json(json!({ "error": "unknown or revoked operator" }))).into_response();
-    }
     // Hex string (not a u64) so the in-browser signing flow never loses precision.
     let nonce_hex = format!("{:016x}", kirra_runtime_sdk::verifier::generate_challenge_nonce());
-    let key = format!("{operator_id}|{node_id}");
-    svc.app.issue_clearance_challenge(&key, nonce_hex.clone(), now_ms());
+    // #325: store a REAL challenge only for an active operator; everyone else gets a
+    // decoy nonce that is never recorded (no oracle, no map growth). #326: the
+    // challenge-map key is length-prefixed (unambiguous operator/node split).
+    if active {
+        let key = composite_challenge_key(operator_id, node_id);
+        svc.app.issue_clearance_challenge(&key, nonce_hex.clone(), now_ms());
+    }
     (StatusCode::OK, Json(json!({
         "operator_id": operator_id,
         "node_id": node_id,
@@ -3056,7 +3125,8 @@ async fn console_clearance_grant(
             }))).into_response();
         }
         // 3. CONSUME the nonce (verify-then-consume; replay/expired → 401, audited).
-        let key = format!("{operator_id}|{node_id}");
+        //    #326: same length-prefixed composite key the challenge issuer used.
+        let key = composite_challenge_key(&operator_id, &node_id);
         if !svc.app.consume_clearance_challenge(&key, &nonce, now) {
             audit_grant_rejection(&svc.app, "nonce_replay_or_expired", &node_id, &operator_id, now);
             return (StatusCode::UNAUTHORIZED, Json(json!({
@@ -4162,13 +4232,18 @@ mod systemd_notify_tests {
 // ===========================================================================
 #[cfg(test)]
 mod console_phase_a_tests {
-    use super::{build_app, supervisor_key_ok};
+    use super::{
+        admin_token_fingerprint, build_app, composite_challenge_key, register_operator,
+        supervisor_key_ok, valid_identifier, RegisterOperatorRequest,
+    };
 
     use serde_json::json;
     use std::sync::Arc;
 
     use axum::body::{to_bytes, Body};
-    use axum::http::{Request, StatusCode};
+    use axum::extract::{Json, State};
+    use axum::http::{header, HeaderMap, Request, StatusCode};
+    use axum::response::IntoResponse;
     use tower::ServiceExt; // oneshot
 
     use kirra_runtime_sdk::posture_cache::{ServiceState, SharedPostureCache};
@@ -4425,6 +4500,145 @@ mod console_phase_a_tests {
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    // ===================================================================
+    // #325 / #326 / #327 — medium hardening. The admin-gated /console/operators
+    // route is 503 without KIRRA_ADMIN_TOKEN (INV-13 forbids set_var here), so the
+    // register handler is exercised by a DIRECT call (its admin gating is proved
+    // separately by `require_admin_token`); the unauthenticated challenge/grant
+    // routes go through the real router.
+    // ===================================================================
+
+    fn audit_has(svc: &Arc<ServiceState>, event_type: &str) -> bool {
+        let page = svc.app.store.lock().unwrap().load_audit_chain_page(200, 0, None).unwrap();
+        page.entries.iter().any(|e| e.event_type == event_type)
+    }
+
+    fn chain_json(svc: &Arc<ServiceState>) -> String {
+        let page = svc.app.store.lock().unwrap().load_audit_chain_page(200, 0, None).unwrap();
+        serde_json::to_string(&page.entries).unwrap()
+    }
+
+    fn admin_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    /// #326 — the composite challenge-map key resolves the `{op}|{node}` ambiguity
+    /// (the old form collided `(a|b,c)` with `(a,b|c)` to `"a|b|c"`).
+    #[test]
+    fn composite_key_resolves_delimiter_ambiguity() {
+        assert_ne!(
+            composite_challenge_key("a|b", "c"),
+            composite_challenge_key("a", "b|c"),
+            "length-prefixing must distinguish (a|b,c) from (a,b|c)"
+        );
+        assert_eq!(composite_challenge_key("alice", "robot-01"), "5:alice:robot-01");
+    }
+
+    /// #326 — identifier charset: `|` and control characters rejected; clean ids pass.
+    #[test]
+    fn valid_identifier_rejects_pipe_and_controls() {
+        assert!(valid_identifier("alice"));
+        assert!(valid_identifier("op-7_A.B"));
+        assert!(!valid_identifier(""), "empty rejected");
+        assert!(!valid_identifier("a|b"), "pipe rejected");
+        assert!(!valid_identifier("a\nb"), "newline rejected");
+        assert!(!valid_identifier("a\tb"), "tab rejected");
+        assert!(!valid_identifier("a\u{7}b"), "bell control char rejected");
+    }
+
+    /// #326 — the register route rejects a `|`-bearing / control-char operator_id
+    /// with 400 and accepts a clean one (201). Handler called directly.
+    #[tokio::test]
+    async fn register_operator_rejects_bad_charset() {
+        let svc = build_state();
+        let (_sk, pem) = operator_keypair(3);
+        let headers = admin_headers("t");
+
+        let bad_pipe = RegisterOperatorRequest { operator_id: "a|b".into(), ed25519_pubkey_pem: pem.clone() };
+        let r = register_operator(State(svc.clone()), headers.clone(), Json(bad_pipe)).await.into_response();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "pipe in operator_id → 400");
+
+        let bad_ctrl = RegisterOperatorRequest { operator_id: "a\nb".into(), ed25519_pubkey_pem: pem.clone() };
+        let r = register_operator(State(svc.clone()), headers.clone(), Json(bad_ctrl)).await.into_response();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "control char in operator_id → 400");
+
+        let ok = RegisterOperatorRequest { operator_id: "alice".into(), ed25519_pubkey_pem: pem };
+        let r = register_operator(State(svc), headers, Json(ok)).await.into_response();
+        assert_eq!(r.status(), StatusCode::CREATED, "a clean id registers");
+    }
+
+    /// #325 — NO enumeration oracle: an unknown operator gets a uniform 200 with a
+    /// nonce-shaped body and NOTHING stored (the decoy proof); an active operator
+    /// gets a real stored challenge; and a grant attempt for the unknown operator
+    /// still 403s at the unchanged grant-time check.
+    #[tokio::test]
+    async fn unknown_operator_challenge_is_a_decoy_no_oracle() {
+        let svc = build_state();
+        seed_node(&svc, "robot-01");
+
+        // Unknown operator → 200 + nonce, but NOTHING stored (no map growth, no 403).
+        let (status, body) =
+            get(svc.clone(), "/console/clearance-challenge?operator_id=ghost&node_id=robot-01").await;
+        assert_eq!(status, StatusCode::OK, "no 403 oracle — unknown operator still gets 200");
+        assert!(!parse_nonce(&body).is_empty(), "the decoy response is nonce-shaped");
+        assert!(svc.app.pending_clearance_challenges.is_empty(), "the decoy nonce is NEVER stored");
+
+        // Active operator → 200 + nonce AND a real stored challenge under the key.
+        let (_sk, pem) = operator_keypair(4);
+        register_op(&svc, "alice", &pem);
+        let (status, body) =
+            get(svc.clone(), "/console/clearance-challenge?operator_id=alice&node_id=robot-01").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!parse_nonce(&body).is_empty());
+        assert!(
+            svc.app
+                .pending_clearance_challenges
+                .contains_key(&composite_challenge_key("alice", "robot-01")),
+            "an active operator's challenge IS stored under the composite key"
+        );
+
+        // Grant-time still 403s for the unknown operator (the decoy buys nothing).
+        let body = json!({
+            "node_id": "robot-01", "operator_id": "ghost",
+            "nonce": "abcd", "signature_b64": "AAAA"
+        })
+        .to_string();
+        let (status, _) = post_json(svc, "/console/clearance-grants", body, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "an unknown operator cannot redeem a decoy at grant time");
+    }
+
+    /// #327 — re-registering a REVOKED operator emits a distinct OperatorReactivated
+    /// chain event (carrying the reactivating admin's token fingerprint), not a
+    /// silent OperatorRegistered. A FRESH registration emits OperatorRegistered only.
+    #[tokio::test]
+    async fn reregistering_revoked_operator_audits_reactivation() {
+        let svc = build_state();
+        let (_sk, pem) = operator_keypair(9);
+        let headers = admin_headers("admin-secret");
+
+        // Fresh registration → OperatorRegistered only.
+        let req = RegisterOperatorRequest { operator_id: "alice".into(), ed25519_pubkey_pem: pem.clone() };
+        let r = register_operator(State(svc.clone()), headers.clone(), Json(req)).await.into_response();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        assert!(audit_has(&svc, "OperatorRegistered"), "fresh registration is audited");
+        assert!(!audit_has(&svc, "OperatorReactivated"), "a fresh registration is NOT a reactivation");
+
+        // Revoke, then re-register → OperatorReactivated appears, attributed.
+        svc.app.store.lock().unwrap().revoke_operator("alice", 2).unwrap();
+        let req2 = RegisterOperatorRequest { operator_id: "alice".into(), ed25519_pubkey_pem: pem };
+        let r = register_operator(State(svc.clone()), headers, Json(req2)).await.into_response();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        assert!(audit_has(&svc, "OperatorReactivated"), "reactivation is distinctly audited");
+
+        let fp = admin_token_fingerprint(&admin_headers("admin-secret")).unwrap();
+        assert!(
+            chain_json(&svc).contains(&fp),
+            "the reactivation event carries the reactivating admin's token fingerprint"
+        );
     }
 
     /// HAPPY PATH + the ADDITIVE PROOF: an operator-signed grant records with the

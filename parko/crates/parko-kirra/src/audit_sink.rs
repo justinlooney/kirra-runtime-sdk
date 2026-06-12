@@ -588,8 +588,11 @@ impl RecordedClearanceLoop {
         self.clearance.observe(evidence, cfg, now_ms);
         let after = self.clearance.state();
 
-        // Incident open (Normal → Latched): record the trigger breakdown.
-        if before == ClearanceState::Normal && after == ClearanceState::Latched {
+        // Incident open (Normal → immobilized): record the trigger breakdown.
+        // Post-#328 the latch raises escalation in one step, so the open edge is
+        // `Normal → any immobilized state` (Latched OR EscalationRaised), not
+        // specifically Latched.
+        if before == ClearanceState::Normal && after != ClearanceState::Normal {
             self.sink
                 .record_detected(&ImpactDetectedPayload::from_evidence(evidence, cfg));
         }

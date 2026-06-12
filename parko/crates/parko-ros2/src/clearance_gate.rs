@@ -207,6 +207,67 @@ impl SpikeDebouncer {
     }
 }
 
+/// IMU staleness watchdog (#324). A configured-but-silent or stale IMU is a SENSOR
+/// FAULT, not "reduced coverage": without a fresh deceleration reading the gate
+/// cannot detect a hard-decel impact, so the safe response is to force the MRC
+/// (stop) — the same convention the tick pipeline already applies to a stale sensor
+/// FRAME (`sensor_staleness_budget_ms`). Distinct from an UNCONFIGURED IMU (no guard
+/// armed → reduced coverage, never a forced stop).
+///
+/// The guard is stamped each time a FRESH sample arrives (the node's IMU drain
+/// records the arrival time) and is consulted per tick. `None` last-update (armed
+/// but nothing ever arrived) reads as stale → MRC at startup until the first sample.
+/// Lives here (the default-lane harness, alongside [`ContactCell`] / [`SpikeDebouncer`])
+/// so the watchdog logic is CI-tested without ROS; `node.rs` only wires the stamp.
+#[derive(Debug)]
+pub struct StalenessGuard {
+    /// Wall-clock (ms) of the most recent fresh sample, or `None` if none yet.
+    last_update_ms: Option<u64>,
+    /// Max age (ms) before a sample is considered stale → force MRC.
+    window_ms: u64,
+    /// Throttle for the per-tick stale log (warn at most once per window).
+    last_warn_ms: Option<u64>,
+}
+
+impl StalenessGuard {
+    #[must_use]
+    pub fn new(window_ms: u64) -> Self {
+        Self { last_update_ms: None, window_ms, last_warn_ms: None }
+    }
+
+    /// Record a fresh sample arrival at `now_ms`. Idempotent if called repeatedly
+    /// with the same (unchanged) arrival time — the guard tracks the LAST arrival.
+    pub fn stamp(&mut self, now_ms: u64) {
+        self.last_update_ms = Some(now_ms);
+    }
+
+    /// True when the sensor is MISSING (never stamped) or STALE (last sample older
+    /// than the window) — in both cases the gate must force the MRC.
+    #[must_use]
+    pub fn is_stale(&self, now_ms: u64) -> bool {
+        match self.last_update_ms {
+            None => true, // armed but nothing has ever arrived → missing → MRC
+            Some(t) => now_ms.saturating_sub(t) > self.window_ms,
+        }
+    }
+
+    /// Rate-limited stale signal for logging: returns `true` at most once per
+    /// `window_ms` while stale, so a persistently-silent IMU does not flood the log.
+    pub fn take_warning(&mut self, now_ms: u64) -> bool {
+        if !self.is_stale(now_ms) {
+            return false;
+        }
+        let due = match self.last_warn_ms {
+            None => true,
+            Some(w) => now_ms.saturating_sub(w) >= self.window_ms,
+        };
+        if due {
+            self.last_warn_ms = Some(now_ms);
+        }
+        due
+    }
+}
+
 /// Node-owned clearance components: the per-vehicle [`ClearanceDelivery`] (store
 /// pickup, scoped to THIS node's id) plus the node's own [`ClearanceLoop`] (the
 /// SG6 motion veto). One per node; constructed at startup when delivery is
@@ -227,6 +288,10 @@ pub struct NodeClearance {
     /// Decel confirmation debounce (#321) — per-node stateful, M-of-N consecutive
     /// from `cfg.confirmation_*`.
     spike_debouncer: SpikeDebouncer,
+    /// IMU staleness watchdog (#324). `None` when no IMU source is configured
+    /// (reduced coverage, never a forced stop); `Some` when an IMU is expected, so
+    /// a stale/silent sensor forces the MRC.
+    imu_staleness: Option<StalenessGuard>,
 }
 
 impl NodeClearance {
@@ -245,6 +310,7 @@ impl NodeClearance {
             vanished: None,
             vanished_cfg: VanishedCfg::default(),
             spike_debouncer: SpikeDebouncer::new(),
+            imu_staleness: None,
         }
     }
 
@@ -254,6 +320,38 @@ impl NodeClearance {
     pub fn with_impact_cfg(mut self, cfg: ImpactCfg) -> Self {
         self.cfg = cfg;
         self
+    }
+
+    /// Arm the IMU staleness watchdog (#324) with the given window. The binary
+    /// calls this ONLY when an IMU source is configured — so an UNCONFIGURED IMU
+    /// stays reduced-coverage (no guard, no forced stop), while a CONFIGURED IMU
+    /// that goes silent/stale forces the MRC. Without this, `imu_staleness` is
+    /// `None` and staleness never forces a stop.
+    #[must_use]
+    pub fn with_imu_staleness(mut self, window_ms: u64) -> Self {
+        self.imu_staleness = Some(StalenessGuard::new(window_ms));
+        self
+    }
+
+    /// Record a fresh IMU sample arrival (#324). No-op when the watchdog is not
+    /// armed. The node's IMU drain calls this with the sample's arrival time.
+    pub fn stamp_imu(&mut self, now_ms: u64) {
+        if let Some(g) = self.imu_staleness.as_mut() {
+            g.stamp(now_ms);
+        }
+    }
+
+    /// True when an ARMED IMU watchdog reports a stale/missing sensor → the tick
+    /// must force the MRC. Always false when no IMU source is configured.
+    #[must_use]
+    pub fn imu_mrc_required(&self, now_ms: u64) -> bool {
+        self.imu_staleness.as_ref().is_some_and(|g| g.is_stale(now_ms))
+    }
+
+    /// Rate-limited stale-IMU warning for the tick log (#324). At most once per
+    /// window while stale; false when not armed or not stale.
+    pub fn imu_stale_warning(&mut self, now_ms: u64) -> bool {
+        self.imu_staleness.as_mut().is_some_and(|g| g.take_warning(now_ms))
     }
 
     /// Enable the vanished-object trigger with the given config. The caller MUST
@@ -371,8 +469,13 @@ pub struct ClearedTickOutcome {
     /// (the dev lane); `Some(NoGrant)` on the common idempotent-empty pickup.
     pub delivery: Option<DeliveryOutcome>,
     /// True when the clearance veto forced the stopped twist this tick (the loop
-    /// was immobilized after delivery). Lets the node log the held line.
+    /// was immobilized after delivery, OR the IMU watchdog forced the MRC). Lets the
+    /// node log the held line.
     pub vetoed: bool,
+    /// True when the veto this tick was driven (wholly or partly) by a stale/missing
+    /// IMU watchdog (#324), distinct from a loop-immobilization veto. Lets the node
+    /// log the sensor-fault MRC distinctly.
+    pub imu_stale: bool,
 }
 
 /// Drive one tick with the node-owned clearance gate wired in. When `clearance`
@@ -392,7 +495,7 @@ pub struct ClearedTickOutcome {
 /// the optional `AgentScene` for the vanished trigger (`None` until a scene
 /// source is wired — the #309 remainder).
 ///
-// SAFETY: SG6 | REQ: parko-ros2-clearance-detect-veto-and-delivery | TEST: decel_spike_latches_and_stops_at_nominal,contact_latches,no_signals_never_latch_across_many_ticks,delivery_before_detection_ordering_holds,full_lifecycle_detect_clear_resume,latched_loop_stops_tick_even_at_nominal,pending_grant_delivers_and_resumes,no_clearance_gate_ticks_normally,grant_for_other_node_not_picked_up
+// SAFETY: SG6 | REQ: parko-ros2-clearance-detect-veto-and-delivery | TEST: decel_spike_latches_and_stops_at_nominal,contact_latches,no_signals_never_latch_across_many_ticks,delivery_before_detection_ordering_holds,full_lifecycle_detect_clear_resume,latched_loop_stops_tick_even_at_nominal,pending_grant_delivers_and_resumes,no_clearance_gate_ticks_normally,grant_for_other_node_not_picked_up,stale_imu_forces_mrc_even_at_nominal_with_normal_loop,fresh_imu_does_not_force_mrc
 #[allow(clippy::too_many_arguments)]
 pub async fn run_pipeline_tick_with_clearance<B>(
     config: &ParkoNodeConfig,
@@ -423,17 +526,34 @@ where
     // 3. The normal posture-gated tick (the LockedOut stop path lives inside).
     let mut tick = run_pipeline_tick_inner(config, loop_mutex, frame, posture).await;
 
-    // 4. THE STOP TIE-IN — immobilized (post-delivery, post-detection) → stop
-    //    regardless of posture, alongside the governor's LockedOut stop.
-    let vetoed = clearance.as_deref().is_some_and(NodeClearance::is_immobilized);
+    // 4. THE STOP TIE-IN — immobilized (post-delivery, post-detection) OR a
+    //    stale/missing IMU watchdog (#324) → stop regardless of posture, alongside
+    //    the governor's LockedOut stop. The stale-IMU warning is rate-limited.
+    let (immobilized, imu_stale, warn) = match clearance {
+        Some(c) => {
+            let immobilized = c.is_immobilized();
+            let imu_stale = c.imu_mrc_required(now_ms);
+            let warn = imu_stale && c.imu_stale_warning(now_ms);
+            (immobilized, imu_stale, warn)
+        }
+        None => (false, false, false),
+    };
+    let vetoed = immobilized || imu_stale;
     if vetoed {
         tick.twist = OutgoingTwist::stopped(now_ms);
+    }
+    if warn {
+        tracing::warn!(
+            "parko-ros2: SG6 IMU sample stale/missing beyond the staleness window — forcing MRC \
+             (stopped) this tick; decel impact detection is BLIND until fresh IMU resumes."
+        );
     }
 
     ClearedTickOutcome {
         tick,
         delivery,
         vetoed,
+        imu_stale,
     }
 }
 
@@ -541,6 +661,55 @@ mod tests {
         assert!(!d.drain_confirmed(&cfg));
     }
 
+    // ---- #324: IMU StalenessGuard ---------------------------------------
+
+    /// STARTUP-MISSING → MRC: an armed-but-never-stamped guard reads stale at any
+    /// time (a configured IMU that has not yet published forces the MRC).
+    #[test]
+    fn staleness_guard_never_stamped_is_stale() {
+        let g = StalenessGuard::new(100);
+        assert!(g.is_stale(0), "never stamped → stale (missing sensor → MRC)");
+        assert!(g.is_stale(10_000), "still stale far later");
+    }
+
+    /// STALE-CELL → MRC, and FRESH-UPDATE RESETS: within the window a stamped guard
+    /// is fresh; past the window it is stale; a fresh stamp clears it again.
+    #[test]
+    fn staleness_guard_window_and_reset() {
+        let mut g = StalenessGuard::new(100);
+        g.stamp(1_000);
+        assert!(!g.is_stale(1_050), "within the 100ms window → fresh");
+        assert!(!g.is_stale(1_100), "exactly at the window edge → still fresh (inclusive)");
+        assert!(g.is_stale(1_101), "one ms past the window → stale → MRC");
+        // A fresh sample resets the watchdog.
+        g.stamp(1_200);
+        assert!(!g.is_stale(1_250), "a fresh stamp resets staleness");
+    }
+
+    /// The per-tick stale log is rate-limited: at most one warning per window.
+    #[test]
+    fn staleness_guard_warning_is_rate_limited() {
+        let mut g = StalenessGuard::new(100); // never stamped → always stale
+        assert!(g.take_warning(1_000), "first stale tick warns");
+        assert!(!g.take_warning(1_050), "a second tick within the window does not re-warn");
+        assert!(g.take_warning(1_100), "after a full window it warns again");
+    }
+
+    /// An UNARMED NodeClearance never forces an MRC on staleness (an unconfigured
+    /// IMU is reduced coverage, not a fault). An armed one does until stamped fresh.
+    #[test]
+    fn node_clearance_imu_mrc_only_when_armed() {
+        let mut unarmed = NodeClearance::from_store(store(), "node-x");
+        assert!(!unarmed.imu_mrc_required(10_000), "no IMU configured → never forces MRC");
+        unarmed.stamp_imu(1); // no-op when unarmed
+
+        let mut armed = NodeClearance::from_store(store(), "node-x").with_imu_staleness(100);
+        assert!(armed.imu_mrc_required(0), "armed + never stamped → MRC (startup-missing)");
+        armed.stamp_imu(1_000);
+        assert!(!armed.imu_mrc_required(1_050), "fresh sample → no MRC");
+        assert!(armed.imu_mrc_required(1_500), "gone stale → MRC again");
+    }
+
     use parko_core::backend::{BackendDescriptor, TensorBatch};
     use parko_core::backends::mock::MockBackend;
     use parko_core::commands::ControlCommand;
@@ -585,7 +754,8 @@ mod tests {
     }
 
     /// Drive a `NodeClearance`'s loop into an immobilized state through the REAL
-    /// state machine. `ticks` observes: 1 → `Latched`, 2 → `EscalationRaised`.
+    /// state machine. Post-#328 the first latching observe reaches `EscalationRaised`
+    /// in one step; further observes are harmless no-ops (stay `EscalationRaised`).
     fn immobilize(nc: &mut NodeClearance, ticks: u32) {
         let ev = ImpactEvidence {
             imu_accel_spike_mps2: 0.0,
@@ -604,8 +774,8 @@ mod tests {
     async fn latched_loop_stops_tick_even_at_nominal() {
         let infer = build_loop(0.1, 0.2);
         let mut nc = NodeClearance::from_store(store(), "KIRRA-DEMO-03");
-        immobilize(&mut nc, 1); // Normal -> Latched
-        assert_eq!(nc.state(), ClearanceState::Latched);
+        immobilize(&mut nc, 1); // Normal -> EscalationRaised (one step, #328)
+        assert_eq!(nc.state(), ClearanceState::EscalationRaised);
 
         let out = run_pipeline_tick_with_clearance(
             &ParkoNodeConfig::default(),
@@ -622,6 +792,63 @@ mod tests {
         assert_eq!(out.tick.twist.linear_x_mps, 0.0, "latched → stopped twist (linear)");
         assert_eq!(out.tick.twist.angular_z_rads, 0.0, "latched → stopped twist (angular)");
         assert_eq!(out.delivery, Some(DeliveryOutcome::NoGrant), "no grant pending");
+    }
+
+    /// #324 — STALE IMU FORCES MRC: with the loop in Normal (not immobilized) at
+    /// Nominal posture, an armed-but-never-stamped IMU watchdog forces the stopped
+    /// twist anyway — a configured IMU that is silent is a sensor fault, not reduced
+    /// coverage. The veto reason is surfaced as `imu_stale`, distinct from the loop.
+    #[tokio::test(start_paused = true)]
+    async fn stale_imu_forces_mrc_even_at_nominal_with_normal_loop() {
+        let infer = build_loop(0.1, 0.2);
+        // Armed watchdog, NEVER stamped → stale at any tick time (startup-missing).
+        let mut nc = NodeClearance::from_store(store(), "KIRRA-DEMO-03").with_imu_staleness(100);
+        assert_eq!(nc.state(), ClearanceState::Normal, "loop is NOT immobilized");
+
+        let out = run_pipeline_tick_with_clearance(
+            &ParkoNodeConfig::default(),
+            infer,
+            fresh_frame(700),
+            SafetyPosture::Nominal,
+            Some(&mut nc),
+            &ImpactInputs::default(),
+            None,
+        )
+        .await;
+
+        assert!(out.imu_stale, "a configured-but-silent IMU is reported stale");
+        assert!(out.vetoed, "stale IMU forces the MRC veto");
+        assert_eq!(nc.state(), ClearanceState::Normal, "the stop came from staleness, not the loop");
+        assert_eq!(out.tick.twist.linear_x_mps, 0.0, "stale IMU → stopped twist");
+    }
+
+    /// #324 — A FRESH IMU does NOT force the MRC: an armed watchdog stamped fresh
+    /// within the window lets the governed command flow (loop Normal, no veto).
+    #[tokio::test(start_paused = true)]
+    async fn fresh_imu_does_not_force_mrc() {
+        let infer = build_loop(0.1, 0.2);
+        // Generous window so the stamp-then-tick clock advance can't flip it stale.
+        let mut nc = NodeClearance::from_store(store(), "KIRRA-DEMO-03").with_imu_staleness(10_000);
+        nc.stamp_imu(current_time_ms()); // a fresh sample just arrived
+
+        let out = run_pipeline_tick_with_clearance(
+            &ParkoNodeConfig::default(),
+            infer,
+            fresh_frame(701),
+            SafetyPosture::Nominal,
+            Some(&mut nc),
+            &ImpactInputs::default(),
+            None,
+        )
+        .await;
+
+        assert!(!out.imu_stale, "a fresh IMU is not stale");
+        assert!(!out.vetoed, "fresh IMU → no forced stop");
+        assert!(
+            (out.tick.twist.linear_x_mps - 0.1).abs() < 1e-4,
+            "command flows when the IMU is fresh; got {}",
+            out.tick.twist.linear_x_mps
+        );
     }
 
     /// END-TO-END: a pending grant in the store is delivered on ONE tick, the loop
@@ -896,8 +1123,8 @@ mod tests {
         );
         assert_eq!(
             nc.state(),
-            ClearanceState::Latched,
-            "detection re-latches AFTER delivery — the grant cannot clear the new impact"
+            ClearanceState::EscalationRaised,
+            "detection re-latches AFTER delivery (one step, #328) — the grant cannot clear the new impact"
         );
         assert!(out.vetoed, "re-latched → still stopped");
         assert_eq!(out.tick.twist.linear_x_mps, 0.0);
@@ -911,15 +1138,15 @@ mod tests {
         let mut nc = NodeClearance::from_store(s.clone(), "KIRRA-DEMO-03");
         let no_impact = ImpactInputs::default();
 
-        // Tick 1: a decel spike LATCHES the loop from live evidence.
+        // Tick 1: a decel spike LATCHES the loop and raises escalation in one step (#328).
         let spike = ImpactInputs { imu: Some(imu_accel_mag(40.0)), contact: false };
         let out1 = tick(&mut nc, &spike).await;
-        assert_eq!(nc.state(), ClearanceState::Latched, "tick 1 latches on the spike");
+        assert_eq!(nc.state(), ClearanceState::EscalationRaised, "tick 1 latches + escalates (#328)");
         assert!(out1.vetoed);
 
-        // Tick 2: no new impact — the transient Latched escalates to operator-required.
+        // Tick 2: no new impact — stays escalated (operator-required), still vetoed.
         let out2 = tick(&mut nc, &no_impact).await;
-        assert_eq!(nc.state(), ClearanceState::EscalationRaised, "tick 2 escalates");
+        assert_eq!(nc.state(), ClearanceState::EscalationRaised, "tick 2 stays escalated");
         assert!(out2.vetoed, "still immobilized → still stopped");
 
         // The operator records a grant.

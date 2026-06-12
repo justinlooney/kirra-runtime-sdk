@@ -20,6 +20,7 @@
 //     next-milestone deliverable. For M2 the node accepts a posture
 //     parameter (CLI / env) and defaults to `Nominal`.
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use parko_core::backend::InferenceBackend;
@@ -34,7 +35,7 @@ use crate::command_mapping::OutgoingTwist;
 use crate::config::ParkoNodeConfig;
 use crate::imu_shim::imu_msg_to_sample;
 use crate::sensor_mapping::{ImuSample, SensorInputMapping};
-use crate::tick_pipeline::TickError;
+use crate::tick_pipeline::{current_time_ms, TickError};
 use parko_kirra::clearance_delivery::DeliveryOutcome;
 
 /// Run the Parko ROS 2 node. Owns the r2r context for the lifetime of
@@ -102,6 +103,10 @@ where
     // when the clearance gate is active.
     let detection_enabled = clearance.is_some();
     let latest_imu: Arc<StdMutex<Option<ImuSample>>> = Arc::new(StdMutex::new(None));
+    // #324: arrival time (ms) of the LATEST IMU sample, 0 = none yet. The drain
+    // stamps the gate's staleness watchdog from this; a silent IMU stops advancing
+    // it, so the watchdog goes stale and the gate forces the MRC.
+    let imu_arrival: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     // Contact is sticky-until-read so a sub-tick pulse is not lost — see
     // [`ContactCell`] (#320), the CI-tested semantics this transport just wires.
     let contact_state: Arc<ContactCell> = Arc::new(ContactCell::new());
@@ -112,6 +117,7 @@ where
                 let imu_stream =
                     node.subscribe::<r2r::sensor_msgs::msg::Imu>(topic, r2r::QosProfile::default())?;
                 let cell = Arc::clone(&latest_imu);
+                let arrival = Arc::clone(&imu_arrival);
                 tokio::spawn(async move {
                     use futures::StreamExt;
                     let mut s = imu_stream;
@@ -120,6 +126,8 @@ where
                         if let Ok(mut g) = cell.lock() {
                             *g = Some(sample);
                         }
+                        // #324: record freshness so the watchdog can detect a stall.
+                        arrival.store(current_time_ms(), AtomicOrdering::Release);
                     }
                     tracing::warn!("parko-ros2: IMU stream closed — decel detection now inactive");
                 });
@@ -165,6 +173,7 @@ where
     let drain_infer   = Arc::clone(&infer);
     let drain_mapping = Arc::clone(&mapping);
     let drain_imu     = Arc::clone(&latest_imu);
+    let drain_imu_arrival = Arc::clone(&imu_arrival);
     let drain_contact = Arc::clone(&contact_state);
 
     let drain_task = tokio::spawn(async move {
@@ -200,6 +209,16 @@ where
                 imu: drain_imu.lock().ok().and_then(|g| *g),
                 contact: drain_contact.drain(), // sticky-until-read drain (#320)
             };
+
+            // #324: stamp the IMU staleness watchdog from the latest arrival time. A
+            // no-op when no IMU is configured (watchdog unarmed). When the IMU stream
+            // stalls, `arrival` stops advancing and the watchdog forces the MRC.
+            if let Some(c) = clearance.as_mut() {
+                let arrived = drain_imu_arrival.load(AtomicOrdering::Acquire);
+                if arrived != 0 {
+                    c.stamp_imu(arrived);
+                }
+            }
 
             let cleared = run_pipeline_tick_with_clearance(
                 &drain_config,
