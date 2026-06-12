@@ -53,8 +53,14 @@
   .row .sig-verified { color:var(--ok); } .row .sig-unsigned,.row .sig-unverified { color:var(--warn); }
   .row pre { margin:4px 0 0; color:var(--dim); white-space:pre-wrap; word-break:break-word; font-size:11px; }
   label { display:block; margin:8px 0 3px; color:var(--dim); font-size:12px; }
-  input { width:100%; background:var(--bg); border:1px solid var(--line); color:var(--ink);
+  input, textarea { width:100%; background:var(--bg); border:1px solid var(--line); color:var(--ink);
           border-radius:5px; padding:7px; font:inherit; }
+  textarea { resize:vertical; min-height:64px; }
+  details { margin-top:14px; border-top:1px dashed var(--line); padding-top:8px; }
+  summary { cursor:pointer; color:var(--warn); font-size:12px; }
+  .fp { color:var(--accent); }
+  .cli { background:var(--bg); border:1px solid var(--line); border-radius:5px; padding:8px;
+         font-size:11px; color:var(--dim); white-space:pre-wrap; word-break:break-word; }
   button { margin-top:12px; background:var(--accent); color:#fff; border:0; border-radius:5px;
            padding:8px 14px; font:inherit; cursor:pointer; }
   button:disabled { opacity:.5; cursor:default; }
@@ -89,17 +95,50 @@
   </section>
 
   <section>
-    <h2>Supervisor clearance grant <span class="badge">RECORD-ONLY · delivery = Phase B</span></h2>
-    <form id="grantform" autocomplete="off">
-      <label for="node_id">Node id (must be registered)</label>
-      <input id="node_id" name="node_id" required>
-      <label for="operator_id">Operator id</label>
-      <input id="operator_id" name="operator_id" required>
-      <label for="supkey">Supervisor key (held in memory for this session only — never stored)</label>
-      <input id="supkey" name="supkey" type="password" required>
-      <button type="submit" id="grantbtn">Record clearance grant</button>
-    </form>
-    <div class="result" id="grantresult"></div>
+    <h2>Clearance grant <span class="badge">RECORD-ONLY · delivery = Phase B</span></h2>
+
+    <!-- PRIMARY: operator-proven identity (#314). The operator signs the
+         challenge in-browser with their Ed25519 private key (WebCrypto). The
+         private key is held in memory ONLY — never localStorage, never sent. -->
+    <div id="opsigned">
+      <form id="grantform" autocomplete="off">
+        <label for="node_id">Node id (must be registered)</label>
+        <input id="node_id" name="node_id" required>
+        <label for="operator_id">Operator id (must be a registered operator)</label>
+        <input id="operator_id" name="operator_id" required>
+        <label for="opkey">Operator private key — PKCS#8 PEM (in memory for this session only — NEVER stored, NEVER sent; the page signs locally)</label>
+        <textarea id="opkey" rows="4" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----" required></textarea>
+        <button type="submit" id="grantbtn">Sign &amp; record clearance grant</button>
+      </form>
+      <div class="result" id="grantresult"></div>
+    </div>
+
+    <!-- FALLBACK: shown only when WebCrypto Ed25519 is unavailable. We do NOT
+         silently fall back to break-glass — we point to the documented CLI flow. -->
+    <div id="clifallback" style="display:none">
+      <p class="err">This browser cannot sign Ed25519 in-page (WebCrypto Ed25519 unavailable, or not a secure context).</p>
+      <p style="color:var(--dim);font-size:12px">Use the documented <b>CLI signing flow</b> in
+        <code>docs/CONSOLE_RUNBOOK.md</code> → “Operator onboarding”. Do NOT use break-glass for a routine grant.</p>
+    </div>
+
+    <!-- BREAK-GLASS: the named, distinctly-audited supervisor fallback (#255).
+         Present but secondary; deployments disable it by unsetting the env. -->
+    <details id="breakglass">
+      <summary>Break-glass · supervisor key (named fallback — audited distinctly as <code>supervisor-break-glass</code>)</summary>
+      <p style="color:var(--dim);font-size:11px;margin:6px 0">
+        Use ONLY when an operator key is lost/unavailable — a fleet locked out of recovery is its own safety failure.
+        Every break-glass grant is recorded distinctly in the signed chain.</p>
+      <form id="bgform" autocomplete="off">
+        <label for="bg_node_id">Node id</label>
+        <input id="bg_node_id" required>
+        <label for="bg_operator_id">Operator id</label>
+        <input id="bg_operator_id" required>
+        <label for="bg_supkey">Supervisor key (in memory only — never stored)</label>
+        <input id="bg_supkey" type="password" required>
+        <button type="submit" id="bgbtn">Break-glass record</button>
+      </form>
+      <div class="result" id="bgresult"></div>
+    </details>
   </section>
 
   <section>
@@ -233,39 +272,115 @@ async function poll(){
   } catch(e){ conn.textContent = "poll error: "+e.message; conn.classList.add("err"); }
 }
 
+// ---- #314 operator-proven identity (WebCrypto Ed25519, in-page signing) ----
+function pemToDer(pem){
+  const b64 = enc(pem).replace(/-----[^-]+-----/g, "").replace(/[^A-Za-z0-9+/=]/g, "");
+  const bin = atob(b64); const u = new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) u[i] = bin.charCodeAt(i);
+  return u;
+}
+function b64FromBytes(buf){
+  const u = new Uint8Array(buf); let s = "";
+  for(let i=0;i<u.length;i++) s += String.fromCharCode(u[i]);
+  return btoa(s);
+}
+// MUST byte-match Rust attestation::operator_grant_signing_payload:
+//   "KIRRA-OPERATOR-GRANT-v1" || for f in [operator_id,node_id,nonce]: u64_le(len(f)) || f
+function operatorGrantPayload(operatorId, nodeId, nonce){
+  const te = new TextEncoder();
+  const domain = te.encode("KIRRA-OPERATOR-GRANT-v1");
+  const fields = [operatorId, nodeId, nonce].map(s => te.encode(s));
+  let total = domain.length; for(const f of fields) total += 8 + f.length;
+  const buf = new Uint8Array(total); let o = 0;
+  buf.set(domain, o); o += domain.length;
+  for(const f of fields){
+    new DataView(buf.buffer, o, 8).setBigUint64(0, BigInt(f.length), true); o += 8;
+    buf.set(f, o); o += f.length;
+  }
+  return buf;
+}
+async function ed25519Supported(){
+  try {
+    if(!(window.crypto && crypto.subtle)) return false;
+    return !!(await crypto.subtle.generateKey({name:"Ed25519"}, false, ["sign","verify"]));
+  } catch(_){ return false; }
+}
+
+function showRecorded(res, body){
+  res.className = "result recorded";
+  res.innerHTML = '<span class="pend">GRANT RECORDED — DELIVERY PENDING</span><br>'+
+    'node <b>'+esc(body.node_id)+'</b> · operator <b>'+esc(body.operator_id)+'</b><br>'+
+    'auth: <b>'+esc(body.auth_method||"?")+'</b>'+
+    (body.operator_key_fingerprint ? (' · key <span class="fp">'+esc(body.operator_key_fingerprint)+'</span>') : '')+'<br>'+
+    '<span style="color:var(--dim)">'+esc(body.note||"")+'</span>';
+  lastGrant = { node_id: body.node_id }; // follow its delivery lifecycle on poll
+  poll();
+}
+function showRejected(res, status, reason){
+  res.className = "result rejected";
+  res.innerHTML = 'REJECTED ('+esc(status)+'): '+esc(reason || "request refused");
+}
+
+// PRIMARY: operator-signed grant. Fetch challenge → sign locally → submit.
 document.getElementById("grantform").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const btn = document.getElementById("grantbtn");
   const res = document.getElementById("grantresult");
+  const opkeyEl = document.getElementById("opkey");
   const node_id = document.getElementById("node_id").value.trim();
   const operator_id = document.getElementById("operator_id").value.trim();
-  const supkey = document.getElementById("supkey").value; // in-memory only; never stored
+  const pem = opkeyEl.value; // memory only; never stored, never sent
+  btn.disabled = true; res.className = "result"; res.style.display = "none";
+  try {
+    let key;
+    try { key = await crypto.subtle.importKey("pkcs8", pemToDer(pem), {name:"Ed25519"}, false, ["sign"]); }
+    catch(_){ showRejected(res, "key", "private key is not a valid PKCS#8 Ed25519 PEM"); return; }
+    const cr = await fetch("/console/clearance-challenge?operator_id="+encodeURIComponent(operator_id)+
+                           "&node_id="+encodeURIComponent(node_id), { headers:{accept:"application/json"} });
+    const cbody = await cr.json().catch(() => ({}));
+    if(!cr.ok){ showRejected(res, cr.status, cbody.error || "could not get a challenge (is the operator registered?)"); return; }
+    const sigBuf = await crypto.subtle.sign({name:"Ed25519"}, key,
+                       operatorGrantPayload(operator_id, node_id, cbody.nonce));
+    const r = await fetch("/console/clearance-grants", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ node_id, operator_id, nonce: cbody.nonce, signature_b64: b64FromBytes(sigBuf) }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if(r.ok && body.status === "recorded") showRecorded(res, body);
+    else showRejected(res, r.status, body.reason);
+  } catch(e){ showRejected(res, "err", e.message); }
+  finally { opkeyEl.value = ""; btn.disabled = false; } // drop the key from the field
+});
+
+// FALLBACK: break-glass via the supervisor key (named, audited distinctly).
+document.getElementById("bgform").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const btn = document.getElementById("bgbtn");
+  const res = document.getElementById("bgresult");
+  const supEl = document.getElementById("bg_supkey");
+  const node_id = document.getElementById("bg_node_id").value.trim();
+  const operator_id = document.getElementById("bg_operator_id").value.trim();
+  const supkey = supEl.value; // in-memory only; never stored
   btn.disabled = true; res.className = "result"; res.style.display = "none";
   try {
     const r = await fetch("/console/clearance-grants", {
-      method: "POST",
-      headers: { "content-type":"application/json", "x-kirra-supervisor-key": supkey },
+      method:"POST",
+      headers:{ "content-type":"application/json", "x-kirra-supervisor-key": supkey },
       body: JSON.stringify({ node_id, operator_id }),
     });
     const body = await r.json().catch(() => ({}));
-    if(r.ok && body.status === "recorded"){
-      res.className = "result recorded";
-      res.innerHTML = '<span class="pend">GRANT RECORDED — DELIVERY PENDING</span><br>'+
-        'node <b>'+esc(body.node_id)+'</b> · operator <b>'+esc(body.operator_id)+'</b> · '+
-        'granted_at '+esc(body.granted_at_ms)+'<br>'+
-        '<span style="color:var(--dim)">'+esc(body.note||"")+'</span>';
-      lastGrant = { node_id: body.node_id }; // follow its delivery lifecycle on poll
-      document.getElementById("supkey").value = ""; // drop the key from the field
-      poll();
-    } else {
-      res.className = "result rejected";
-      res.innerHTML = 'REJECTED ('+r.status+'): '+esc(body.reason || "request refused");
-    }
-  } catch(e){
-    res.className = "result rejected"; res.innerHTML = "REJECTED: "+esc(e.message);
-  } finally {
-    document.getElementById("supkey").value = ""; // never retain the key
-    btn.disabled = false;
+    if(r.ok && body.status === "recorded") showRecorded(res, body);
+    else showRejected(res, r.status, body.reason);
+  } catch(e){ showRejected(res, "err", e.message); }
+  finally { supEl.value = ""; btn.disabled = false; } // never retain the key
+});
+
+// Feature-detect WebCrypto Ed25519. If unavailable, hide the in-page signing form
+// and surface the documented CLI flow — NEVER a silent break-glass fallback.
+ed25519Supported().then(ok => {
+  if(!ok){
+    document.getElementById("opsigned").style.display = "none";
+    document.getElementById("clifallback").style.display = "block";
   }
 });
 
