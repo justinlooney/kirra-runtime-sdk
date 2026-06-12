@@ -73,9 +73,9 @@ pub use commit_zone::{
     CommitZoneMap, CommitZoneScene, ExitClearanceEvidence, NonYieldingAgent, NonYieldingScene,
 };
 pub use impact::{
-    is_impact, ClearanceLoop, ClearanceRejection, ClearanceState, ImpactCfg, ImpactEvidence,
-    ImpactLatch, OperatorClearanceGrant, VanishedCfg, VanishedObjectDetector,
-    DEFAULT_MAX_GRANT_AGE_MS,
+    impact_cfg_for_class, is_impact, ClearanceLoop, ClearanceRejection, ClearanceState, ImpactCfg,
+    ImpactEvidence, ImpactLatch, OperatorClearanceGrant, VanishedCfg, VanishedObjectDetector,
+    VehicleClass, DEFAULT_MAX_GRANT_AGE_MS,
 };
 pub use localization::{
     gate_commit_zone_scene, gate_water_scene, localization_trusted, LocalizationCfg,

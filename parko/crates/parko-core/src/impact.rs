@@ -49,6 +49,55 @@ impl Default for ImpactCfg {
     }
 }
 
+/// The vehicle class an [`ImpactCfg`] is selected for (#312 / #313). The SG6
+/// impact-decel threshold is class-shaped: a sidewalk collision at walking pace
+/// produces a far smaller decel signature than a road-speed crash.
+///
+/// CROSS-WORKSPACE DUPLICATION (stated, not hidden). The kinematic-envelope side
+/// of this family lives in `kirra-runtime-sdk`'s
+/// `src/gateway/contract_profiles.rs` (`VehicleClass` + `contract_for`). parko-core
+/// and the SDK gateway are **separate workspaces with no dependency edge**, so this
+/// class enum and the thresholds below **cannot be shared by import** — they are a
+/// deliberate, CITED copy. The single source of truth for the per-class numbers is
+/// the normative table `docs/CONTRACT_PROFILES.md`; both sides cite it by parameter
+/// id. A hidden copy is a future divergence; a cited copy is a maintained one — if
+/// you change a number here, change `docs/CONTRACT_PROFILES.md` and the SDK side too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VehicleClass {
+    /// Sidewalk courier — pedestrian-space, low-speed (#313).
+    Courier,
+    /// Road-going delivery AV (Nuro-shape pod).
+    DeliveryAv,
+    /// Robotaxi — full-speed. The frozen reference; uses [`ImpactCfg::default`].
+    Robotaxi,
+}
+
+/// The SG6 [`ImpactCfg`] for `class`. **Does NOT touch [`ImpactCfg::default`]** —
+/// the robotaxi member delegates to it (the default IS the robotaxi-class value;
+/// zero new number), and the other members are siblings.
+///
+/// Every non-inherited threshold is **VALIDATION-PENDING** (bench/SOTIF
+/// characterization, NOT certified) and is the parko mirror of the value in
+/// `docs/CONTRACT_PROFILES.md` (param `*.impact_spike`).
+#[must_use]
+pub fn impact_cfg_for_class(class: VehicleClass) -> ImpactCfg {
+    match class {
+        // Robotaxi = the frozen default (road-speed collision-grade decel, 30 m/s²).
+        VehicleClass::Robotaxi => ImpactCfg::default(),
+        // VALIDATION-PENDING: a road-pod collision at ~11 m/s decelerates less
+        // violently than a full-speed crash; a mid threshold pending bench data.
+        // (CONTRACT_PROFILES.md delivery-av.impact_spike)
+        VehicleClass::DeliveryAv => ImpactCfg { spike_threshold_mps2: 18.0 },
+        // VALIDATION-PENDING: a sidewalk collision at walking pace produces a SMALL
+        // decel signature — far below the road threshold — so the trigger must be
+        // more sensitive, but ABOVE ordinary curb/bump jolts. This value genuinely
+        // needs bench characterization of low-speed collision decel signatures; it
+        // is a flagged placeholder, NOT a guessed certified number.
+        // (CONTRACT_PROFILES.md courier.impact_spike)
+        VehicleClass::Courier => ImpactCfg { spike_threshold_mps2: 8.0 },
+    }
+}
+
 /// Conservative, fail-closed fusion: an impact is declared iff **ANY** signal
 /// fires —
 ///   * `contact_sensor` (definitive), OR
@@ -498,6 +547,43 @@ mod tests {
 
     fn cfg() -> ImpactCfg {
         ImpactCfg::default() // spike_threshold = 30.0
+    }
+
+    // --- Per-class ImpactCfg family (#312 / #313) --------------------------
+
+    #[test]
+    fn impact_cfg_for_class_is_constructible_for_every_class() {
+        for class in [VehicleClass::Courier, VehicleClass::DeliveryAv, VehicleClass::Robotaxi] {
+            let c = impact_cfg_for_class(class);
+            assert!(c.spike_threshold_mps2.is_finite() && c.spike_threshold_mps2 > 0.0,
+                "{class:?} threshold must be a positive finite value, got {}", c.spike_threshold_mps2);
+        }
+    }
+
+    #[test]
+    fn robotaxi_impact_cfg_is_the_frozen_default_courier_differs() {
+        // Robotaxi delegates to the frozen default (zero new number).
+        assert_eq!(
+            impact_cfg_for_class(VehicleClass::Robotaxi).spike_threshold_mps2,
+            ImpactCfg::default().spike_threshold_mps2,
+            "robotaxi must be the frozen default threshold"
+        );
+        // Courier is more sensitive (lower threshold) — a sidewalk collision is a
+        // smaller decel signature; it must NOT equal the robotaxi/road value.
+        let courier = impact_cfg_for_class(VehicleClass::Courier).spike_threshold_mps2;
+        let robotaxi = impact_cfg_for_class(VehicleClass::Robotaxi).spike_threshold_mps2;
+        assert!(courier != robotaxi, "courier threshold must differ from robotaxi");
+        assert!(courier < robotaxi, "courier (sidewalk) must be more sensitive than robotaxi (road)");
+        // Ordering sanity across the family: courier < delivery-av < robotaxi.
+        let delivery = impact_cfg_for_class(VehicleClass::DeliveryAv).spike_threshold_mps2;
+        assert!(courier < delivery && delivery < robotaxi,
+            "threshold ordering courier {courier} < delivery-av {delivery} < robotaxi {robotaxi}");
+    }
+
+    #[test]
+    fn impact_cfg_default_is_untouched() {
+        // The frozen default must remain exactly 30.0 (the family adds beside it).
+        assert_eq!(ImpactCfg::default().spike_threshold_mps2, 30.0);
     }
 
     fn clean() -> ImpactEvidence {

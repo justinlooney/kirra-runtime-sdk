@@ -33,6 +33,20 @@ use proptest::prelude::*;
 use crate::gateway::kinematics_contract::{
     validate_vehicle_command, EnforceAction, ProposedVehicleCommand, VehicleKinematicsContract,
 };
+use crate::gateway::contract_profiles::{contract_for, mrc_fallback_for, VehicleClass};
+
+/// EVERY member of the contract family (Nominal + MRC for all three classes),
+/// as `(label, contract)`. The validation gate (#312): a profile that fails the
+/// frozen instance's properties does not ship — that inheritance IS the family's
+/// certification story, so the same battery runs against every member.
+fn family_contracts() -> Vec<(&'static str, VehicleKinematicsContract)> {
+    let mut v = Vec::new();
+    for class in [VehicleClass::Courier, VehicleClass::DeliveryAv, VehicleClass::Robotaxi] {
+        v.push((class.as_str(), contract_for(class)));
+        v.push((class.as_str(), mrc_fallback_for(class)));
+    }
+    v
+}
 
 // ---------------------------------------------------------------------------
 // Strategies
@@ -379,6 +393,129 @@ proptest! {
                  nominal: {nominal_result:?}, mrc: Allow",
                 cmd.linear_velocity_mps, cmd.delta_time_s, cmd.steering_angle_deg
             );
+        }
+    }
+}
+
+// ===========================================================================
+// THE VALIDATION GATE (#312/#313) — the SAME property battery, run against
+// EVERY family member (courier / delivery-av / robotaxi, Nominal + MRC). These
+// properties are profile-agnostic: each reads the contract's OWN fields, so a new
+// class member inherits the frozen instance's certification by passing them. A
+// member that fails any of these does not ship.
+// ===========================================================================
+
+proptest! {
+    /// NO_PANIC — no family member panics on any finite input.
+    #[test]
+    fn prop_family_no_panic_on_finite(cmd in finite_command()) {
+        for (_label, contract) in family_contracts() {
+            let _ = validate_vehicle_command(&cmd, &contract);
+        }
+    }
+}
+
+proptest! {
+    /// NO_PANIC + DENY — every member denies a nonfinite field (never panics,
+    /// never silently admits).
+    #[test]
+    fn prop_family_nonfinite_always_denied(
+        bad in nonfinite_f64(),
+        field_idx in 0usize..5,
+    ) {
+        let cmd = command_with_one_nonfinite_field(bad, field_idx);
+        for (label, contract) in family_contracts() {
+            let result = validate_vehicle_command(&cmd, &contract);
+            prop_assert!(
+                matches!(result, EnforceAction::DenyBreach(_)),
+                "{label}: nonfinite field {field_idx}={bad} must DenyBreach, got {result:?}"
+            );
+        }
+    }
+}
+
+proptest! {
+    /// CLAMP_IN_BOUNDS — every member's ClampLinear/ClampSteering output satisfies
+    /// THAT member's own contract (finite + within its bounds).
+    #[test]
+    fn prop_family_clamp_in_bounds(cmd in valid_dt_command()) {
+        for (label, contract) in family_contracts() {
+            match validate_vehicle_command(&cmd, &contract) {
+                EnforceAction::ClampLinear(v) => {
+                    prop_assert!(v.is_finite(), "{label}: ClampLinear {v} not finite");
+                    prop_assert!(v.abs() <= contract.max_speed_mps + 1e-9,
+                        "{label}: ClampLinear {v} > max_speed {}", contract.max_speed_mps);
+                }
+                EnforceAction::ClampSteering(d) => {
+                    prop_assert!(d.is_finite(), "{label}: ClampSteering {d} not finite");
+                    prop_assert!(d.abs() <= contract.max_steering_deg + 1e-9,
+                        "{label}: ClampSteering {d} > max_steering {}", contract.max_steering_deg);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+proptest! {
+    /// ALLOW_IMPLIES_SAFE — an Allow from any member implies that member's speed,
+    /// steering, and bicycle-model lateral-accel invariants all hold.
+    #[test]
+    fn prop_family_allow_implies_safe(cmd in valid_dt_command()) {
+        for (label, contract) in family_contracts() {
+            if let EnforceAction::Allow = validate_vehicle_command(&cmd, &contract) {
+                prop_assert!(cmd.linear_velocity_mps.abs() <= contract.max_speed_mps + 1e-9,
+                    "{label}: Allow speed {} > {}", cmd.linear_velocity_mps, contract.max_speed_mps);
+                prop_assert!(cmd.steering_angle_deg.abs() <= contract.max_steering_deg + 1e-9,
+                    "{label}: Allow steering {} > {}", cmd.steering_angle_deg, contract.max_steering_deg);
+                let v2 = cmd.linear_velocity_mps.powi(2);
+                if v2 > 1e-6 && contract.wheelbase_m > 1e-6 {
+                    let lat = (v2 * cmd.steering_angle_deg.to_radians().tan().abs())
+                        / contract.wheelbase_m;
+                    prop_assert!(lat <= contract.max_lateral_accel_mps2 + 1e-6,
+                        "{label}: Allow lateral {lat:.6} > {}", contract.max_lateral_accel_mps2);
+                }
+            }
+        }
+    }
+}
+
+proptest! {
+    /// BICYCLE_MODEL_AFTER_CLAMP — a member's ClampSteering output satisfies that
+    /// member's lateral-accel limit.
+    #[test]
+    fn prop_family_clamp_steering_satisfies_lateral(cmd in valid_dt_command()) {
+        for (label, contract) in family_contracts() {
+            if let EnforceAction::ClampSteering(safe_delta) = validate_vehicle_command(&cmd, &contract) {
+                let v2 = cmd.linear_velocity_mps.powi(2);
+                if v2 > 1e-6 && contract.wheelbase_m > 1e-6 && safe_delta.is_finite() {
+                    let lat = (v2 * safe_delta.to_radians().tan().abs()) / contract.wheelbase_m;
+                    prop_assert!(lat <= contract.max_lateral_accel_mps2 + 1e-6,
+                        "{label}: ClampSteering({safe_delta:.4}) lat {lat:.6} > {}",
+                        contract.max_lateral_accel_mps2);
+                }
+            }
+        }
+    }
+}
+
+proptest! {
+    /// DETERMINISTIC — every member is deterministic (discriminant-stable; clamp
+    /// values bit-identical).
+    #[test]
+    fn prop_family_deterministic(cmd in finite_command()) {
+        for (label, contract) in family_contracts() {
+            let r1 = validate_vehicle_command(&cmd, &contract);
+            let r2 = validate_vehicle_command(&cmd, &contract);
+            prop_assert_eq!(std::mem::discriminant(&r1), std::mem::discriminant(&r2),
+                "{} not deterministic", label);
+            match (&r1, &r2) {
+                (EnforceAction::ClampLinear(a), EnforceAction::ClampLinear(b)) =>
+                    prop_assert_eq!(a.to_bits(), b.to_bits()),
+                (EnforceAction::ClampSteering(a), EnforceAction::ClampSteering(b)) =>
+                    prop_assert_eq!(a.to_bits(), b.to_bits()),
+                _ => {}
+            }
         }
     }
 }
