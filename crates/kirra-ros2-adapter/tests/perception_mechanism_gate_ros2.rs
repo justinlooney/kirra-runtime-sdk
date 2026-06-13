@@ -151,6 +151,7 @@ use kirra_ros2_adapter::corridor::{CorridorSource, MockCorridorSource};
 use kirra_ros2_adapter::node::run_adapter;
 use kirra_ros2_adapter::perception_ingest::perception_derate_enabled;
 use kirra_ros2_adapter::state::{AdaptorState, TrajectoryVerdict};
+use kirra_runtime_sdk::verifier::FleetPosture;
 
 /// Adapter node name + namespace the harness publishes INTO. `run_adapter`
 /// creates the node in namespace `"kirra"`; the harness picks the name, so the
@@ -174,6 +175,23 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Phase I observability (integration-harness §I.1). Install a tracing subscriber
+/// so the node's `kirra::ingress` `subscription_callback` events and the slow-loop
+/// `trajectory_verdict` spans (now carrying posture + per-input freshness ages) are
+/// visible under `--nocapture`. This is the harness's core defect fix: without a
+/// subscriber the existing PMON-004 test could not tell delivery (Branch A) from
+/// staleness (Branch B). Idempotent (`try_init`) so every `#[ignore]` test in this
+/// binary may call it; filter with `RUST_LOG` (defaults to `info`).
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let _ = fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
 }
 
 /// A 3-pose straight trajectory at x = 60, 62, 64 (inside the 0..100 × ±5 m mock
@@ -384,5 +402,102 @@ async fn run_full_node_integration_async() {
     // no shutdown channel yet, Phase 4 — so abort is the clean exit), then drop
     // the harness node.
     adapter.abort();
+}
+
+// --- Phase I clean-accept delivery probe (integration-harness §I.2) ---
+
+/// The canonical A-vs-B discriminator. A plausible straight trajectory inside the
+/// mock corridor + BENIGN objects (scenario_b — all plausible, so the perception
+/// cap is nominal) + fresh odom must reach `Accept` at **Nominal** posture over
+/// real DDS. Holds in BOTH derate modes, because benign objects never trigger a
+/// cap — so this isolates *delivery + the clean verdict* from the derate matrix.
+///
+/// With `init_tracing` installed, read the `kirra::ingress` `subscription_callback`
+/// events while this runs:
+///   - reaches `Accept` + callbacks seen  → delivery works; the original
+///     scenario-b `MRCFallback` was a fixture artifact, not a product bug.
+///   - `MRCFallback` + NO callbacks       → Branch A (wiring): a topic / namespace
+///     / QoS / typesupport mismatch; the per-topic callback events pinpoint which
+///     subscription never fired.
+///   - `MRCFallback` + callbacks fire     → Branch B (staleness/stamping): inspect
+///     the `*_age_ms` fields on the `trajectory_verdict` span.
+///
+/// Live ROS 2 graph; run on a ROS-sourced dev box:
+///   source /opt/ros/${ROS_DISTRO}/setup.bash
+///   cargo test -p kirra-ros2-adapter --features ros2 \
+///       --test perception_mechanism_gate_ros2 clean_accept_delivery_probe \
+///       -- --ignored --nocapture
+#[test]
+#[ignore = "live ROS 2 node graph over real DDS; run via `-- --ignored` on a ROS-sourced dev box (see doc comment)"]
+fn clean_accept_delivery_probe() {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(clean_accept_delivery_probe_async());
+}
+
+async fn clean_accept_delivery_probe_async() {
+    init_tracing();
+
+    // Distinct node name so this probe's topics don't collide with
+    // run_full_node_integration when both run in the same binary.
+    const PROBE_NODE: &str = "pmon004_clean_accept";
+    let probe_topic = |leaf: &str| format!("/{NS}/{PROBE_NODE}/input/{leaf}");
+
+    // Spawn the adapter sharing AdaptorState (the verdict observation point — the
+    // node publishes no output topic yet, Phase 4).
+    let state = AdaptorState::new();
+    let corridor: Arc<dyn CorridorSource> =
+        Arc::new(MockCorridorSource::straight_5m_half_width(100.0));
+    let adapter_state = Arc::clone(&state);
+    let adapter = tokio::spawn(async move {
+        let _ = run_adapter(adapter_state, corridor, PROBE_NODE).await;
+    });
+
+    // Harness publisher node (its own r2r context → real DDS to the adapter).
+    let ctx = r2r::Context::create().expect("harness r2r context");
+    let mut node =
+        r2r::Node::create(ctx, "pmon004_clean_accept_harness", NS).expect("harness node");
+    let traj_pub = node
+        .create_publisher::<r2r::autoware_planning_msgs::msg::Trajectory>(
+            &probe_topic("trajectory"),
+            r2r::QosProfile::default(),
+        )
+        .expect("trajectory publisher");
+    let obj_pub = node
+        .create_publisher::<r2r::autoware_perception_msgs::msg::PredictedObjects>(
+            &probe_topic("objects"),
+            r2r::QosProfile::default(),
+        )
+        .expect("objects publisher");
+    let odom_pub = node
+        .create_publisher::<r2r::nav_msgs::msg::Odometry>(
+            &probe_topic("odometry"),
+            r2r::QosProfile::default(),
+        )
+        .expect("odometry publisher");
+
+    // Benign, all-plausible objects → nominal cap → Accept regardless of derate.
+    let benign = fixture_to_predicted_objects(&scenario_b());
+    drive_until(
+        &state,
+        &traj_pub,
+        &odom_pub,
+        &obj_pub,
+        Some(&benign),
+        TrajectoryVerdict::Accept,
+        0,
+        "clean-accept delivery probe",
+    )
+    .await;
+
+    // Posture must be Nominal: no posture source is configured, so the
+    // PostureTracker stays in `nominal_default_no_source` mode.
+    assert_eq!(
+        state.current_posture(),
+        FleetPosture::Nominal,
+        "clean-accept must observe Nominal posture (no posture source configured)"
+    );
+
+    adapter.abort();
+    let _ = adapter.await;
 }
 
