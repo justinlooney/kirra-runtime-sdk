@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 
 use crate::corridor::CorridorSource;
 use crate::state::{
-    AdaptorState, EgoOdom, TrajectoryPoint, TrajectoryVerdict,
+    AdaptorState, TrajectoryPoint, TrajectoryVerdict,
     SUBSCRIPTION_STALENESS_TIMEOUT_MS,
 };
 use crate::validation::{
