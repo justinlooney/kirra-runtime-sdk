@@ -18,3 +18,10 @@ mutants.out/
 ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
+
+# local bootstrap scripts + SQLite verifier stores
+occy_bootstrap.sh
+occy_standards.sh
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

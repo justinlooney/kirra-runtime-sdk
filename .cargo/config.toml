@@ -1,2 +1,10 @@
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
+
+[target.x86_64-pc-nto-qnx800]
+linker = "qcc"
+rustflags = ["-C", "link-args=-Vgcc_ntox86_64"]
+
+[target.aarch64-unknown-nto-qnx800]
+linker = "qcc"
+rustflags = ["-C", "link-args=-Vgcc_ntoaarch64le"]
