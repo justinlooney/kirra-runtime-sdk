@@ -74,7 +74,7 @@ function boot() {
       .to('.hero__eyebrow', { y: 0, opacity: 1, duration: 0.7 }, 0.2)
       .to('.hero__lede', { y: 0, opacity: 1, duration: 0.8 }, '-=0.7')
       .to('.hero__actions', { y: 0, opacity: 1, duration: 0.8 }, '-=0.6')
-      .to('.hero__pipeline', { y: 0, opacity: 1, duration: 0.8 }, '-=0.6');
+      .to('.hero__flow', { y: 0, opacity: 1, duration: 0.8 }, '-=0.6');
   }
 
   // ---------- Custom cursor ----------
@@ -166,10 +166,12 @@ function revealManifesto(instant) {
   p.innerHTML = ''; p.appendChild(frag);
   const words = p.querySelectorAll('.word');
   if (instant || !window.ScrollTrigger) return;
-  gsap.set(words, { opacity: 0.12 });
+  // Words stay legible at rest (0.55) and brighten to full as the section
+  // scrolls through — fully revealed by the time it reaches mid-viewport.
+  gsap.set(words, { opacity: 0.55 });
   gsap.to(words, {
-    opacity: 1, stagger: 0.06, ease: 'none',
-    scrollTrigger: { trigger: p, start: 'top 75%', end: 'bottom 60%', scrub: 1 },
+    opacity: 1, stagger: 0.05, ease: 'none',
+    scrollTrigger: { trigger: p, start: 'top 80%', end: 'center 60%', scrub: 1 },
   });
 }
 

@@ -8,7 +8,11 @@ on:
     branches: [main]
     paths:
       - 'website/**'
+      - 'scripts/fetch-substack-posts.mjs'
       - '.github/workflows/deploy-pages.yml'
+  # Daily rebuild so the Field Notes feed picks up new Substack posts.
+  schedule:
+    - cron: '0 13 * * *'
   workflow_dispatch:
 
 permissions:
@@ -36,6 +40,12 @@ jobs:
         uses: actions/configure-pages@v5
         with:
           enablement: true
+
+      # Bake the latest Substack posts into website/posts.json. Never fails the
+      # deploy: the script exits 0 on any error, and the page falls back to the
+      # subscribe CTA whenever posts.json is empty.
+      - name: Fetch latest Substack posts
+        run: node scripts/fetch-substack-posts.mjs || true
 
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v3
