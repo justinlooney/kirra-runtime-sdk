@@ -93,12 +93,23 @@
           <span>See the posture engine</span>
         </a>
       </div>
-      <div class="hero__pipeline" data-fade>
-        <span class="pipeline__node">LLM&nbsp;/&nbsp;Planner</span>
-        <span class="pipeline__arrow">→</span>
-        <span class="pipeline__node pipeline__node--kirra">Kirra Governor</span>
-        <span class="pipeline__arrow">→</span>
-        <span class="pipeline__node">Actuator</span>
+      <div class="hero__flow" data-fade>
+        <div class="flow" id="flow" aria-hidden="true">
+          <div class="flow__node flow__node--src" id="flowSrc">
+            <span class="flow__title">LLM / Planner</span>
+            <span class="flow__meta">proposes commands</span>
+          </div>
+          <div class="flow__seg"></div>
+          <div class="flow__node flow__node--gov" id="flowGov">
+            <span class="flow__title">Kirra Governor</span>
+            <span class="flow__verdict" id="flowVerdict">evaluating…</span>
+          </div>
+          <div class="flow__seg"></div>
+          <div class="flow__node flow__node--act" id="flowAct">
+            <span class="flow__title">Actuator</span>
+            <span class="flow__meta" id="flowActMeta">idle</span>
+          </div>
+        </div>
       </div>
       <div class="hero__scrollcue" aria-hidden="true">
         <span>SCROLL</span><span class="hero__scrollline"></span>
@@ -313,5 +324,6 @@ verdict = governor.<span class="c-fn">evaluate</span>(
 
   <script type="module" src="js/scene.js"></script>
   <script type="module" src="js/main.js"></script>
+  <script type="module" src="js/flow.js"></script>
 </body>
 </html>
