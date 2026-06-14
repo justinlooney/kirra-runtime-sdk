@@ -274,7 +274,7 @@ section { position: relative; z-index: 3; }
 .stats { max-width: var(--maxw); margin: 0 auto; padding: clamp(60px, 8vh, 120px) clamp(20px, 5vw, 56px); display: grid; grid-template-columns: repeat(4, 1fr); gap: 30px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .stat { text-align: center; }
 .stat__num { display: block; font-family: var(--font-display); font-weight: 700; font-size: clamp(2.2rem, 5vw, 3.6rem); letter-spacing: -0.03em; background: linear-gradient(180deg, var(--ink), var(--green)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
-.stat__label { color: var(--ink-mute); font-size: 0.9rem; }
+.stat__label { color: var(--ink-soft); font-size: 0.9rem; text-shadow: 0 1px 14px rgba(4,6,12,0.6); }
 @media (max-width: 760px) { .stats { grid-template-columns: repeat(2, 1fr); gap: 40px 20px; } }
 
 /* ───────── CTA ───────── */
