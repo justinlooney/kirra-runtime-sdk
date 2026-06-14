@@ -19,28 +19,41 @@ async function loadNotes() {
       card.target = '_blank';
       card.rel = 'noopener';
 
+      if (p.image && /^https?:\/\//.test(p.image)) {
+        const img = document.createElement('img');
+        img.className = 'note-card__img';
+        img.src = p.image;
+        img.alt = '';
+        img.loading = 'lazy';
+        card.appendChild(img);
+      }
+
+      const body = document.createElement('div');
+      body.className = 'note-card__body';
+
       if (p.date) {
         const d = document.createElement('span');
         d.className = 'note-card__date';
         d.textContent = p.date;
-        card.appendChild(d);
+        body.appendChild(d);
       }
       const t = document.createElement('span');
       t.className = 'note-card__title';
       t.textContent = p.title || 'Untitled';
-      card.appendChild(t);
+      body.appendChild(t);
 
       if (p.excerpt) {
         const e = document.createElement('span');
         e.className = 'note-card__excerpt';
         e.textContent = p.excerpt;
-        card.appendChild(e);
+        body.appendChild(e);
       }
       const more = document.createElement('span');
       more.className = 'note-card__more';
       more.textContent = 'Read on Substack ↗';
-      card.appendChild(more);
+      body.appendChild(more);
 
+      card.appendChild(body);
       grid.appendChild(card);
     }
     grid.classList.add('is-loaded');

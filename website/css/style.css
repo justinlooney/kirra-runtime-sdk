@@ -339,12 +339,14 @@ section { position: relative; z-index: 3; }
 .notes__sub { max-width: 620px; margin: 0 auto 32px; color: var(--ink-soft); font-size: 1.08rem; }
 .notes__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; max-width: 1040px; margin: 0 auto 36px; text-align: left; }
 .notes__grid:empty { display: none; }
-.note-card { display: flex; flex-direction: column; gap: 9px; padding: 22px; border: 1px solid var(--line); border-radius: 14px; background: var(--bg-glass); backdrop-filter: blur(8px); transition: transform .35s var(--ease), border-color .35s; }
+.note-card { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 14px; background: var(--bg-glass); backdrop-filter: blur(8px); overflow: hidden; transition: transform .35s var(--ease), border-color .35s; }
 .note-card:hover { transform: translateY(-4px); border-color: var(--accent); }
+.note-card__img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; display: block; background: var(--bg-2); }
+.note-card__body { display: flex; flex-direction: column; gap: 9px; padding: 20px; }
 .note-card__date { font-family: var(--font-mono); font-size: 11px; letter-spacing: 1px; color: var(--green); }
 .note-card__title { font-family: var(--font-display); font-size: 1.15rem; color: var(--ink); line-height: 1.25; }
 .note-card__excerpt { font-size: 0.9rem; color: var(--ink-soft); line-height: 1.5; }
-.note-card__more { margin-top: auto; font-family: var(--font-mono); font-size: 12px; color: var(--accent); }
+.note-card__more { margin-top: 4px; font-family: var(--font-mono); font-size: 12px; color: var(--accent); }
 
 /* ───────── Reveal states (GSAP toggles) ───────── */
 [data-fade], [data-reveal], [data-stagger] .word { will-change: transform, opacity; }
