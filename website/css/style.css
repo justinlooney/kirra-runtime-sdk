@@ -133,7 +133,17 @@ body::before {
 }
 .nav.is-stuck { background: var(--bg-glass); backdrop-filter: blur(14px); padding-top: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
 .nav__brand { display: flex; align-items: center; gap: 10px; font-family: var(--font-display); font-weight: 700; letter-spacing: 3px; font-size: 15px; }
-.nav__logo { color: var(--green); font-size: 18px; }
+/* Brand PNG mark — mix-blend hides its dark bg over the dark site; a gentle
+   breathing-glow gives it life (the K can't have data travel inside a flat image). */
+.nav__logo { width: 30px; height: 30px; display: inline-block; vertical-align: middle; flex: none; object-fit: contain; mix-blend-mode: screen; animation: logo-breathe 3.4s ease-in-out infinite; }
+.preloader__logo { width: 88px; height: 88px; object-fit: contain; mix-blend-mode: screen; animation: logo-breathe 3.4s ease-in-out infinite; }
+@keyframes logo-breathe {
+  0%, 100% { filter: brightness(0.9); transform: scale(1); }
+  50%      { filter: brightness(1.28); transform: scale(1.04); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nav__logo, .preloader__logo { animation: none; filter: brightness(1.05); }
+}
 .nav__links { display: flex; gap: 30px; font-size: 14px; color: var(--ink-soft); }
 .nav__links a { position: relative; }
 .nav__links a::after { content: ''; position: absolute; left: 0; bottom: -5px; width: 0; height: 1px; background: var(--accent); transition: width .35s var(--ease); }
