@@ -133,23 +133,16 @@ body::before {
 }
 .nav.is-stuck { background: var(--bg-glass); backdrop-filter: blur(14px); padding-top: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
 .nav__brand { display: flex; align-items: center; gap: 10px; font-family: var(--font-display); font-weight: 700; letter-spacing: 3px; font-size: 15px; }
-.nav__logo { width: 30px; height: 30px; display: inline-block; vertical-align: middle; flex: none; }
-
-/* ───────── Dynamic K logo (injected by js/logo.js) ───────── */
-.klogo { display: inline-block; line-height: 0; }
-.klogo--lg { width: 88px; height: 88px; }
-.kl { width: 100%; height: 100%; display: block; overflow: visible; filter: drop-shadow(0 0 2px rgba(52,245,166,0.55)); }
-.kl-edges path { stroke: #34f5a6; stroke-width: 10; stroke-linecap: round; opacity: 0.22; }
-.kl-pulses path { stroke: #5cf0ff; stroke-width: 10; stroke-linecap: round; stroke-dasharray: 16 84; stroke-dashoffset: 100; animation: kl-flow 2.4s linear infinite; }
-@keyframes kl-flow { to { stroke-dashoffset: 0; } }
-.kl-nodes circle { animation: kl-node 2.6s ease-in-out infinite; }
-.kl-cyan { fill: #5cf0ff; }
-@keyframes kl-node { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
-.kl-gov { animation: kl-gov 2s ease-in-out infinite; }
-@keyframes kl-gov { 0%, 100% { opacity: 0.85; } 50% { opacity: 1; } }
+/* Brand PNG mark — mix-blend hides its dark bg over the dark site; a gentle
+   breathing-glow gives it life (the K can't have data travel inside a flat image). */
+.nav__logo { width: 30px; height: 30px; display: inline-block; vertical-align: middle; flex: none; object-fit: contain; mix-blend-mode: screen; animation: logo-breathe 3.4s ease-in-out infinite; }
+.preloader__logo { width: 88px; height: 88px; object-fit: contain; mix-blend-mode: screen; animation: logo-breathe 3.4s ease-in-out infinite; }
+@keyframes logo-breathe {
+  0%, 100% { filter: brightness(0.9); transform: scale(1); }
+  50%      { filter: brightness(1.28); transform: scale(1.04); }
+}
 @media (prefers-reduced-motion: reduce) {
-  .kl-pulses path { animation: none; opacity: 0; }
-  .kl-nodes circle, .kl-gov { animation: none; }
+  .nav__logo, .preloader__logo { animation: none; filter: brightness(1.05); }
 }
 .nav__links { display: flex; gap: 30px; font-size: 14px; color: var(--ink-soft); }
 .nav__links a { position: relative; }
