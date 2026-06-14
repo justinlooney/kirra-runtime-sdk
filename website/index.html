@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kirra — Fail-Closed Trust for Autonomous Machines</title>
+  <meta name="description" content="Kirra is a distributed runtime legitimacy engine and safety governor for AI-driven robotic and edge systems. It enforces fail-closed trust across a heterogeneous fleet — stopping unsafe commands before they reach actuators." />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/style.css" />
+
+  <!-- Three.js (module) -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <!-- GSAP (global) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/ScrollTrigger.min.js" defer></script>
+</head>
+<body>
+  <!-- ───────── Preloader ───────── -->
+  <div class="preloader" id="preloader">
+    <div class="preloader__inner">
+      <div class="preloader__mark">
+        <span class="preloader__glyph">K</span>
+        <span class="preloader__ring"></span>
+      </div>
+      <div class="preloader__bar"><span id="preloaderFill"></span></div>
+      <div class="preloader__meta">
+        <span class="preloader__status" id="preloaderStatus">VERIFYING FLEET POSTURE</span>
+        <span class="preloader__pct" id="preloaderPct">0%</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ───────── Custom cursor ───────── -->
+  <div class="cursor" id="cursor"></div>
+  <div class="cursor-dot" id="cursorDot"></div>
+
+  <!-- ───────── Grain + scroll progress ───────── -->
+  <div class="grain" aria-hidden="true"></div>
+  <div class="scroll-progress"><span id="scrollProgress"></span></div>
+
+  <!-- ───────── WebGL canvas ───────── -->
+  <canvas id="lattice" class="lattice-canvas" aria-hidden="true"></canvas>
+
+  <!-- ───────── Nav ───────── -->
+  <header class="nav" id="nav">
+    <a href="#top" class="nav__brand" data-magnetic>
+      <span class="nav__logo">◇</span>
+      <span class="nav__name">KIRRA</span>
+    </a>
+    <nav class="nav__links">
+      <a href="#posture" data-magnetic>Posture</a>
+      <a href="#capabilities" data-magnetic>Capabilities</a>
+      <a href="#occy" data-magnetic>Occy / AV</a>
+      <a href="#quickstart" data-magnetic>Quickstart</a>
+    </nav>
+    <a href="https://github.com/justinlooney/kirra-runtime-sdk" class="nav__cta" data-magnetic target="_blank" rel="noopener">
+      <span>GitHub</span><span class="nav__cta-arrow">↗</span>
+    </a>
+  </header>
+
+  <main id="top">
+    <!-- ───────── Hero ───────── -->
+    <section class="hero" id="hero">
+      <div class="hero__eyebrow" data-fade>
+        <span class="dot dot--live"></span>
+        RUNTIME LEGITIMACY ENGINE · SAFETY GOVERNOR
+      </div>
+      <h1 class="hero__title">
+        <span class="line"><span class="word">Fail&#8209;closed</span> <span class="word">trust</span></span>
+        <span class="line"><span class="word">for</span> <span class="word accent">autonomous</span></span>
+        <span class="line"><span class="word accent">machines.</span></span>
+      </h1>
+      <p class="hero__lede" data-fade>
+        Kirra sits between your AI and your actuators. Every command — from an LLM,
+        a planner, or an upstream orchestrator — is judged against live fleet posture
+        <em>before</em> a single byte reaches hardware. If trust can't be proven, nothing moves.
+      </p>
+      <div class="hero__actions" data-fade>
+        <a href="#quickstart" class="btn btn--primary" data-magnetic>
+          <span>Drop it in your stack</span>
+        </a>
+        <a href="#posture" class="btn btn--ghost" data-magnetic>
+          <span>See the posture engine</span>
+        </a>
+      </div>
+      <div class="hero__pipeline" data-fade>
+        <span class="pipeline__node">LLM&nbsp;/&nbsp;Planner</span>
+        <span class="pipeline__arrow">→</span>
+        <span class="pipeline__node pipeline__node--kirra">Kirra Governor</span>
+        <span class="pipeline__arrow">→</span>
+        <span class="pipeline__node">Actuator</span>
+      </div>
+      <div class="hero__scrollcue" aria-hidden="true">
+        <span>SCROLL</span><span class="hero__scrollline"></span>
+      </div>
+    </section>
+
+    <!-- ───────── Manifesto / problem ───────── -->
+    <section class="manifesto" id="manifesto">
+      <p class="manifesto__text" data-stagger>
+        A model that hallucinates <span class="hl hl--red">999&nbsp;m/s</span>, invents a
+        non&#8209;existent action, or issues a kinetic command while the fleet is
+        <span class="hl hl--amber">degraded</span> is stopped at the software layer —
+        and the attempt is permanently recorded in a
+        <span class="hl hl--cyan">SHA&#8209;256 hash&#8209;chained ledger.</span>
+      </p>
+    </section>
+
+    <!-- ───────── Posture engine (pinned, color-driven) ───────── -->
+    <section class="posture" id="posture">
+      <div class="posture__sticky">
+        <div class="posture__header">
+          <span class="section-tag">THE POSTURE ENGINE</span>
+          <h2 class="posture__heading" id="postureHeading">Nominal</h2>
+        </div>
+        <div class="posture__cards">
+          <article class="pcard pcard--nominal" data-state="0">
+            <header><span class="pcard__led"></span><h3>Nominal</h3></header>
+            <p>The gray/black DAG resolves clean across the fleet. Kinetic writes are admitted —
+               each still validated against the vehicle kinematics envelope.</p>
+            <span class="pcard__verdict">cmd_vel ✓ · read ✓</span>
+          </article>
+          <article class="pcard pcard--degraded" data-state="1">
+            <header><span class="pcard__led"></span><h3>Degraded</h3></header>
+            <p>Controlled decel&#8209;to&#8209;stop&#8209;and&#8209;HOLD. Speed may only converge to zero;
+               re&#8209;acceleration is denied. The governor never authors a restart.</p>
+            <span class="pcard__verdict">cmd_vel ✗ · read ✓</span>
+          </article>
+          <article class="pcard pcard--locked" data-state="2">
+            <header><span class="pcard__led"></span><h3>LockedOut</h3></header>
+            <p>A cycle, depth breach, or unresolved trust locks the fleet. Everything is denied —
+               down to telemetry. Recovery is a deliberate human reset.</p>
+            <span class="pcard__verdict">cmd_vel ✗ · read ✗</span>
+          </article>
+        </div>
+        <p class="posture__note">
+          Posture is recomputed by a coalescing worker over a real two&#8209;set DAG traversal —
+          gray set for cycle detection, black set for diamond&#8209;DAG memoization. A
+          <code>LockedOut</code> dependency propagates upward as <code>LockedOut</code>, never softened to degraded.
+        </p>
+      </div>
+    </section>
+
+    <!-- ───────── Capabilities grid ───────── -->
+    <section class="caps" id="capabilities">
+      <div class="caps__intro">
+        <span class="section-tag">SECURITY INVARIANTS, NOT FEATURES</span>
+        <h2 class="caps__title" data-fade>Trust is enforced, <br/>never assumed.</h2>
+        <p class="caps__sub" data-fade>Each of these has been blocked or reverted in review more than once.
+          They are invariants — the system fails closed if any one cannot hold.</p>
+      </div>
+      <div class="caps__grid">
+        <article class="cap" data-reveal>
+          <span class="cap__idx">01</span>
+          <h3>Cryptographic attestation</h3>
+          <p>Per&#8209;node Ed25519 proof over a <code>(node_id, nonce)</code> challenge, checked against a
+            registered attestation key. No registered key, malformed proof, or bad signature → reject.</p>
+        </article>
+        <article class="cap" data-reveal>
+          <span class="cap__idx">02</span>
+          <h3>Constant&#8209;time comparison</h3>
+          <p>Every security&#8209;critical token check runs in constant time. Plain <code>==</code> on secret bytes
+            is forbidden across the entire codebase.</p>
+        </article>
+        <article class="cap" data-reveal>
+          <span class="cap__idx">03</span>
+          <h3>Fail&#8209;closed admin gate</h3>
+          <p>Mutation routes require an admin token sourced only from the environment. Absent or empty →
+            <code>503</code>. There is no fail&#8209;open path and no hardcoded fallback.</p>
+        </article>
+        <article class="cap" data-reveal>
+          <span class="cap__idx">04</span>
+          <h3>Tamper&#8209;evident ledger</h3>
+          <p>Every accepted report and denied command links into a SHA&#8209;256 hash&#8209;chained audit log —
+            independently verifiable, append&#8209;only, break&#8209;detecting.</p>
+        </article>
+        <article class="cap" data-reveal>
+          <span class="cap__idx">05</span>
+          <h3>Kinematics envelope</h3>
+          <p>The governor clamps to the absolute hard boundary first, then applies rate&#8209;of&#8209;change limits.
+            The envelope cap always wins. <code>NaN</code>/<code>Inf</code> are rejected before publish.</p>
+        </article>
+        <article class="cap" data-reveal>
+          <span class="cap__idx">06</span>
+          <h3>Bounded&#8209;time verdict</h3>
+          <p>An O(1) structural boundedness argument guards the governor verdict path, with a CI WCET gate.
+            Host timing is indicative; only QNX&#8209;target numbers feed an FTTI claim.</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- ───────── Occy / AV safety goals ───────── -->
+    <section class="occy" id="occy">
+      <div class="occy__head">
+        <span class="section-tag">OCCY LINE · AUTONOMOUS DRIVING</span>
+        <h2 data-fade>An ASIL&#8209;D governor for the planning &amp; control loop.</h2>
+        <p data-fade>A Safety Element out of Context that runs as a two&#8209;rate checker, enforces
+          drivable&#8209;space containment against an HD map, and publishes a Minimal Risk Condition
+          verdict the stack must honor before any trajectory reaches actuators.</p>
+      </div>
+      <div class="occy__goals">
+        <div class="goal" data-reveal>
+          <div class="goal__id">SG1</div>
+          <div class="goal__body"><h3>Speed envelope</h3><p>50&nbsp;mph / 80&nbsp;km/h hard cap.</p></div>
+          <div class="goal__asil">ASIL&nbsp;D<span>ENFORCED</span></div>
+        </div>
+        <div class="goal" data-reveal>
+          <div class="goal__id">SG2</div>
+          <div class="goal__body"><h3>Lateral containment</h3><p>Drivable&#8209;space margin ≥ 0.40&nbsp;m.</p></div>
+          <div class="goal__asil">ASIL&nbsp;D<span>ENFORCED</span></div>
+        </div>
+        <div class="goal" data-reveal>
+          <div class="goal__id">SG3</div>
+          <div class="goal__body"><h3>RSS safety distance</h3><p>Longitudinal &amp; lateral separation.</p></div>
+          <div class="goal__asil">ASIL&nbsp;D<span>ENFORCED</span></div>
+        </div>
+        <div class="goal" data-reveal>
+          <div class="goal__id">SG4</div>
+          <div class="goal__body"><h3>MRC publication</h3><p>On any contract violation.</p></div>
+          <div class="goal__asil">ASIL&nbsp;D<span>ENFORCED</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────── Quickstart / code ───────── -->
+    <section class="quickstart" id="quickstart">
+      <div class="quickstart__left">
+        <span class="section-tag">FIVE&#8209;MINUTE INTEGRATION</span>
+        <h2 data-fade>Compatible with OpenAI function calling, LangChain tools, or any agent that can POST.</h2>
+        <p data-fade>Drop Kirra between your AI agent and your robot fleet. Every AI&#8209;generated command is
+          evaluated against the live posture before any hardware interaction occurs.</p>
+        <div class="quickstart__install">
+          <code id="installCmd">curl -fsSL kirra.sh/install | sh</code>
+          <button class="copy-btn" data-copy="curl -fsSL kirra.sh/install | sh" data-magnetic>Copy</button>
+        </div>
+      </div>
+      <div class="quickstart__code" data-reveal>
+        <div class="code-window">
+          <div class="code-window__bar">
+            <span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span>
+            <span class="code-window__title">action_filter.py</span>
+          </div>
+<pre class="code-window__body"><code><span class="c-kw">import</span> kirra
+
+governor = kirra.<span class="c-fn">Governor</span>(<span class="c-str">"https://verifier.fleet.local"</span>)
+
+<span class="c-cm"># LLM proposes an action — Kirra judges it against live posture</span>
+verdict = governor.<span class="c-fn">evaluate</span>(
+    node_id=<span class="c-str">"robot-07"</span>,
+    action={<span class="c-str">"type"</span>: <span class="c-str">"cmd_vel"</span>, <span class="c-str">"linear"</span>: <span class="c-num">2.0</span>},
+)
+
+<span class="c-kw">if</span> verdict.allowed:
+    fleet.<span class="c-fn">dispatch</span>(verdict.action)   <span class="c-cm"># clamped to envelope</span>
+<span class="c-kw">else</span>:
+    log.<span class="c-fn">warn</span>(verdict.<span class="c-kw">reason</span>)        <span class="c-cm"># DegradedSpeedIncreaseDenied</span>
+</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────── Stats ───────── -->
+    <section class="stats" id="stats">
+      <div class="stat" data-reveal>
+        <span class="stat__num" data-count="4" data-suffix="">ASIL&nbsp;D</span>
+        <span class="stat__label">Safety goals enforced end&#8209;to&#8209;end</span>
+      </div>
+      <div class="stat" data-reveal>
+        <span class="stat__num" data-count="0">0</span>
+        <span class="stat__label">Fail&#8209;open paths in the codebase</span>
+      </div>
+      <div class="stat" data-reveal>
+        <span class="stat__num" data-count="100" data-suffix="%">0</span>
+        <span class="stat__label">Mutations behind a constant&#8209;time gate</span>
+      </div>
+      <div class="stat" data-reveal>
+        <span class="stat__num" data-count="256" data-suffix="&#8209;bit">0</span>
+        <span class="stat__label">SHA hash&#8209;chained audit ledger</span>
+      </div>
+    </section>
+
+    <!-- ───────── CTA ───────── -->
+    <section class="cta" id="cta">
+      <div class="cta__glow" aria-hidden="true"></div>
+      <h2 class="cta__title" data-fade>If trust can't be proven,<br/><span class="accent">nothing moves.</span></h2>
+      <p class="cta__sub" data-fade>Put a fail&#8209;closed governor between your model and the world.</p>
+      <div class="cta__actions" data-fade>
+        <a href="https://github.com/justinlooney/kirra-runtime-sdk" class="btn btn--primary btn--lg" data-magnetic target="_blank" rel="noopener"><span>Get the SDK</span></a>
+        <a href="https://github.com/justinlooney/kirra-runtime-sdk/blob/main/docs/llm_integration_guide.md" class="btn btn--ghost btn--lg" data-magnetic target="_blank" rel="noopener"><span>Read the integration guide</span></a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer__brand"><span class="nav__logo">◇</span> KIRRA RUNTIME SDK</div>
+    <div class="footer__cols">
+      <a href="https://github.com/justinlooney/kirra-runtime-sdk" target="_blank" rel="noopener">Repository</a>
+      <a href="https://github.com/justinlooney/kirra-runtime-sdk/blob/main/docs/action_filter.md" target="_blank" rel="noopener">Action Filter</a>
+      <a href="https://github.com/justinlooney/kirra-runtime-sdk/blob/main/SECURITY.md" target="_blank" rel="noopener">Security</a>
+    </div>
+    <div class="footer__legal">Fail&#8209;closed by construction · Built for robots that can hurt people.</div>
+  </footer>
+
+  <script type="module" src="js/scene.js"></script>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
