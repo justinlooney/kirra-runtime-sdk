@@ -135,8 +135,8 @@ body::before {
 .nav__brand { display: flex; align-items: center; gap: 10px; font-family: var(--font-display); font-weight: 700; letter-spacing: 3px; font-size: 15px; }
 /* Brand mark — its dark background is knocked out to transparent at runtime
    (js/logomask.js), then a gentle breathing-glow follows the K's shape. */
-.nav__logo { width: 44px; height: 44px; display: inline-block; vertical-align: middle; flex: none; object-fit: contain; animation: logo-breathe 3.6s ease-in-out infinite; }
-.preloader__logo { width: 96px; height: 96px; object-fit: contain; animation: logo-breathe 3.6s ease-in-out infinite; }
+.nav__logo { width: 50px; height: 50px; display: inline-block; vertical-align: middle; flex: none; object-fit: contain; animation: logo-breathe 3.6s ease-in-out infinite; }
+.preloader__logo { width: 104px; height: 104px; object-fit: contain; animation: logo-breathe 3.6s ease-in-out infinite; }
 @keyframes logo-breathe {
   0%, 100% { filter: brightness(0.95) drop-shadow(0 0 3px rgba(52,245,166,0.45)); transform: scale(1); }
   50%      { filter: brightness(1.25) drop-shadow(0 0 9px rgba(92,240,255,0.7)); transform: scale(1.05); }
