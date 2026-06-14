@@ -1,0 +1,66 @@
+// Build-time fetch of the latest Substack posts → website/posts.json.
+// Runs in the Pages deploy workflow (Node 20+, has global fetch). Pure stdlib,
+// no dependencies. Resilient by design: any failure exits 0 and leaves the
+// existing posts.json untouched, so the deploy never breaks.
+
+import { writeFileSync } from 'node:fs';
+
+const FEED = 'https://justinlooney.substack.com/feed';
+const OUT = 'website/posts.json';
+const MAX = 4;
+
+function decodeEntities(s = '') {
+  return s
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&#x2019;/gi, '’')
+    .trim();
+}
+
+function tag(block, name) {
+  const m = block.match(new RegExp(`<${name}[^>]*>([\\s\\S]*?)</${name}>`, 'i'));
+  return m ? decodeEntities(m[1]) : '';
+}
+
+function snippet(html, n = 150) {
+  const text = decodeEntities(html).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return text.length > n ? text.slice(0, n).replace(/\s+\S*$/, '') + '…' : text;
+}
+
+try {
+  const res = await fetch(FEED, { headers: { 'User-Agent': 'kirra-site-build/1.0 (+kirrasystems.com)' } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const xml = await res.text();
+
+  const posts = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)]
+    .slice(0, MAX)
+    .map((m) => {
+      const b = m[1];
+      let date = '';
+      const pub = tag(b, 'pubDate');
+      if (pub) {
+        const d = new Date(pub);
+        if (!Number.isNaN(d.getTime())) {
+          date = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        }
+      }
+      return {
+        title: tag(b, 'title'),
+        link: tag(b, 'link'),
+        date,
+        excerpt: snippet(tag(b, 'description')),
+      };
+    })
+    .filter((p) => p.title && /^https?:\/\//.test(p.link));
+
+  writeFileSync(OUT, JSON.stringify(posts, null, 2) + '\n');
+  console.log(`Substack: wrote ${posts.length} post(s) to ${OUT}`);
+} catch (err) {
+  console.warn(`Substack fetch skipped (${err.message}); keeping existing ${OUT}.`);
+  process.exit(0); // never fail the deploy over an external feed
+}
