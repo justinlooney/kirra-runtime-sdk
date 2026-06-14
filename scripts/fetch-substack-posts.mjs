@@ -32,8 +32,25 @@ function snippet(html, n = 150) {
   return text.length > n ? text.slice(0, n).replace(/\s+\S*$/, '') + '…' : text;
 }
 
+function firstImage(block) {
+  // Substack item cover lives in <enclosure>, sometimes <media:content>,
+  // otherwise the first <img> inside the CDATA description/content.
+  let m = block.match(/<enclosure[^>]*url="([^"]+)"[^>]*type="image/i);
+  if (m) return decodeEntities(m[1]);
+  m = block.match(/<media:content[^>]*url="([^"]+)"/i);
+  if (m && /\.(jpe?g|png|webp|gif|avif)/i.test(m[1])) return decodeEntities(m[1]);
+  m = block.match(/<img[^>]*\bsrc="([^"]+)"/i);
+  if (m) return decodeEntities(m[1]);
+  return '';
+}
+
 try {
-  const res = await fetch(FEED, { headers: { 'User-Agent': 'kirra-site-build/1.0 (+kirrasystems.com)' } });
+  const res = await fetch(FEED, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5',
+    },
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const xml = await res.text();
 
@@ -54,6 +71,7 @@ try {
         link: tag(b, 'link'),
         date,
         excerpt: snippet(tag(b, 'description')),
+        image: firstImage(b),
       };
     })
     .filter((p) => p.title && /^https?:\/\//.test(p.link));
